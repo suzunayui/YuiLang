@@ -1,17 +1,20 @@
 //! Ahead-of-time compiler: turns a program into a Windows x64 executable that
 //! contains no interpreter (see `docs/native-backend.md`).
 //!
-//! It handles programs made of functions over `Int`, `Bool` and `List<Int>`:
-//! arithmetic, comparisons, `if`, `while`, `for`, calls, list literals,
-//! `push`, `len`, indexing, `map` / `filter` / `fold` / `any` / `all` with a
-//! closure written in place, and `print` of a string whose `{...}` parts are
-//! Ints or Bools. Anything else is reported as `Unsupported`.
+//! It handles programs made of functions over `Int`, `Bool`, `String` and
+//! `List<Int>`: arithmetic, comparisons, `if`, `while`, `for`, calls, list
+//! literals, `push`, `len`, indexing, `map` / `filter` / `fold` / `any` /
+//! `all` with a closure written in place, strings with `{...}` parts,
+//! comparisons and a few methods on strings, and `print`. Anything else is
+//! reported as `Unsupported`.
 //!
-//! Lists live on the heap with a reference count in front (the layout is in
-//! `runtime.yui`, which also holds the list routines; they are compiled by
-//! this same compiler). Every list variable owns one reference, and every
-//! list expression produces one; a reference is given up when its variable
-//! goes out of scope or is assigned to.
+//! Lists and strings live on the heap with a reference count in front (the
+//! layouts are in `runtime.yui`, which also holds their routines; they are
+//! compiled by this same compiler). Every such variable owns one reference,
+//! and every such expression produces one; a reference is given up when its
+//! variable goes out of scope or is assigned to. String literals are
+//! constants in the executable, marked by a negative count that is never
+//! changed.
 //!
 //! Values have no tags: an Int is 8 bytes in a register. Each function keeps
 //! its busiest variables in registers that calls preserve (rbx, rsi, rdi,
@@ -19,7 +22,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_AE, CC_E, CC_GE, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_AE, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -42,15 +45,13 @@ const STDOUT: i64 = -11;
 const STDERR: i64 = -12;
 
 /// Functions imported from kernel32.dll, in the order of the import table.
-const IMPORTS: [&str; 7] =
-    ["GetStdHandle", "WriteFile", "ExitProcess", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc"];
+const IMPORTS: [&str; 6] = ["GetStdHandle", "WriteFile", "ExitProcess", "HeapAlloc", "HeapFree", "HeapReAlloc"];
 const GET_STD_HANDLE: usize = 0;
 const WRITE_FILE: usize = 1;
 const EXIT_PROCESS: usize = 2;
-const GET_PROCESS_HEAP: usize = 3;
-const HEAP_ALLOC: usize = 4;
-const HEAP_FREE: usize = 5;
-const HEAP_REALLOC: usize = 6;
+const HEAP_ALLOC: usize = 3;
+const HEAP_FREE: usize = 4;
+const HEAP_REALLOC: usize = 5;
 
 /// The list routines, written in YuiLang.
 const RUNTIME: &str = include_str!("runtime.yui");
@@ -92,8 +93,25 @@ enum Ty {
     Unit,
     /// `List<Int>`: a pointer to a counted block on the heap.
     List,
+    /// `String`: a pointer to a counted block on the heap, or to a constant.
+    Str,
     /// The expression does not produce a value (`return`, `break`, ...).
     Never,
+}
+
+impl Ty {
+    /// Whether values of this type are counted references.
+    fn heap(self) -> bool {
+        matches!(self, Ty::List | Ty::Str)
+    }
+
+    /// The routine of `runtime.yui` that gives up a reference.
+    fn release(self) -> &'static str {
+        match self {
+            Ty::Str => "str_release",
+            _ => "list_release",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -142,8 +160,12 @@ struct Native<'a> {
     data: Vec<(usize, Vec<u8>)>,
     /// Positions of rip-relative displacements into the writable memory, and the offset there.
     bss_fixups: Vec<(usize, usize)>,
-    /// Whether the program allocates, and so needs the list routines.
+    /// Whether the program needs anything of `runtime.yui`.
     uses_heap: bool,
+    /// The functions of `runtime.yui` that are called, and those not compiled yet.
+    rt_seen: std::collections::HashSet<String>,
+    rt_queue: Vec<String>,
+    rt_copy: usize,
     /// Compiling `runtime.yui`: memory intrinsics are available and arithmetic is unchecked.
     in_runtime: bool,
     /// Count heap blocks and report at exit if any are left.
@@ -196,6 +218,9 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             runtime_fns.push(f.clone());
         }
     }
+    // Copying memory is machine code, but is called like a function of the runtime.
+    let rt_copy = a.label();
+    fns.insert("%__copy".to_string(), FnInfo { label: rt_copy, params: vec![Ty::Int; 3], ret: Ty::Unit });
     for item in &program.items {
         match item {
             Item::Fn(f) => {
@@ -239,6 +264,9 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         data: Vec::new(),
         bss_fixups: Vec::new(),
         uses_heap: false,
+        rt_seen: Default::default(),
+        rt_queue: Vec::new(),
+        rt_copy,
         in_runtime: false,
         check_heap: std::env::var_os("YUI_NATIVE_CHECK_HEAP").is_some(),
         rt_alloc,
@@ -284,9 +312,12 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         n.function(f, &f.name)?;
     }
     if n.uses_heap {
+        // Only the routines that are reached, to keep the executable small.
         n.in_runtime = true;
-        for f in &runtime_fns {
-            n.function(f, &format!("%{}", f.name))?;
+        while let Some(name) = n.rt_queue.pop() {
+            if let Some(f) = runtime_fns.iter().find(|f| f.name == name) {
+                n.function(f, &format!("%{name}"))?;
+            }
         }
         n.heap_runtime();
     }
@@ -305,6 +336,7 @@ fn simple_type(t: &TypeExpr) -> R<Ty> {
             "Int" => Ok(Ty::Int),
             "Bool" => Ok(Ty::Bool),
             "Unit" => Ok(Ty::Unit),
+            "String" => Ok(Ty::Str),
             other => unsupported(format!("the type `{other}`"), t.span),
         },
         TypeKind::Named(name, args) if name == "List" && args.len() == 1 => match simple_type(&args[0])? {
@@ -312,22 +344,6 @@ fn simple_type(t: &TypeExpr) -> R<Ty> {
             _ => unsupported("a list of anything but Ints", t.span),
         },
         _ => unsupported("this type", t.span),
-    }
-}
-
-/// Whether evaluating `e` may call a function, which overwrites r8-r11.
-/// Anything with statements inside counts, to stay on the safe side.
-fn has_call(e: &Expr) -> bool {
-    match &e.kind {
-        ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
-        ExprKind::Unary(_, x) => has_call(x),
-        ExprKind::Binary(_, l, r) => has_call(l) || has_call(r),
-        // Reading from a list held by a variable is done in place.
-        ExprKind::Index(list, index) => !matches!(list.kind, ExprKind::Ident(_)) || has_call(index),
-        ExprKind::MethodCall { recv, name, args, .. } => {
-            !(name == "len" && args.is_empty() && matches!(recv.kind, ExprKind::Ident(_)))
-        }
-        _ => true,
     }
 }
 
@@ -452,6 +468,27 @@ fn weigh_block(b: &Block, depth: u32, weight: &mut HashMap<String, usize>, decls
 impl Native<'_> {
     // ---- small pieces of code ----
 
+    /// Whether evaluating `e` may call a function, which overwrites r8-r11.
+    /// Anything with statements inside counts, to stay on the safe side.
+    fn has_call(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
+            ExprKind::Unary(_, x) => self.has_call(x),
+            ExprKind::Binary(_, l, r) => self.has_call(l) || self.has_call(r),
+            // Reading from a list held by a variable is done in place.
+            // (The same on a string is a call into the runtime.)
+            ExprKind::Index(list, index) => self.list_var(list).is_none() || self.has_call(index),
+            ExprKind::MethodCall { recv, name, args, .. } => {
+                !(name == "len" && args.is_empty() && self.list_var(recv).is_some())
+            }
+            // Reading memory in the runtime is one instruction, not a call.
+            ExprKind::Call { name, args, .. } if self.in_runtime && (name == "__load" || name == "__load8") => {
+                args.iter().any(|arg| self.has_call(arg))
+            }
+            _ => true,
+        }
+    }
+
     fn call_label(&mut self, label: usize) {
         self.a.b(0xE8);
         self.a.rel32(label);
@@ -523,9 +560,43 @@ impl Native<'_> {
 
     /// Calls a function of `runtime.yui`.
     fn call_rt(&mut self, name: &str) {
-        self.uses_heap = true;
+        self.need_rt(name);
         let label = self.fns[&format!("%{name}")].label;
         self.call_label(label);
+    }
+
+    /// Notes that the function `name` of `runtime.yui` has to be in the executable.
+    fn need_rt(&mut self, name: &str) {
+        self.uses_heap = true;
+        if self.rt_seen.insert(name.to_string()) {
+            self.rt_queue.push(name.to_string());
+        }
+    }
+
+    /// One more owner for the list or string in `reg`.
+    fn retain(&mut self, reg: u8, ty: Ty) {
+        match ty {
+            Ty::List => self.a.inc_mem(M(reg, 0)),
+            Ty::Str => {
+                // A constant has a negative count and is left alone.
+                let constant = self.a.label();
+                self.a.cmp_imm(M(reg, 0), 0);
+                self.a.jcc(CC_L, constant);
+                self.a.inc_mem(M(reg, 0));
+                self.a.bind(constant);
+            }
+            _ => {}
+        }
+    }
+
+    /// A string that is part of the executable.
+    fn str_constant(&mut self, text: &str) -> usize {
+        let mut block = Vec::new();
+        block.extend((-1i64).to_le_bytes());
+        block.extend((text.len() as u64).to_le_bytes());
+        block.extend((text.len() as u64).to_le_bytes());
+        block.extend(text.as_bytes());
+        self.constant(&block)
     }
 
     /// The register holding the value at `loc`, loading it into `scratch` if it is in the frame.
@@ -662,20 +733,23 @@ impl Native<'_> {
         self.call_import(EXIT_PROCESS);
     }
 
+    /// `rcx = the process heap`. Windows keeps it in the process environment
+    /// block; this is what `GetProcessHeap` does.
+    fn process_heap(&mut self) {
+        self.a.buf.extend_from_slice(&[0x65, 0x48, 0x8B, 0x0C, 0x25, 0x60, 0, 0, 0]); // mov rcx, gs:[0x60]
+        self.a.buf.extend_from_slice(&[0x48, 0x8B, 0x49, 0x30]); // mov rcx, [rcx + 0x30]
+    }
+
     /// Memory from the operating system, for the intrinsics of `runtime.yui`.
     fn heap_runtime(&mut self) {
         let oom = self.a.label();
-        // The caller's side of the frame has room for the register arguments.
-        let home = |slot: i32| M(RSP, 48 + 8 * slot);
 
         // alloc(rcx = bytes) -> rax
         self.a.bind(self.rt_alloc);
         self.a.alu_imm(5, RSP, 40);
-        self.a.store(home(0), RCX);
-        self.call_import(GET_PROCESS_HEAP);
-        self.a.mov_rr(RCX, RAX);
+        self.a.mov_rr(R8, RCX);
+        self.process_heap();
         self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
-        self.a.load(R8, home(0));
         self.call_import(HEAP_ALLOC);
         self.a.alu_rr(0x85, RAX, RAX);
         self.a.jcc(CC_Z, oom);
@@ -688,13 +762,10 @@ impl Native<'_> {
         // realloc(rcx = block, rdx = bytes) -> rax
         self.a.bind(self.rt_realloc);
         self.a.alu_imm(5, RSP, 40);
-        self.a.store(home(0), RCX);
-        self.a.store(home(1), RDX);
-        self.call_import(GET_PROCESS_HEAP);
-        self.a.mov_rr(RCX, RAX);
+        self.a.mov_rr(R8, RCX);
+        self.a.mov_rr(R9, RDX);
+        self.process_heap();
         self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
-        self.a.load(R8, home(0));
-        self.a.load(R9, home(1));
         self.call_import(HEAP_REALLOC);
         self.a.alu_rr(0x85, RAX, RAX);
         self.a.jcc(CC_Z, oom);
@@ -704,16 +775,42 @@ impl Native<'_> {
         // free(rcx = block)
         self.a.bind(self.rt_free);
         self.a.alu_imm(5, RSP, 40);
-        self.a.store(home(0), RCX);
-        self.call_import(GET_PROCESS_HEAP);
-        self.a.mov_rr(RCX, RAX);
+        self.a.mov_rr(R8, RCX);
+        self.process_heap();
         self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
-        self.a.load(R8, home(0));
         self.call_import(HEAP_FREE);
         if self.check_heap {
             self.rip_bss(&[0x48, 0xFF, 0x0D], LIVE_BLOCKS); // dec qword [live blocks]
         }
         self.a.alu_imm(0, RSP, 40);
+        self.a.b(0xC3);
+
+        // copy(rcx = to, rdx = from, r8 = bytes): a few bytes one at a time,
+        // more with the processor's block copy, which is slow to start.
+        let (block, bytes, done) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.bind(self.rt_copy);
+        self.a.alu_imm(7, R8, 32);
+        self.a.jcc(CC_AE, block);
+        self.a.alu_rr(0x85, R8, R8);
+        self.a.jcc(CC_Z, done);
+        self.a.bind(bytes);
+        self.a.buf.extend_from_slice(&[0x8A, 0x02]); // mov al, [rdx]
+        self.a.buf.extend_from_slice(&[0x88, 0x01]); // mov [rcx], al
+        self.a.alu_imm(0, RCX, 1);
+        self.a.alu_imm(0, RDX, 1);
+        self.a.alu_imm(5, R8, 1);
+        self.a.jcc(CC_NZ, bytes);
+        self.a.bind(done);
+        self.a.b(0xC3);
+        self.a.bind(block);
+        self.a.push(RSI);
+        self.a.push(RDI);
+        self.a.mov_rr(RDI, RCX);
+        self.a.mov_rr(RSI, RDX);
+        self.a.mov_rr(RCX, R8);
+        self.a.buf.extend_from_slice(&[0xF3, 0xA4]); // rep movsb
+        self.a.pop(RDI);
+        self.a.pop(RSI);
         self.a.b(0xC3);
 
         // Reached with the stack as inside the routines above.
@@ -907,7 +1004,7 @@ impl Native<'_> {
     fn declare(&mut self, name: &str, local: Local) {
         let scope = self.scopes.last_mut().expect("scope");
         if let Some(old) = scope.insert(name.to_string(), local) {
-            if old.ty == Ty::List {
+            if old.ty.heap() {
                 // Shadowed, but it still holds a list until the scope ends.
                 let hidden = format!("{name}%{}", scope.len());
                 scope.insert(hidden, old);
@@ -915,17 +1012,17 @@ impl Native<'_> {
         }
     }
 
-    /// Gives up the lists held by the variables of the scopes from `from`
-    /// on. `keep` is a register whose value must survive.
+    /// Gives up the lists and strings held by the variables of the scopes
+    /// from `from` on. `keep` is a register whose value must survive.
     fn release_scopes(&mut self, from: usize, keep: Option<u8>) {
-        let mut locs: Vec<Loc> =
-            self.scopes[from..].iter().flat_map(|s| s.values()).filter(|l| l.ty == Ty::List).map(|l| l.loc).collect();
+        let mut locs: Vec<Local> =
+            self.scopes[from..].iter().flat_map(|s| s.values()).filter(|l| l.ty.heap()).copied().collect();
         if locs.is_empty() {
             return;
         }
         // In a fixed order, so that the same program always gives the same executable.
-        locs.sort_by_key(|loc| match loc {
-            Loc::Reg(r) => *r as i32,
+        locs.sort_by_key(|local| match local.loc {
+            Loc::Reg(r) => r as i32,
             Loc::Stack(off) => 100 + off,
         });
         let slot = keep.map(|reg| {
@@ -933,9 +1030,9 @@ impl Native<'_> {
             self.a.store(slot, reg);
             slot
         });
-        for loc in locs {
-            self.load_loc(RCX, loc);
-            self.call_rt("list_release");
+        for local in locs {
+            self.load_loc(RCX, local.loc);
+            self.call_rt(local.ty.release());
         }
         if let (Some(reg), Some(slot)) = (keep, slot) {
             self.a.load(reg, slot);
@@ -952,12 +1049,103 @@ impl Native<'_> {
         self.spill_depth -= 1;
     }
 
-    /// A value that is dropped must not be a list: nothing would release it.
+    /// A value that is dropped must not be counted: nothing would release it.
     /// (The type checker already rejects unused values.)
     fn discard(&self, ty: Ty, span: Span) -> R<()> {
-        match ty {
-            Ty::List => unsupported("a list that is not used", span),
-            _ => Ok(()),
+        if ty.heap() {
+            return unsupported("a list or a string that is not used", span);
+        }
+        Ok(())
+    }
+
+    /// The variable `e` names, if it holds a list or a string.
+    fn heap_var(&self, e: &Expr) -> Option<Local> {
+        let ExprKind::Ident(name) = &e.kind else { return None };
+        let local = self.scopes.iter().rev().find_map(|s| s.get(name.as_str()))?;
+        local.ty.heap().then_some(*local)
+    }
+
+    /// Puts the value of `e` in a new spill slot, using `dst` on the way.
+    /// A list or string held by a variable is only borrowed (the variable
+    /// keeps it alive); otherwise the slot owns a reference. Returns the
+    /// slot, whether it owns, and the type.
+    fn park(&mut self, e: &Expr, dst: u8) -> R<(M, bool, Ty)> {
+        let (owned, ty) = match self.heap_var(e) {
+            Some(local) => {
+                self.load_loc(dst, local.loc);
+                (false, local.ty)
+            }
+            None => (true, self.eval(e, dst)?),
+        };
+        let slot = self.push_spill();
+        self.a.store(slot, dst);
+        Ok((slot, owned, ty))
+    }
+
+    /// Calls `routine` of the runtime on one or two strings and leaves its
+    /// result in rax. `left` is a parked string (see `park`); its slot and
+    /// the one of `right` are freed, and owned references given up.
+    fn str_op(&mut self, routine: &str, left: (M, bool), right: Option<&Expr>, dst: u8) -> R<()> {
+        let mut second = None;
+        if let Some(right) = right {
+            let (slot, owned, ty) = self.park(right, dst)?;
+            if ty != Ty::Str {
+                return unsupported("this operation on a String and something else", right.span);
+            }
+            second = Some((slot, owned));
+        }
+        self.a.load(RCX, left.0);
+        if let Some((slot, _)) = second {
+            self.a.load(RDX, slot);
+        }
+        self.call_rt(routine);
+        for (slot, owned) in [Some(left), second].into_iter().flatten() {
+            if owned {
+                // The slot now keeps the result while the string is released.
+                self.a.load(RCX, slot);
+                self.a.store(slot, RAX);
+                self.call_rt("str_release");
+                self.a.load(RAX, slot);
+            }
+        }
+        self.spill_depth -= 1 + second.is_some() as i32;
+        Ok(())
+    }
+
+    /// What `e` evaluates to, as far as it can be told without compiling it.
+    fn type_of(&self, e: &Expr) -> Option<Ty> {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Index(..) => Some(Ty::Int),
+            ExprKind::Bool(_) => Some(Ty::Bool),
+            ExprKind::Str(_) => Some(Ty::Str),
+            ExprKind::List(_) => Some(Ty::List),
+            ExprKind::Ident(name) => self.scopes.iter().rev().find_map(|s| s.get(name.as_str())).map(|l| l.ty),
+            ExprKind::Call { name, local: false, .. } => self.fns.get(name).map(|f| f.ret),
+            ExprKind::Unary(UnOp::Neg, _) => Some(Ty::Int),
+            ExprKind::Unary(UnOp::Not, _) => Some(Ty::Bool),
+            ExprKind::Binary(op, ..) => match op {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Some(Ty::Int),
+                _ => Some(Ty::Bool),
+            },
+            ExprKind::MethodCall { name, .. } => match name.as_str() {
+                "to_string" => Some(Ty::Str),
+                "push" | "map" | "filter" => Some(Ty::List),
+                "len" => Some(Ty::Int),
+                "any" | "all" | "is_empty" | "contains" | "starts_with" | "ends_with" => Some(Ty::Bool),
+                _ => None,
+            },
+            ExprKind::Block(b) => self.type_of_block(b),
+            ExprKind::If { then, els, .. } => {
+                self.type_of_block(then).or_else(|| els.as_ref().and_then(|e| self.type_of(e)))
+            }
+            _ => None,
+        }
+    }
+
+    fn type_of_block(&self, b: &Block) -> Option<Ty> {
+        match b.stmts.last() {
+            Some(Stmt::Expr(e)) => self.type_of(e),
+            _ => None,
         }
     }
 
@@ -1019,7 +1207,7 @@ impl Native<'_> {
         if let (Loc::Reg(r), true) = (loc, direct) {
             return self.eval(value, r);
         }
-        if has_call(value) {
+        if self.has_call(value) {
             let outer = self.fresh_temps(TEMPS[0]);
             let ty = self.eval(value, TEMPS[0])?;
             self.store_loc(loc, TEMPS[0]);
@@ -1040,7 +1228,7 @@ impl Native<'_> {
                 // The new variable is not visible in its own initializer.
                 let ty = self.eval_into(value, loc, true)?;
                 let known = match ty {
-                    Ty::Int | Ty::Bool => true,
+                    Ty::Int | Ty::Bool | Ty::Str => true,
                     // An empty list says nothing about its items; ask the type checker.
                     // (`_` is never read, so its items do not matter.)
                     Ty::List => {
@@ -1049,10 +1237,10 @@ impl Native<'_> {
                     _ => false,
                 };
                 if !known {
-                    return unsupported("a variable that is not an Int, a Bool or a List<Int>", *name_span);
+                    return unsupported("a variable that is not an Int, a Bool, a String or a List<Int>", *name_span);
                 }
-                // `_` cannot be read, but a list in it is still released with the scope.
-                if name != "_" || ty == Ty::List {
+                // `_` cannot be read, but what it holds is still released with the scope.
+                if name != "_" || ty.heap() {
                     self.declare(name, Local { ty, loc });
                 }
             }
@@ -1061,8 +1249,8 @@ impl Native<'_> {
                     return unsupported("assigning to anything but a variable", target.span);
                 };
                 let local = self.lookup(name, target.span)?;
-                if local.ty == Ty::List {
-                    return self.assign_list(name, local, value);
+                if local.ty.heap() {
+                    return self.assign_heap(name, local, value);
                 }
                 // `x = x + 1` can be computed in place: x is read before it is written.
                 let updates_itself = match &value.kind {
@@ -1071,7 +1259,7 @@ impl Native<'_> {
                     }
                     _ => false,
                 };
-                let direct = !has_call(value) && (updates_itself || !mentions(value, name));
+                let direct = !self.has_call(value) && (updates_itself || !mentions(value, name));
                 self.eval_into(value, local.loc, direct)?;
             }
             Stmt::While { cond, body, .. } => {
@@ -1159,12 +1347,12 @@ impl Native<'_> {
         Ok(())
     }
 
-    /// `name = value` for a list variable: the list it held is given up.
-    fn assign_list(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
+    /// `name = value` for a list or string variable: what it held is given up.
+    fn assign_heap(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
         // `xs = xs.push(v)` hands the variable's own reference to `push`, which
         // can then add the item in place instead of copying the list.
         if let ExprKind::MethodCall { recv, name: method, args, .. } = &value.kind {
-            if method == "push" && args.len() == 1 && matches!(&recv.kind, ExprKind::Ident(n) if n == name) {
+            if local.ty == Ty::List && method == "push" && args.len() == 1 && matches!(&recv.kind, ExprKind::Ident(n) if n == name) {
                 let t = self.take_temp(value.span)?;
                 let ty = self.eval(&args[0], t)?;
                 self.expect_int(ty, args[0].span)?;
@@ -1187,11 +1375,13 @@ impl Native<'_> {
             }
         }
         let t = self.take_temp(value.span)?;
-        self.owned_list(value, t)?;
+        if self.eval(value, t)? != local.ty {
+            return unsupported("this assignment", value.span);
+        }
         self.load_loc(RCX, local.loc);
         self.store_loc(local.loc, t);
         self.free.push(t);
-        self.call_rt("list_release");
+        self.call_rt(local.ty.release());
         Ok(())
     }
 
@@ -1250,7 +1440,7 @@ impl Native<'_> {
         if let Some((b, ty)) = self.simple(rhs) {
             return Ok((Opnd::Reg(left), b, ty, None, false));
         }
-        if has_call(rhs) || self.free.is_empty() {
+        if self.has_call(rhs) || self.free.is_empty() {
             // Park the left operand in the frame and reuse its register.
             let slot = self.push_spill();
             self.a.store(slot, left);
@@ -1286,12 +1476,10 @@ impl Native<'_> {
             ExprKind::Ident(name) => {
                 let local = self.lookup(name, e.span)?;
                 self.load_loc(dst, local.loc);
-                if local.ty == Ty::List {
-                    // One more owner.
-                    self.a.inc_mem(M(dst, 0));
-                }
+                self.retain(dst, local.ty);
                 Ok(local.ty)
             }
+            ExprKind::Str(parts) => self.string(parts, dst),
             ExprKind::List(items) => {
                 self.a.mov_imm64(RCX, items.len() as i64);
                 self.call_rt("list_new");
@@ -1505,17 +1693,39 @@ impl Native<'_> {
                     (Some((Opnd::Reg(reg), lt)), Some((b, rt))) => Some((reg, b, lt, rt)),
                     _ => None,
                 };
+                // Strings are compared by the runtime: 1 or 0 for equality, and
+                // negative / zero / positive for order.
+                let routine = if matches!(op, BinOp::Eq | BinOp::Ne) { "str_eq" } else { "str_cmp" };
+                let expected = (routine == "str_eq") as i32;
+                if let Some((left, right, Ty::Str, Ty::Str)) = direct {
+                    // Two variables: nothing to evaluate or release.
+                    self.a.mov_rr(RCX, left);
+                    self.load_opnd(RDX, right);
+                    self.call_rt(routine);
+                    self.a.alu_imm(7, RAX, expected);
+                    self.a.jcc(condition(*op) ^ 1, no);
+                    return Ok(());
+                }
                 let (left, b, temp, spilled, owned, lt, rt) = match direct {
                     Some((reg, b, lt, rt)) => (Opnd::Reg(reg), b, None, false, None, lt, rt),
                     None => {
                         let t = self.take_temp(e.span)?;
                         let lt = self.eval(l, t)?;
+                        if lt == Ty::Str {
+                            let slot = self.push_spill();
+                            self.a.store(slot, t);
+                            self.str_op(routine, (slot, true), Some(r), t)?;
+                            self.free.push(t);
+                            self.a.alu_imm(7, RAX, expected);
+                            self.a.jcc(condition(*op) ^ 1, no);
+                            return Ok(());
+                        }
                         let (a, b, rt, temp, spilled) = self.operands(t, r)?;
                         (a, b, temp, spilled, Some(t), lt, rt)
                     }
                 };
-                if lt == Ty::List || rt == Ty::List {
-                    return unsupported("comparing lists", e.span);
+                if lt != rt || !matches!(lt, Ty::Int | Ty::Bool) {
+                    return unsupported("comparing anything but Ints, Bools and Strings", e.span);
                 }
                 self.load_opnd(RAX, left);
                 match b {
@@ -1545,10 +1755,13 @@ impl Native<'_> {
         if name == "print" {
             return self.print(&args[0]);
         }
-        if self.in_runtime && name.starts_with("__") {
+        if self.in_runtime && name.starts_with("__") && name != "__copy" {
             return self.intrinsic(name, args, dst, span);
         }
         let key = if self.in_runtime { format!("%{name}") } else { name.to_string() };
+        if self.in_runtime {
+            self.need_rt(name);
+        }
         let Some(info) = self.fns.get(&key) else {
             return unsupported(format!("the function `{name}`"), span);
         };
@@ -1563,7 +1776,7 @@ impl Native<'_> {
         let outer = std::mem::take(&mut self.free);
         let mut parked: Vec<Option<M>> = vec![None; args.len()];
         for (i, arg) in args.iter().enumerate() {
-            if has_call(arg) {
+            if self.has_call(arg) {
                 // The call inside would overwrite the arguments computed so far.
                 for j in 0..i {
                     if parked[j].is_none() {
@@ -1608,6 +1821,22 @@ impl Native<'_> {
                 self.release(temp, spilled);
                 Ok(Ty::Unit)
             }
+            ("__load8", [address]) => {
+                self.eval(address, dst)?;
+                self.a.mov_rr(RAX, dst);
+                self.a.buf.extend_from_slice(&[0x0F, 0xB6, 0x00]); // movzx eax, byte [rax]
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            ("__store8", [address, value]) => {
+                self.eval(address, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, value)?;
+                self.load_opnd(RCX, a);
+                self.load_opnd(RAX, b);
+                self.a.buf.extend_from_slice(&[0x88, 0x01]); // mov [rcx], al
+                self.release(temp, spilled);
+                Ok(Ty::Unit)
+            }
             ("__alloc", [bytes]) => {
                 self.eval(bytes, dst)?;
                 self.a.mov_rr(RCX, dst);
@@ -1635,8 +1864,135 @@ impl Native<'_> {
         }
     }
 
-    /// A method of a list.
+    /// A string with `{...}` parts: the pieces are added to a new string one by one.
+    fn string(&mut self, parts: &[StrPart], dst: u8) -> R<Ty> {
+        if parts.iter().all(|p| matches!(p, StrPart::Lit(_))) {
+            let text: String = parts.iter().map(|p| if let StrPart::Lit(t) = p { t.as_str() } else { "" }).collect();
+            let constant = self.str_constant(&text);
+            self.lea_label(dst, constant);
+            return Ok(Ty::Str);
+        }
+        // Enough room for the usual case, so that adding the pieces does not
+        // have to move the string: an Int takes at most 20 bytes.
+        let room: usize = parts
+            .iter()
+            .map(|p| match p {
+                StrPart::Lit(text) => text.len(),
+                StrPart::Expr(value) => match self.type_of(value) {
+                    Some(Ty::Int) => 20,
+                    Some(Ty::Bool) => 5,
+                    _ => 24,
+                },
+            })
+            .sum();
+        self.a.mov_imm64(RCX, room as i64);
+        self.call_rt("str_new");
+        let building = self.push_spill();
+        self.a.store(building, RAX);
+        for part in parts {
+            match part {
+                StrPart::Lit(text) if text.is_empty() => continue,
+                StrPart::Lit(text) => {
+                    let bytes = self.constant(text.as_bytes());
+                    self.lea_label(RDX, bytes);
+                    self.a.mov_imm64(R8, text.len() as i64);
+                    self.a.load(RCX, building);
+                    self.call_rt("str_append");
+                }
+                StrPart::Expr(value) => {
+                    let (slot, owned, ty) = self.park(value, dst)?;
+                    match ty {
+                        Ty::Int => {
+                            self.a.load(RCX, building);
+                            self.a.load(RDX, slot);
+                            self.call_rt("str_append_int");
+                        }
+                        Ty::Bool => {
+                            self.bool_text(slot);
+                            self.a.load(RCX, building);
+                            self.call_rt("str_append");
+                        }
+                        Ty::Str => {
+                            self.a.load(RCX, building);
+                            self.a.load(RDX, slot);
+                            self.call_rt("str_append_str");
+                            if owned {
+                                self.a.store(building, RAX);
+                                self.a.load(RCX, slot);
+                                self.call_rt("str_release");
+                                self.a.load(RAX, building);
+                            }
+                        }
+                        _ => return unsupported("this kind of value inside a string", value.span),
+                    }
+                    self.spill_depth -= 1;
+                }
+            }
+            self.a.store(building, RAX);
+        }
+        self.a.load(dst, building);
+        self.spill_depth -= 1;
+        Ok(Ty::Str)
+    }
+
+    /// Puts the text of the Bool in `slot` in rdx and its length in r8.
+    fn bool_text(&mut self, slot: M) {
+        let (yes, no) = (self.constant(b"true"), self.constant(b"false"));
+        let (is_false, done) = (self.a.label(), self.a.label());
+        self.a.cmp_imm(slot, 0);
+        self.a.jcc(CC_E, is_false);
+        self.lea_label(RDX, yes);
+        self.a.mov_imm64(R8, 4);
+        self.a.jmp(done);
+        self.a.bind(is_false);
+        self.lea_label(RDX, no);
+        self.a.mov_imm64(R8, 5);
+        self.a.bind(done);
+    }
+
+    /// A method call. Which methods there are depends on the receiver.
     fn method(&mut self, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        match (self.type_of(recv), name, args) {
+            (Some(Ty::List), ..) => self.list_method(recv, name, name_span, args, dst),
+            (Some(Ty::Str), "to_string", []) => self.eval(recv, dst),
+            (Some(Ty::Int), "to_string", []) => {
+                self.eval(recv, dst)?;
+                self.a.mov_rr(RCX, dst);
+                self.call_rt("str_from_int");
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Str)
+            }
+            (Some(Ty::Bool), "to_string", []) => {
+                let (yes, no) = (self.str_constant("true"), self.str_constant("false"));
+                let (is_false, done) = (self.a.label(), self.a.label());
+                self.cond(recv, is_false)?;
+                self.lea_label(dst, yes);
+                self.a.jmp(done);
+                self.a.bind(is_false);
+                self.lea_label(dst, no);
+                self.a.bind(done);
+                Ok(Ty::Str)
+            }
+            (Some(Ty::Str), ..) => {
+                let (routine, result) = match (name, args.len()) {
+                    ("len", 0) => ("str_chars", Ty::Int),
+                    ("is_empty", 0) => ("str_is_empty", Ty::Bool),
+                    ("contains", 1) => ("str_contains", Ty::Bool),
+                    ("starts_with", 1) => ("str_starts_with", Ty::Bool),
+                    ("ends_with", 1) => ("str_ends_with", Ty::Bool),
+                    _ => return unsupported(format!("the method `{name}` of a String"), name_span),
+                };
+                let (slot, owned, _) = self.park(recv, dst)?;
+                self.str_op(routine, (slot, owned), args.first(), dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(result)
+            }
+            _ => unsupported(format!("the method `{name}` here"), name_span),
+        }
+    }
+
+    /// A method of a list.
+    fn list_method(&mut self, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (name, args) {
             ("len", []) => {
                 if let Some(local) = self.list_var(recv) {
@@ -1783,48 +2139,72 @@ impl Native<'_> {
         Ok(result)
     }
 
-    /// `print("text {value} ...")`: writes each piece, then a line break.
+    /// `print(...)`: a literal is written piece by piece, without building
+    /// the string; anything else is a string to write. Then a line break.
     fn print(&mut self, arg: &Expr) -> R<Ty> {
-        let ExprKind::Str(parts) = &arg.kind else {
-            return unsupported("printing anything but a string literal", arg.span);
-        };
-        for part in parts {
-            match part {
-                StrPart::Lit(text) if text.is_empty() => {}
-                StrPart::Lit(text) => self.write(text.as_bytes(), STDOUT),
-                StrPart::Expr(value) => {
-                    let outer = std::mem::replace(&mut self.free, TEMPS[1..].to_vec());
-                    let t = TEMPS[0];
-                    let ty = self.eval(value, t)?;
-                    self.free = outer;
-                    match ty {
-                        Ty::Int => {
-                            self.a.mov_rr(RCX, t);
-                            self.a.mov_imm64(RDX, STDOUT);
-                            self.call_label(self.rt_print_int);
-                        }
-                        Ty::Bool => {
-                            let (yes, no) = (self.constant(b"true"), self.constant(b"false"));
-                            let (is_false, write) = (self.a.label(), self.a.label());
-                            self.a.alu_rr(0x85, t, t);
-                            self.a.jcc(CC_Z, is_false);
-                            self.lea_label(RCX, yes);
-                            self.a.mov_imm64(RDX, 4);
-                            self.a.jmp(write);
-                            self.a.bind(is_false);
-                            self.lea_label(RCX, no);
-                            self.a.mov_imm64(RDX, 5);
-                            self.a.bind(write);
-                            self.a.mov_imm64(R8, STDOUT);
-                            self.call_label(self.rt_write);
-                        }
-                        _ => return unsupported("printing a value that is not an Int or a Bool", value.span),
+        match &arg.kind {
+            ExprKind::Str(parts) => {
+                for part in parts {
+                    match part {
+                        StrPart::Lit(text) if text.is_empty() => {}
+                        StrPart::Lit(text) => self.write(text.as_bytes(), STDOUT),
+                        StrPart::Expr(value) => self.print_value(value)?,
                     }
                 }
             }
+            _ => self.print_value(arg)?,
         }
-        self.write(b"\n", STDOUT);
+        self.write(b"
+", STDOUT);
         Ok(Ty::Unit)
+    }
+
+    /// Writes the text of one value.
+    fn print_value(&mut self, value: &Expr) -> R<()> {
+        let outer = std::mem::replace(&mut self.free, TEMPS[1..].to_vec());
+        let t = TEMPS[0];
+        // A string held by a variable is written from where it is.
+        let borrowed = self.heap_var(value).filter(|local| local.ty == Ty::Str);
+        let ty = match borrowed {
+            Some(local) => {
+                self.load_loc(t, local.loc);
+                Ty::Str
+            }
+            None => self.eval(value, t)?,
+        };
+        self.free = outer;
+        match ty {
+            Ty::Int => {
+                self.a.mov_rr(RCX, t);
+                self.a.mov_imm64(RDX, STDOUT);
+                self.call_label(self.rt_print_int);
+            }
+            Ty::Bool => {
+                let slot = self.push_spill();
+                self.a.store(slot, t);
+                self.bool_text(slot);
+                self.spill_depth -= 1;
+                self.a.mov_rr(RCX, RDX);
+                self.a.mov_rr(RDX, R8);
+                self.a.mov_imm64(R8, STDOUT);
+                self.call_label(self.rt_write);
+            }
+            Ty::Str => {
+                let slot = self.push_spill();
+                self.a.store(slot, t);
+                self.a.lea(RCX, M(t, ELEMENTS));
+                self.a.load(RDX, M(t, LENGTH));
+                self.a.mov_imm64(R8, STDOUT);
+                self.call_label(self.rt_write);
+                if borrowed.is_none() {
+                    self.a.load(RCX, slot);
+                    self.call_rt("str_release");
+                }
+                self.spill_depth -= 1;
+            }
+            _ => return unsupported("printing this kind of value", value.span),
+        }
+        Ok(())
     }
 
     fn write(&mut self, bytes: &[u8], to: i64) {

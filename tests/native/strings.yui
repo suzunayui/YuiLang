@@ -1,0 +1,144 @@
+// 文字列: 定数、補間、比較、メソッド、関数との受け渡し、リストとの組み合わせ
+
+fn greet(name: String) -> String {
+  "hello, {name}!"
+}
+
+fn repeat(s: String, n: Int) -> String {
+  let mut out = ""
+  for i in 0..n {
+    out = "{out}{s}"
+  }
+  out
+}
+
+fn describe(n: Int) -> String {
+  if n < 0 {
+    return "negative"
+  }
+  if n == 0 { "zero" } else { "positive {n}" }
+}
+
+fn order(a: String, b: String) -> String {
+  if a < b {
+    "{a} < {b}"
+  } else if a == b {
+    "{a} == {b}"
+  } else {
+    "{a} > {b}"
+  }
+}
+
+fn digits(n: Int) -> Int {
+  n.to_string().len()
+}
+
+fn pick(flag: Bool, a: String, b: String) -> String {
+  if flag { a } else { b }
+}
+
+fn main() uses io {
+  print("plain")
+  print("")
+  let name = "yui"
+  print(name)
+  print(greet(name))
+  let world_text = greet("world")
+  print("{world_text} {greet(name)} {greet(greet(name))}")
+  let nothing = ""
+  print("{name} has {name.len()} letters, empty: {name.is_empty()} {nothing.is_empty()}")
+  print(repeat("ab", 5))
+  print("[{repeat(name, 0)}] [{repeat(name, 1)}]")
+  print("{describe(-3)} {describe(0)} {describe(42)}")
+
+  // 数と真偽値の埋め込み。画面に直接書く場合と、文字列を作る場合の両方
+  let big = 9223372036854775807
+  let small = -9223372036854775807 - 1
+  let text = "{big} {small} {0} {-7} {1000000} {true} {false} {big > small}"
+  print(text)
+  print("{big} {small} {0} {-7} {1000000} {true} {false} {big > small}")
+  print("{12.to_string()} {(3 - 5).to_string()} {true.to_string()} {(1 > 2).to_string()} {name.to_string()}")
+  print("digits {digits(0)} {digits(-45)} {digits(big)} {digits(small)}")
+
+  // 比較
+  print(order("apple", "banana"))
+  print(order("pear", "pear"))
+  print(order("b", "abc"))
+  print(order("ab", "abc"))
+  print(order("", "a"))
+  let same = "a long piece of text, longer than eight bytes"
+  let other = "a long piece of text, longer than eight bytez"
+  let half = "a long piece of text, "
+  let copy = "{half}longer than eight bytes"
+  print("{same == same} {same == other} {same != other} {same == copy} {copy == same} {greet(same) == greet(copy)}")
+  let z = "z"
+  print("{name == greet(name)} {name != other} {repeat(name, 1) == name} {name <= name} {name >= z} {name < z && z > name}")
+
+  // メソッド
+  let sentence = "the quick brown fox"
+  let the = "the"
+  let fox = "fox"
+  let quick = "quick"
+  print("{sentence.contains(quick)} {sentence.contains(z)} {sentence.contains(nothing)} {sentence.contains(sentence)}")
+  print("{sentence.starts_with(the)} {sentence.starts_with(fox)} {sentence.ends_with(fox)} {sentence.ends_with(the)}")
+  print("{fox.contains(sentence)} {fox.starts_with(sentence)} {fox.ends_with(sentence)} {greet(sentence).ends_with(greet(fox))}")
+  print("{greet(fox).contains(repeat(fox, 1))} {greet(fox).starts_with(greet(fox))} {repeat(the, 3).len()}")
+
+  // 日本語: 長さは文字数
+  let jp = "こんにちは、世界"
+  let world = "世界"
+  let bye = "さようなら"
+  let accent = "é"
+  let face = "😀a"
+  print("{jp} {jp.len()} {greet(jp).len()} {jp.contains(world)} {jp < bye} {accent.len()} {face.len()} {face}")
+
+  // 値として扱われる。代入で前の文字列を手放す
+  let mut a = "start"
+  let b = a
+  a = "{a}-more"
+  a = "{a}-{b.len()}"
+  print("{a} / {b}")
+  let mut log = ""
+  let mut i = 0
+  while i < 5 {
+    if i == 3 {
+      i = i + 1
+      continue
+    }
+    let piece = "<{i}>"
+    log = "{log}{piece}"
+    i = i + 1
+  }
+  print(log)
+
+  // 計算の途中で文字列の操作を呼ぶ
+  let mut count = 0
+  for k in 0..50 {
+    let s = "item-{k % 7}"
+    if s == log {
+      count = count + 1000
+    }
+    count = count + s.len() * 2 + k
+    count = k + count - name.len()
+  }
+  print("count {count} {count + log.len() * 3 - name.len()} {name.len() + count}")
+
+  // リストと組み合わせる
+  let xs = [3, 1, 4, 1, 5]
+  let mut joined = ""
+  for x in xs {
+    if joined.is_empty() {
+      joined = x.to_string()
+    } else {
+      joined = "{joined},{x}"
+    }
+  }
+  print("{joined} ({xs.len()} items, sum {xs.fold(0, |acc, x| acc + x)})")
+  let four = "4"
+  print("{xs.map(|x| (x * 11).to_string().len() + x).fold(0, |acc, x| acc + x)} {xs.any(|x| x.to_string() == four)}")
+  print("{xs.filter(|x| greet(x.to_string()) != greet(four)).len()} {xs.all(|x| digits(x) == 1)}")
+
+  let _ = greet("nobody")
+  let left = pick(true, "left", greet("right"))
+  print("{left}{pick(false, name, greet(name))}")
+}

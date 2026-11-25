@@ -6,6 +6,12 @@
 //   __alloc(bytes) -> Int         メモリを確保して番地を返す
 //   __realloc(address, bytes) -> Int   大きさを変えて（移動するかもしれない）番地を返す
 //   __free(address)               メモリを返す
+//   __load8(address) -> Int       その番地の 1 バイトを読む（0〜255）
+//   __store8(address, value)      その番地に 1 バイトを書く
+//   __copy(to, from, bytes)       メモリを写す
+//
+// 足し算・引き算・掛け算は溢れを調べない。単項のマイナスと、定数以外での割り算は使わない
+// （エラー表示がこのファイルの位置を指せないため）。
 //
 // リスト（List<Int>）の形: 先頭から 8 バイトずつ [参照カウント][長さ][容量][要素 0][要素 1]...
 
@@ -20,11 +26,7 @@ fn list_new(capacity: Int) -> Int {
 // 持ち主が 1 人減る。最後の 1 人だったらメモリを返す
 fn list_release(list: Int) {
   let count = __load(list)
-  if count == 1 {
-    __free(list)
-  } else {
-    __store(list, count - 1)
-  }
+  if count == 1 { __free(list) } else { __store(list, count - 1) }
 }
 
 // list の末尾に value を足したリストを返す。list の持ち主 1 人分を受け取り、返すリストの持ち主 1 人分を渡す。
@@ -56,4 +58,155 @@ fn list_push(list: Int, value: Int) -> Int {
   __store(copy + 8, length + 1)
   __store(list, count - 1)
   copy
+}
+
+// 文字列の形: 先頭から [参照カウント][バイト数][容量][UTF-8 のバイト列]。
+// 参照カウントが負のものはプログラムに埋め込まれた定数で、解放も書き換えもしない
+
+fn str_new(capacity: Int) -> Int {
+  let s = __alloc(24 + capacity)
+  __store(s, 1)
+  __store(s + 8, 0)
+  __store(s + 16, capacity)
+  s
+}
+
+fn str_release(s: Int) {
+  let count = __load(s)
+  if count == 1 { __free(s) } else if count > 1 { __store(s, count - 1) }
+}
+
+// ここから下の str_append 系は、作りかけの文字列（持ち主が 1 人で、定数でない）にだけ使う。
+// あと extra バイト入るようにして返す（移動するかもしれない）
+fn str_reserve(s: Int, extra: Int) -> Int {
+  let length = __load(s + 8)
+  if length + extra <= __load(s + 16) { return s }
+  let room = (length + extra) * 2
+  let grown = __realloc(s, 24 + room)
+  __store(grown + 16, room)
+  grown
+}
+
+fn str_append(s: Int, source: Int, count: Int) -> Int {
+  let out = str_reserve(s, count)
+  let length = __load(out + 8)
+  __copy(out + 24 + length, source, count)
+  __store(out + 8, length + count)
+  out
+}
+
+fn str_append_str(s: Int, piece: Int) -> Int {
+  str_append(s, piece + 24, __load(piece + 8))
+}
+
+// 10 進表記を足す。最小の整数も扱えるように、負の数のまま桁を取り出す
+fn str_append_int(s: Int, value: Int) -> Int {
+  let out = str_reserve(s, 20)
+  let length = __load(out + 8)
+  let mut n = value
+  if n > 0 {
+    n = 0 - n
+  }
+  let mut digits = 1
+  let mut rest = n / 10
+  while rest != 0 {
+    digits = digits + 1
+    rest = rest / 10
+  }
+  let mut at = out + 24 + length
+  let mut written = digits
+  if value < 0 {
+    __store8(at, 45)
+    at = at + 1
+    written = written + 1
+  }
+  let mut i = digits
+  while i > 0 {
+    i = i - 1
+    __store8(at + i, 48 - n % 10)
+    n = n / 10
+  }
+  __store(out + 8, length + written)
+  out
+}
+
+fn str_from_int(value: Int) -> Int {
+  str_append_int(str_new(20), value)
+}
+
+// count バイトが同じなら 1。8 バイトずつ比べ、端数は 1 バイトずつ
+fn bytes_equal(a: Int, b: Int, count: Int) -> Int {
+  let mut i = 0
+  while i + 8 <= count {
+    if __load(a + i) != __load(b + i) { return 0 }
+    i = i + 8
+  }
+  while i < count {
+    if __load8(a + i) != __load8(b + i) { return 0 }
+    i = i + 1
+  }
+  1
+}
+
+fn str_eq(a: Int, b: Int) -> Int {
+  let count = __load(a + 8)
+  if count != __load(b + 8) { return 0 }
+  bytes_equal(a + 24, b + 24, count)
+}
+
+// 辞書順で a が前なら負、同じなら 0、後なら正。UTF-8 はバイト順と文字コード順が一致する
+fn str_cmp(a: Int, b: Int) -> Int {
+  let a_count = __load(a + 8)
+  let b_count = __load(b + 8)
+  let mut i = 0
+  while i < a_count && i < b_count {
+    let x = __load8(a + 24 + i)
+    let y = __load8(b + 24 + i)
+    if x != y { return x - y }
+    i = i + 1
+  }
+  a_count - b_count
+}
+
+// 文字数。UTF-8 の続きのバイト（128〜191）は数えない
+fn str_chars(s: Int) -> Int {
+  let count = __load(s + 8)
+  let mut chars = 0
+  let mut i = 0
+  while i < count {
+    let byte = __load8(s + 24 + i)
+    if byte < 128 || byte > 191 {
+      chars = chars + 1
+    }
+    i = i + 1
+  }
+  chars
+}
+
+fn str_is_empty(s: Int) -> Int {
+  if __load(s + 8) == 0 { 1 } else { 0 }
+}
+
+fn str_starts_with(s: Int, part: Int) -> Int {
+  let count = __load(part + 8)
+  if count > __load(s + 8) { return 0 }
+  bytes_equal(s + 24, part + 24, count)
+}
+
+fn str_ends_with(s: Int, part: Int) -> Int {
+  let count = __load(part + 8)
+  let length = __load(s + 8)
+  if count > length { return 0 }
+  bytes_equal(s + 24 + length - count, part + 24, count)
+}
+
+fn str_contains(s: Int, part: Int) -> Int {
+  let count = __load(part + 8)
+  let last = __load(s + 8) - count
+  let mut i = 0
+  while i <= last {
+    if bytes_equal(s + 24 + i, part + 24, count) == 1 { return 1 }
+    i = i + 1
+  }
+  0
 }
