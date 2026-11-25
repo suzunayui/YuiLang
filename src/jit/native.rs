@@ -22,6 +22,11 @@
 //! which is kept alive meanwhile. String literals are constants in the
 //! executable, marked by a negative count that is never changed.
 //!
+//! A function value (a closure, or a function used by name) is a counted
+//! block `[count][code][how to free it][captured values]`. Its code takes
+//! the block in rcx and the arguments after it. Captured values are copied
+//! into the block when the closure is made.
+//!
 //! Generic types are compiled once per combination of type arguments. The
 //! code that frees a value of each type (and what it holds) is generated on
 //! demand.
@@ -81,6 +86,15 @@ const POS: u8 = 3;
 const OUT: u8 = 4;
 /// The value a `match` looks at.
 const SCRUT: u8 = 5;
+/// The function a loop over a list calls for each item.
+const FUNC: u8 = 6;
+/// A variable a closure captured, by its position in the closure's block.
+const CAPTURE: u8 = 7;
+
+/// Offsets in the block of a function value.
+const FN_CODE: i32 = 8;
+const FN_FREE: i32 = 16;
+const FN_CAPTURES: i32 = 24;
 
 /// Enum values below this are variants without fields, not addresses.
 const SMALL: i32 = 4096;
@@ -124,6 +138,8 @@ enum Ty {
     Struct(u32),
     /// An enum: the number of a variant without fields, or a pointer to a counted block.
     Enum(u32),
+    /// A function value: a pointer to a counted block.
+    Fn(u32),
     /// The expression does not produce a value (`return`, `break`, ...).
     Never,
 }
@@ -131,7 +147,7 @@ enum Ty {
 impl Ty {
     /// Whether values of this type are counted references.
     fn heap(self) -> bool {
-        matches!(self, Ty::List(_) | Ty::Str | Ty::Struct(_) | Ty::Enum(_))
+        matches!(self, Ty::List(_) | Ty::Str | Ty::Struct(_) | Ty::Enum(_) | Ty::Fn(_))
     }
 }
 
@@ -144,6 +160,27 @@ enum Def {
     Struct(Vec<(String, Ty)>),
     /// The variants, in the order of the declaration, with the types of their fields.
     Enum(Vec<(String, Vec<Ty>)>),
+    /// The types of the parameters and of the result.
+    Fn(Vec<Ty>, Ty),
+}
+
+/// A closure whose body is still to be compiled.
+struct Closure {
+    code: usize,
+    /// Code that frees the closure's block.
+    free: usize,
+    bytes: usize,
+    /// Name, where it is declared, and type.
+    params: Vec<(String, usize, Ty)>,
+    captures: Vec<(String, Ty)>,
+    ret: Ty,
+    body: std::rc::Rc<Expr>,
+}
+
+/// What a function to compile is made of.
+enum Body<'b> {
+    Block(&'b Block),
+    Expr(&'b Expr),
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +237,13 @@ struct Native<'a> {
     drop_labels: HashMap<u32, usize>,
     push_labels: HashMap<u32, usize>,
     glue_queue: Vec<(bool, u32)>,
+    /// Closures to compile, and for each function used as a value, the code
+    /// that calls it the way a closure is called: (label, the function).
+    closures: Vec<Closure>,
+    thunks: HashMap<String, usize>,
+    thunk_queue: Vec<(usize, usize)>,
+    /// Frees the block of a function value that captured nothing.
+    plain_free: Option<usize>,
     /// Positions of `call [rip + ...]` displacements and the import they call.
     iat_fixups: Vec<(usize, usize)>,
     /// Constant data, placed after the code.
@@ -289,6 +333,10 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         drop_labels: HashMap::new(),
         push_labels: HashMap::new(),
         glue_queue: Vec::new(),
+        closures: Vec::new(),
+        thunks: HashMap::new(),
+        thunk_queue: Vec::new(),
+        plain_free: None,
         iat_fixups: Vec::new(),
         data: Vec::new(),
         bss_fixups: Vec::new(),
@@ -381,12 +429,32 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     for f in &decls {
         n.function(f, &f.name)?;
     }
-    while let Some((push, id)) = n.glue_queue.pop() {
-        if push {
-            n.emit_push(id);
+    // Whatever the functions needed: closures (which may need more in turn),
+    // and code generated per type.
+    loop {
+        if let Some(closure) = n.closures.pop() {
+            n.closure(closure)?;
+        } else if let Some((push, id)) = n.glue_queue.pop() {
+            if push {
+                n.emit_push(id);
+            } else {
+                n.emit_drop(id);
+            }
+        } else if let Some((label, target)) = n.thunk_queue.pop() {
+            // The block comes first; the arguments move up by one.
+            n.a.bind(label);
+            n.a.mov_rr(RCX, RDX);
+            n.a.mov_rr(RDX, R8);
+            n.a.mov_rr(R8, R9);
+            n.a.jmp(target);
         } else {
-            n.emit_drop(id);
+            break;
         }
+    }
+    if let Some(label) = n.plain_free {
+        n.a.bind(label);
+        n.a.mov_imm64(RDX, FN_CAPTURES as i64);
+        n.a.jmp(n.rt_pool_free);
     }
     if n.uses_heap {
         // Only the routines that are reached, to keep the executable small.
@@ -414,6 +482,12 @@ fn hidden(id: usize, kind: u8, depth: u32, weight: &mut HashMap<String, usize>, 
     let name = format!("%{kind}@{id}");
     *weight.entry(name.clone()).or_default() += 2 * 8usize.saturating_pow(depth.min(6));
     decls.push((id, name, kind));
+}
+
+/// Whether a function given to `map` and its relatives is compiled as the
+/// body of the loop: a closure written in place that does not leave early.
+fn inlined(f: &Expr) -> bool {
+    matches!(&f.kind, ExprKind::Closure { body, .. } if !crate::bytecode::can_return(body))
 }
 
 /// Registers the variables a pattern introduces.
@@ -460,15 +534,26 @@ fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut 
             weigh(list, depth, weight, decls);
             weigh(index, depth, weight, decls);
         }
-        ExprKind::MethodCall { recv, name_span, args, .. } => {
+        ExprKind::MethodCall { recv, name, name_span, args } => {
             weigh(recv, depth, weight, decls);
+            let id = name_span.start;
+            let looping = matches!(name.as_str(), "map" | "filter" | "fold" | "any" | "all");
+            if looping && !args.last().is_some_and(inlined) {
+                // A function given by name or in a variable is called for each item.
+                for kind in [LIST, POS, OUT, FUNC] {
+                    hidden(id, kind, depth + 1, weight, decls);
+                }
+            }
             for arg in args {
                 let ExprKind::Closure { params, body, .. } = &arg.kind else {
                     weigh(arg, depth, weight, decls);
                     continue;
                 };
+                if !looping || !inlined(arg) {
+                    // Compiled as a function of its own.
+                    continue;
+                }
                 // The closure becomes the body of a loop over the list.
-                let id = name_span.start;
                 hidden(id, LIST, depth + 1, weight, decls);
                 hidden(id, POS, depth + 1, weight, decls);
                 match params.as_slice() {
@@ -669,7 +754,7 @@ impl Native<'_> {
     /// One more owner for the value in `reg`.
     fn retain(&mut self, reg: u8, ty: Ty) {
         match ty {
-            Ty::List(_) | Ty::Struct(_) => self.a.inc_mem(M(reg, 0)),
+            Ty::List(_) | Ty::Struct(_) | Ty::Fn(_) => self.a.inc_mem(M(reg, 0)),
             Ty::Enum(_) if self.plain_enum(ty) => {}
             Ty::Enum(_) => {
                 // A variant without fields is a small number, not a block.
@@ -697,7 +782,7 @@ impl Native<'_> {
             Ty::Str => self.call_rt("str_release"),
             Ty::List(_) if !self.item_ty(ty).heap() => self.call_rt("list_release"),
             Ty::Enum(_) if self.plain_enum(ty) => {}
-            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => {
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) => {
                 let label = self.glue(false, id);
                 self.call_label(label);
             }
@@ -740,6 +825,16 @@ impl Native<'_> {
         let def = self.defs[id as usize].clone();
         let (free, done) = (self.a.label(), self.a.label());
         self.a.bind(self.drop_labels[&id]);
+        if matches!(def, Def::Fn(..)) {
+            // The block of a function value knows how to free itself.
+            self.a.cmp_imm(M(RCX, 0), 1);
+            self.a.jcc(CC_E, free);
+            self.a.dec_mem(M(RCX, 0));
+            self.a.b(0xC3);
+            self.a.bind(free);
+            self.a.buf.extend_from_slice(&[0xFF, 0x61, FN_FREE as u8]); // jmp [rcx + FN_FREE]
+            return;
+        }
         if matches!(def, Def::Enum(_)) {
             self.a.alu_imm(7, RCX, SMALL);
             self.a.jcc(CC_B, done);
@@ -784,6 +879,7 @@ impl Native<'_> {
                 }
                 self.a.bind(end);
             }
+            Def::Fn(..) => {}
             Def::List(item) => {
                 let (top, end) = (self.a.label(), self.a.label());
                 self.a.mov_imm64(RSI, 0);
@@ -868,8 +964,54 @@ impl Native<'_> {
     }
 
     fn ty_parse(&mut self, rest: &mut &str, env: &[(String, Ty)], span: Span) -> R<Ty> {
-        let end = rest.find(['<', ',', '>']).unwrap_or(rest.len());
-        let name = rest[..end].trim().to_string();
+        *rest = rest.trim_start();
+        if let Some(after) = rest.strip_prefix("fn(") {
+            // `fn(A, B) -> R uses io`; a result that is a function type may be in parentheses.
+            *rest = after;
+            let mut params = Vec::new();
+            loop {
+                *rest = rest.trim_start();
+                if let Some(after) = rest.strip_prefix(')') {
+                    *rest = after;
+                    break;
+                }
+                params.push(self.ty_parse(rest, env, span)?);
+                *rest = rest.trim_start();
+                match rest.strip_prefix(',') {
+                    Some(after) => *rest = after,
+                    None if rest.starts_with(')') => {}
+                    None => return unsupported("this function type", span),
+                }
+            }
+            let mut ret = Ty::Unit;
+            if let Some(after) = rest.strip_prefix(" -> ") {
+                *rest = after;
+                if let Some(after) = rest.strip_prefix('(') {
+                    *rest = after;
+                    ret = self.ty_parse(rest, env, span)?;
+                    match rest.strip_prefix(')') {
+                        Some(after) => *rest = after,
+                        None => return unsupported("this function type", span),
+                    }
+                } else {
+                    ret = self.ty_parse(rest, env, span)?;
+                }
+            }
+            // Effects do not change how a function value is represented.
+            if let Some(after) = rest.strip_prefix(" uses ") {
+                *rest = after;
+                while let Some(effect) = EFFECTS.iter().find(|effect| rest.starts_with(**effect)) {
+                    *rest = &rest[effect.len()..];
+                    match rest.strip_prefix(", ") {
+                        Some(after) if EFFECTS.iter().any(|effect| after.starts_with(*effect)) => *rest = after,
+                        _ => break,
+                    }
+                }
+            }
+            return Ok(self.fn_ty(&params, ret));
+        }
+        let end = rest.find(['<', ',', '>', ')', ' ']).unwrap_or(rest.len());
+        let name = rest[..end].to_string();
         *rest = &rest[end..];
         let mut args = Vec::new();
         if rest.starts_with('<') {
@@ -887,6 +1029,27 @@ impl Native<'_> {
             *rest = &rest[1..];
         }
         self.ty_apply(&name, &args, env, span)
+    }
+
+    /// The type of functions from `params` to `ret`.
+    fn fn_ty(&mut self, params: &[Ty], ret: Ty) -> Ty {
+        let list = params.iter().map(|ty| self.ty_key(*ty)).collect::<Vec<_>>().join(", ");
+        let key = format!("fn({list}) -> {}", self.ty_key(ret));
+        if let Some(ty) = self.def_ids.get(&key) {
+            return *ty;
+        }
+        let id = self.defs.len() as u32;
+        self.define(key, Ty::Fn(id), Def::Fn(params.to_vec(), ret))
+    }
+
+    fn fn_def(&self, ty: Ty) -> Option<(Vec<Ty>, Ty)> {
+        match ty {
+            Ty::Fn(id) => match &self.defs[id as usize] {
+                Def::Fn(params, ret) => Some((params.clone(), *ret)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn ty_apply(&mut self, name: &str, args: &[Ty], env: &[(String, Ty)], span: Span) -> R<Ty> {
@@ -970,7 +1133,7 @@ impl Native<'_> {
             Ty::Unit => "Unit".to_string(),
             Ty::Str => "String".to_string(),
             Ty::Never => "Never".to_string(),
-            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => self.def_keys[id as usize].clone(),
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) => self.def_keys[id as usize].clone(),
         }
     }
 
@@ -1022,7 +1185,7 @@ impl Native<'_> {
         match &self.defs[id as usize] {
             Def::Struct(fields) => Some(8 + 8 * fields.len()),
             Def::Enum(variants) => Some(16 + 8 * variants.iter().map(|(_, fields)| fields.len()).max().unwrap_or(0)),
-            Def::List(_) => None,
+            Def::List(_) | Def::Fn(..) => None,
         }
     }
 
@@ -1425,10 +1588,61 @@ impl Native<'_> {
 
     /// Compiles `f`, which is registered in `fns` as `key`.
     fn function(&mut self, f: &FnDecl, key: &str) -> R<()> {
+        let info = &self.fns[key];
+        let (label, ret) = (info.label, info.ret);
+        let params: Vec<(String, usize, Ty)> =
+            f.params.iter().zip(&info.params).map(|(p, ty)| (p.name.clone(), p.span.start, *ty)).collect();
+        self.emit_fn(label, &params, &[], ret, Body::Block(&f.body), f.name_span)
+    }
+
+    /// Compiles the body of a closure, and the code that frees its block.
+    fn closure(&mut self, c: Closure) -> R<()> {
+        self.emit_fn(c.code, &c.params, &c.captures, c.ret, Body::Expr(&c.body), c.body.span)?;
+        self.a.bind(c.free);
+        let counted: Vec<(usize, Ty)> =
+            c.captures.iter().enumerate().filter(|(_, (_, ty))| ty.heap()).map(|(i, (_, ty))| (i, *ty)).collect();
+        if !counted.is_empty() {
+            // Gives up what was captured first.
+            self.a.push(RBX);
+            self.a.alu_imm(5, RSP, 32);
+            self.a.mov_rr(RBX, RCX);
+            for (i, ty) in counted {
+                self.a.load(RCX, M(RBX, FN_CAPTURES + 8 * i as i32));
+                self.drop_value(ty);
+            }
+            self.a.mov_rr(RCX, RBX);
+            self.a.alu_imm(0, RSP, 32);
+            self.a.pop(RBX);
+        }
+        if c.bytes <= POOL_MAX {
+            self.a.mov_imm64(RDX, c.bytes as i64);
+            self.a.jmp(self.rt_pool_free);
+        } else {
+            self.a.jmp(self.rt_free);
+        }
+        Ok(())
+    }
+
+    /// Compiles one function. With `captures`, it is the code of a closure:
+    /// the closure's block arrives in rcx, before the parameters, and the
+    /// captured values are read out of it.
+    fn emit_fn(
+        &mut self,
+        label: usize,
+        params: &[(String, usize, Ty)],
+        captures: &[(String, Ty)],
+        ret: Ty,
+        body: Body,
+        span: Span,
+    ) -> R<()> {
         // Decide where every variable lives: the most used ones in registers.
         let mut weight = HashMap::new();
-        let mut decls: Decls = f.params.iter().map(|p| (p.span.start, p.name.clone(), VAR)).collect();
-        weigh_block(&f.body, 0, &mut weight, &mut decls);
+        let mut decls: Decls = params.iter().map(|(name, at, _)| (*at, name.clone(), VAR)).collect();
+        decls.extend(captures.iter().enumerate().map(|(i, (name, _))| (i, name.clone(), CAPTURE)));
+        match &body {
+            Body::Block(block) => weigh_block(block, 0, &mut weight, &mut decls),
+            Body::Expr(e) => weigh(e, 0, &mut weight, &mut decls),
+        }
         let mut order: Vec<usize> = (0..decls.len()).collect();
         order.sort_by_key(|i| std::cmp::Reverse(weight.get(&decls[*i].1).copied().unwrap_or(0)));
         self.decl_loc.clear();
@@ -1456,9 +1670,6 @@ impl Native<'_> {
         self.loops.clear();
         self.pending.clear();
         self.epilogue = self.a.label();
-        let info = &self.fns[key];
-        let (label, ret) = (info.label, info.ret);
-        let param_tys = info.params.clone();
         self.ret = ret;
 
         self.a.bind(label);
@@ -1468,15 +1679,27 @@ impl Native<'_> {
         self.a.alu_imm(5, RSP, 0);
         let frame_at = [self.a.buf.len() - 4, 0];
         let mut scope = HashMap::new();
-        for (i, p) in f.params.iter().enumerate() {
-            let loc = self.decl_loc[&(p.span.start, VAR)];
-            self.store_loc(loc, ARG_REGS[i]);
-            scope.insert(p.name.clone(), Local { ty: param_tys[i], loc, borrowed: false });
+        // In the code of a function value, the block takes the first place.
+        let is_value = !captures.is_empty() || matches!(body, Body::Expr(_));
+        for (i, (name, at, ty)) in params.iter().enumerate() {
+            let loc = self.decl_loc[&(*at, VAR)];
+            self.store_loc(loc, ARG_REGS[i + is_value as usize]);
+            scope.insert(name.clone(), Local { ty: *ty, loc, borrowed: false });
+        }
+        for (i, (name, ty)) in captures.iter().enumerate() {
+            // Borrowed from the block, which whoever called keeps alive.
+            let loc = self.decl_loc[&(i, CAPTURE)];
+            self.a.load(RAX, M(RCX, FN_CAPTURES + 8 * i as i32));
+            self.store_loc(loc, RAX);
+            scope.insert(name.clone(), Local { ty: *ty, loc, borrowed: true });
         }
         self.scopes = vec![scope];
 
-        let t = self.take_temp(f.name_span)?;
-        let ty = self.block(&f.body, t)?;
+        let t = self.take_temp(span)?;
+        let ty = match body {
+            Body::Block(block) => self.block(block, t)?,
+            Body::Expr(e) => self.eval(e, t)?,
+        };
         if ret != Ty::Unit && ty != Ty::Never {
             self.a.mov_rr(RAX, t);
         }
@@ -2140,6 +2363,95 @@ impl Native<'_> {
                 Ok(ty)
             }
             ExprKind::Match { scrutinee, arms } => self.match_(scrutinee, arms, dst, e.span),
+            ExprKind::Closure { params, captures, body } => {
+                let ty = self.expr_ty(e)?;
+                let Some((param_tys, ret)) = self.fn_def(ty) else {
+                    return unsupported("this closure", e.span);
+                };
+                if params.len() != param_tys.len() || params.len() > 3 {
+                    return unsupported("closures with more than three parameters", e.span);
+                }
+                // The captured values are copied into the closure's block.
+                let held = self.pending.len();
+                let mut parts = Vec::new();
+                let mut captured = Vec::new();
+                for (i, name) in captures.iter().enumerate() {
+                    let local = self.lookup(name, e.span)?;
+                    self.load_loc(dst, local.loc);
+                    self.retain(dst, local.ty);
+                    let slot = self.push_spill();
+                    self.a.store(slot, dst);
+                    self.hold(slot, local.ty);
+                    parts.push((slot, FN_CAPTURES + 8 * i as i32));
+                    captured.push((name.clone(), local.ty));
+                }
+                let bytes = FN_CAPTURES as usize + 8 * captures.len();
+                self.fill_block(bytes, &parts, dst);
+                self.spill_depth -= captures.len() as i32;
+                self.pending.truncate(held);
+                let (code, free) = (self.a.label(), self.a.label());
+                self.lea_label(RAX, code);
+                self.a.store(M(dst, FN_CODE), RAX);
+                self.lea_label(RAX, free);
+                self.a.store(M(dst, FN_FREE), RAX);
+                let params = params.iter().zip(&param_tys).map(|(p, ty)| (p.name.clone(), p.span.start, *ty)).collect();
+                self.closures.push(Closure { code, free, bytes, params, captures: captured, ret, body: body.clone() });
+                Ok(ty)
+            }
+            ExprKind::FnRef(name) => {
+                // A function used as a value: a block with nothing captured,
+                // whose code passes the arguments on to the function.
+                let Some(info) = self.fns.get(name) else {
+                    return unsupported(format!("the function `{name}` as a value"), e.span);
+                };
+                if info.params.len() > 3 {
+                    return unsupported("a function with more than three parameters as a value", e.span);
+                }
+                let (params, ret, target) = (info.params.clone(), info.ret, info.label);
+                let ty = self.fn_ty(&params, ret);
+                let code = match self.thunks.get(name) {
+                    Some(label) => *label,
+                    None => {
+                        let label = self.a.label();
+                        self.thunks.insert(name.clone(), label);
+                        self.thunk_queue.push((label, target));
+                        label
+                    }
+                };
+                let free = match self.plain_free {
+                    Some(label) => label,
+                    None => {
+                        let label = self.a.label();
+                        self.plain_free = Some(label);
+                        label
+                    }
+                };
+                self.fill_block(FN_CAPTURES as usize, &[], dst);
+                self.lea_label(RAX, code);
+                self.a.store(M(dst, FN_CODE), RAX);
+                self.lea_label(RAX, free);
+                self.a.store(M(dst, FN_FREE), RAX);
+                Ok(ty)
+            }
+            ExprKind::Call { name, local: true, args, .. } => {
+                // Calling the function value a variable holds. The variable
+                // keeps the block alive during the call.
+                let local = self.lookup(name, e.span)?;
+                let Some((params, ret)) = self.fn_def(local.ty) else {
+                    return unsupported(format!("calling `{name}`"), e.span);
+                };
+                if params.len() != args.len() || args.len() > 3 {
+                    return unsupported("a call of a function value with more than three arguments", e.span);
+                }
+                let outer = self.arguments(args, 1)?;
+                self.load_loc(RCX, local.loc);
+                self.free = outer;
+                self.a.buf.extend_from_slice(&[0xFF, 0x51, FN_CODE as u8]); // call [rcx + FN_CODE]
+                if ret != Ty::Unit {
+                    self.mov(dst, RAX);
+                }
+                Ok(ret)
+            }
             ExprKind::Try(inner) => {
                 let ty = self.eval(inner, dst)?;
                 let variants = self.variants(ty);
@@ -2417,6 +2729,19 @@ impl Native<'_> {
         }
         let (label, ret) = (info.label, info.ret);
 
+        let outer = self.arguments(args, 0)?;
+        self.free = outer;
+        self.call_label(label);
+        if ret != Ty::Unit {
+            self.mov(dst, RAX);
+        }
+        Ok(ret)
+    }
+
+    /// Evaluates the arguments of a call into the argument registers,
+    /// starting with the one at `first`. Returns the set of free temps to put
+    /// back once the call is made.
+    fn arguments(&mut self, args: &[Expr], first: usize) -> R<Vec<u8>> {
         // No value in r8-r11 is live here: whoever holds one parked it before
         // evaluating an expression with a call in it. Each argument goes to
         // its own temp; the temps of later arguments serve as scratch.
@@ -2430,29 +2755,24 @@ impl Native<'_> {
                 for j in 0..i {
                     if parked[j].is_none() {
                         let slot = self.push_spill();
-                        self.a.store(slot, ARG_TEMPS[j]);
+                        self.a.store(slot, ARG_TEMPS[first + j]);
                         parked[j] = Some(slot);
                         self.hold(slot, arg_tys[j]);
                     }
                 }
             }
-            self.free = ARG_TEMPS[i + 1..].iter().copied().filter(|r| TEMPS.contains(r)).collect();
-            arg_tys.push(self.eval(arg, ARG_TEMPS[i])?);
+            self.free = ARG_TEMPS[first + i + 1..].iter().copied().filter(|r| TEMPS.contains(r)).collect();
+            arg_tys.push(self.eval(arg, ARG_TEMPS[first + i])?);
         }
         self.pending.truncate(held);
         for i in 0..args.len() {
             match parked[i] {
-                Some(slot) => self.a.load(ARG_REGS[i], slot),
-                None => self.mov(ARG_REGS[i], ARG_TEMPS[i]),
+                Some(slot) => self.a.load(ARG_REGS[first + i], slot),
+                None => self.mov(ARG_REGS[first + i], ARG_TEMPS[first + i]),
             }
         }
         self.spill_depth -= parked.iter().flatten().count() as i32;
-        self.free = outer;
-        self.call_label(label);
-        if ret != Ty::Unit {
-            self.mov(dst, RAX);
-        }
-        Ok(ret)
+        Ok(outer)
     }
 
     /// Direct access to memory, for `runtime.yui` only.
@@ -2898,6 +3218,126 @@ impl Native<'_> {
         }
     }
 
+    /// `recv.map(f)` and its relatives where `f` is a function value: a loop
+    /// that calls it for each item.
+    #[allow(clippy::too_many_arguments)]
+    fn list_call_loop(
+        &mut self,
+        e: &Expr,
+        recv: &Expr,
+        name: &str,
+        name_span: Span,
+        start: Option<&Expr>,
+        f: &Expr,
+        dst: u8,
+    ) -> R<Ty> {
+        let outer = self.fresh_temps(dst);
+        let id = name_span.start;
+        let (pos, out, func) = (self.decl_loc[&(id, POS)], self.decl_loc[&(id, OUT)], self.decl_loc[&(id, FUNC)]);
+        let (list, owned, list_ty) = match self.list_var(recv) {
+            Some(local) => (local.loc, false, local.ty),
+            None => {
+                let list = self.decl_loc[&(id, LIST)];
+                let ty = self.eval_into(recv, list, true)?;
+                if !matches!(ty, Ty::List(_)) {
+                    return unsupported(format!("`{name}` on anything but a list"), recv.span);
+                }
+                (list, true, ty)
+            }
+        };
+        let item_ty = self.item_ty(list_ty);
+        // Nothing below leaves early, so the list and the function are simply released at the end.
+        let fn_ty = self.eval_into(f, func, true)?;
+        if self.fn_def(fn_ty).is_none() {
+            return unsupported("this argument", f.span);
+        }
+        let result = match (name, start) {
+            ("fold", Some(start)) => {
+                let ty = self.eval_into(start, out, false)?;
+                if matches!(ty, Ty::Unit | Ty::Never) {
+                    return unsupported("`fold` to no value", start.span);
+                }
+                ty
+            }
+            ("map" | "filter", _) => {
+                let ty = if name == "map" { self.expr_ty(e)? } else { list_ty };
+                let l = self.reg(list, RAX);
+                self.a.load(RCX, M(l, LENGTH));
+                self.call_rt("list_new");
+                self.store_loc(out, RAX);
+                ty
+            }
+            _ => {
+                self.set_loc(out, (name == "all") as i32);
+                Ty::Bool
+            }
+        };
+        self.set_loc(pos, 0);
+        let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.bind(top);
+        let l = self.reg(list, RCX);
+        let p = self.reg(pos, RAX);
+        self.a.alu_m(0x3B, p, M(l, LENGTH));
+        self.a.jcc(CC_GE, exit);
+        // The function owns its arguments: the item is counted once more, and
+        // `fold` hands over the result so far.
+        let item = if name == "fold" { R8 } else { RDX };
+        self.element(0x8B, item, l, p);
+        self.retain(item, item_ty);
+        if name == "fold" {
+            self.load_loc(RDX, out);
+        }
+        self.load_loc(RCX, func);
+        self.a.buf.extend_from_slice(&[0xFF, 0x51, FN_CODE as u8]); // call [rcx + FN_CODE]
+        match name {
+            "map" => {
+                let o = self.reg(out, RCX);
+                let p = self.reg(pos, RDX);
+                self.element(0x89, RAX, o, p);
+            }
+            "fold" => self.store_loc(out, RAX),
+            "filter" => {
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_Z, next);
+                let o = self.reg(out, RCX);
+                let l = self.reg(list, RDX);
+                let p = self.reg(pos, R8);
+                self.element(0x8B, R9, l, p);
+                self.retain(R9, item_ty);
+                self.a.load(RAX, M(o, LENGTH));
+                self.element(0x89, R9, o, RAX);
+                self.a.inc_mem(M(o, LENGTH));
+            }
+            _ => {
+                // `any` stops at the first true, `all` at the first false.
+                let stop = name == "any";
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(if stop { CC_Z } else { CC_NZ }, next);
+                self.set_loc(out, stop as i32);
+                self.a.jmp(exit);
+            }
+        }
+        self.a.bind(next);
+        self.step(pos);
+        self.a.jmp(top);
+        self.a.bind(exit);
+        if name == "map" {
+            let l = self.reg(list, RAX);
+            self.a.load(RAX, M(l, LENGTH));
+            let o = self.reg(out, RCX);
+            self.a.store(M(o, LENGTH), RAX);
+        }
+        if owned {
+            self.load_loc(RCX, list);
+            self.drop_value(list_ty);
+        }
+        self.load_loc(RCX, func);
+        self.drop_value(fn_ty);
+        self.free = outer;
+        self.load_loc(dst, out);
+        Ok(result)
+    }
+
     /// `recv.map(|x| ...)` and its relatives, as a loop with the closure's body inside.
     #[allow(clippy::too_many_arguments)]
     fn list_loop(
@@ -2912,10 +3352,8 @@ impl Native<'_> {
     ) -> R<Ty> {
         let arity = 1 + start.is_some() as usize;
         let (params, body) = match &f.kind {
-            ExprKind::Closure { params, body, .. } if params.len() == arity && !crate::bytecode::can_return(body) => {
-                (params, body)
-            }
-            _ => return unsupported("a function passed as a value", f.span),
+            ExprKind::Closure { params, body, .. } if params.len() == arity && inlined(f) => (params, body),
+            _ => return self.list_call_loop(e, recv, name, name_span, start, f, dst),
         };
         let outer = self.fresh_temps(dst);
         let id = name_span.start;

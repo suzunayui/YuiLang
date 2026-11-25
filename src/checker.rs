@@ -868,7 +868,13 @@ impl Checker {
     /// Checks an expression, using `expected` to infer closure parameter types.
     fn expr_expect(&mut self, e: &Expr, expected: Option<&Type>) -> Type {
         match &e.kind {
-            ExprKind::Closure { params, body, .. } => self.closure(params, body, expected),
+            ExprKind::Closure { params, body, .. } => {
+                let ty = self.closure(params, body, expected);
+                if self.record_exprs {
+                    self.expr_types.push(((e.span.start, e.span.end), ty.clone()));
+                }
+                ty
+            }
             _ => self.expr(e, true),
         }
     }

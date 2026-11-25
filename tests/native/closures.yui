@@ -1,0 +1,148 @@
+// 関数を値として扱う: 変数に入れる、渡す、返す、構造体やリストに入れる、名前で渡す
+
+struct Rule {
+  name: String,
+  accepts: fn(Int) -> Bool,
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn is_even(x: Int) -> Bool {
+  x % 2 == 0
+}
+
+fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+fn shout(s: String) -> String {
+  "{s}!"
+}
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn twice(f: fn(Int) -> Int, x: Int) -> Int {
+  f(f(x))
+}
+
+fn adder(n: Int) -> fn(Int) -> Int {
+  |x| x + n
+}
+
+fn compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> fn(Int) -> Int {
+  |x| g(f(x))
+}
+
+fn prefixer(prefix: String) -> fn(String) -> String {
+  |s| "{prefix}{s}"
+}
+
+fn counter_from(xs: List<Int>) -> fn(Int) -> Int {
+  |limit| xs.filter(|x| x < limit).len()
+}
+
+fn pick(flag: Bool) -> fn(Int) -> Int {
+  if flag { double } else { |x| x - 1 }
+}
+
+fn check(rules: List<Rule>, n: Int) -> String {
+  let mut out = ""
+  for rule in rules {
+    let accepts = rule.accepts
+    if accepts(n) {
+      out = "{out}{rule.name} "
+    }
+  }
+  out
+}
+
+// クロージャの中の ? は、クロージャから抜ける
+fn halves(xs: List<Int>) -> List<Option<Int>> {
+  xs.map(|x| {
+    let h = half(x)?
+    Some(h + 1)
+  })
+}
+
+fn half(n: Int) -> Option<Int> {
+  if n % 2 == 0 { Some(n / 2) } else { None }
+}
+
+fn show(o: Option<Int>) -> String {
+  match o {
+    Some(v) => "{v}"
+    None => "-"
+  }
+}
+
+fn main() uses io {
+  let inc = |x| x + 1
+  let base = 100
+  let shift = |x| x + base
+  print("{inc(1)} {shift(5)} {apply(inc, 10)} {apply(shift, 1)} {apply(double, 21)} {twice(inc, 0)} {twice(double, 3)}")
+
+  let add5 = adder(5)
+  let add7 = adder(7)
+  let both = compose(add5, add7)
+  let again = compose(both, double)
+  let quad = compose(double, double)
+  print("{add5(1)} {add7(1)} {both(0)} {again(1)} {quad(3)} {apply(adder(1), 2)}")
+
+  let hello = prefixer("hello, ")
+  let name = "yui"
+  let greet = |s| shout(hello(s))
+  let echo = prefixer(name)
+  print("{hello(name)} / {greet(name)} / {echo(name)}")
+
+  let xs = [1, 2, 3, 4, 5, 6]
+  let count_below = counter_from(xs)
+  print("{count_below(4)} {count_below(100)} {count_below(0)}")
+  print("{apply(pick(true), 10)} {apply(pick(false), 10)}")
+
+  // map などに、名前・変数・その場で作った値を渡す
+  let doubled = xs.map(double)
+  let evens = xs.filter(is_even)
+  print("{doubled[5]} {evens.len()} {xs.fold(0, add)} {xs.any(is_even)} {xs.all(is_even)} {evens.all(is_even)}")
+  let scale = adder(1000)
+  print("{xs.map(scale)[0]} {xs.map(adder(10))[1]} {xs.map(compose(double, inc)).fold(0, add)} {xs.filter(|x| x > 4).map(shift)[0]}")
+  let words = ["a", "b", "c"]
+  let loud = words.map(shout)
+  let join = |acc, w| "{acc}{w}"
+  let folded = words.fold(name, |acc, w| "{acc}{w}")
+  print("{loud[0]} {loud[2]} {words.map(hello).fold(name, join)} {folded}")
+  let keep = |w| w != name
+  print("{words.filter(keep).len()} {words.any(keep)} {[name, name].any(keep)}")
+
+  // 構造体とリストに入れる
+  let rules = [
+    Rule { name: "even", accepts: is_even },
+    Rule { name: "big", accepts: |n| n > 100 },
+    Rule { name: "small", accepts: |n| n < base },
+  ]
+  print("[{check(rules, 4)}] [{check(rules, 101)}] [{check(rules, 1000)}]")
+  let steps = [inc, double, add5, shift, pick(false)]
+  let mut value = 1
+  for step in steps {
+    value = step(value)
+  }
+  print("{value} {steps.len()} {steps.map(|f| f(0)).fold(0, add)}")
+
+  // 値を複製しても、捕まえた値は共有されるだけで変わらない
+  let mut seen = [1]
+  let snapshot = |i| seen[i]
+  seen = seen.push(2)
+  let later = |i| seen[i]
+  print("{snapshot(0)} {later(1)} {seen.len()}")
+
+  let results = halves([4, 7, 10])
+  print("{show(results[0])} {show(results[1])} {show(results[2])} {results.len()}")
+  let _ = adder(3)
+  let mut f = inc
+  f = compose(f, f)
+  f = compose(f, double)
+  print("{f(1)}")
+}
