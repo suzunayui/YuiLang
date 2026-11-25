@@ -1,0 +1,5 @@
+fn main() uses io {
+  let min = 0 - 9223372036854775807 - 1
+  print("{(min + 1).abs()}")
+  print("{min.abs()}")
+}

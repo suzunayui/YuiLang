@@ -41,6 +41,7 @@ use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_E, CC_GE, CC_L, CC_NE, CC_O, M
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 const RSP: u8 = 4;
 const CC_NS: u8 = 0x9;
@@ -90,6 +91,10 @@ const SCRUT: u8 = 5;
 const FUNC: u8 = 6;
 /// A variable a closure captured, by its position in the closure's block.
 const CAPTURE: u8 = 7;
+/// Where a function with contracts keeps what it was told about its caller,
+/// and its result while the `ensures` clauses look at it.
+const SITE: u8 = 8;
+const RESULT: u8 = 9;
 
 /// Offsets in the block of a function value.
 const FN_CODE: i32 = 8;
@@ -209,6 +214,8 @@ struct FnInfo {
     label: usize,
     params: Vec<Ty>,
     ret: Ty,
+    /// Has `requires` or `ensures`: a caller says where it is (see `site`).
+    contracts: bool,
 }
 
 /// Error-reporting code that belongs to a function but is kept out of its body.
@@ -216,6 +223,12 @@ enum Stub {
     Fail { label: usize, message: usize, len: usize },
     Overflow { label: usize, a: Opnd, b: Opnd, record: usize },
     Bounds { label: usize, list: u8, index: u8, record: usize },
+    /// An error whose message has one number in it, the value of a register.
+    Number { label: usize, value: u8, record: usize },
+    /// A violated `requires` or `ensures`. `header` is the first line of the
+    /// message (up to the result, for `ensures`); the rest names the place
+    /// of the call, which the caller passed and the function kept at `site`.
+    Contract { label: usize, header: usize, len: usize, site: Loc, result: Option<(Ty, Loc)> },
     /// `variable = variable.push(value)` when the item cannot be added in place.
     Push { label: usize, back: usize, variable: Loc, value: u8, list: Ty },
     /// A store into `variable` (through the fields at the offsets in
@@ -246,6 +259,15 @@ struct Native<'a> {
     /// variable that is about to change a value it shares.
     clone_labels: HashMap<u32, usize>,
     clone_queue: Vec<u32>,
+    /// Generated code per type that compares two values, and that writes a
+    /// value out as text. Queue entries: (true for text, the type).
+    eq_labels: HashMap<u32, usize>,
+    repr_labels: HashMap<u32, usize>,
+    text_queue: Vec<(bool, u32)>,
+    rt_number: usize,
+    rt_contract: usize,
+    /// Whether those two are needed.
+    uses_errors: bool,
     /// Closures to compile, and for each function used as a value, the code
     /// that calls it the way a closure is called: (label, the function).
     closures: Vec<Closure>,
@@ -325,17 +347,18 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     for item in &runtime.items {
         if let Item::Fn(f) = item {
             let ret = if f.ret.is_some() { Ty::Int } else { Ty::Unit };
-            fns.insert(format!("%{}", f.name), FnInfo { label: a.label(), params: vec![Ty::Int; f.params.len()], ret });
+            fns.insert(format!("%{}", f.name), FnInfo { label: a.label(), params: vec![Ty::Int; f.params.len()], ret, contracts: false });
             runtime_fns.push(f.clone());
         }
     }
     // Copying memory is machine code, but is called like a function of the runtime.
     let rt_copy = a.label();
-    fns.insert("%__copy".to_string(), FnInfo { label: rt_copy, params: vec![Ty::Int; 3], ret: Ty::Unit });
+    fns.insert("%__copy".to_string(), FnInfo { label: rt_copy, params: vec![Ty::Int; 3], ret: Ty::Unit, contracts: false });
 
     let (rt_write, rt_print_int, rt_fail, rt_overflow) = (a.label(), a.label(), a.label(), a.label());
     let (rt_alloc, rt_realloc, rt_free) = (a.label(), a.label(), a.label());
     let (rt_pool_alloc, rt_pool_free) = (a.label(), a.label());
+    let (rt_number, rt_contract) = (a.label(), a.label());
     let mut n = Native {
         a,
         sources,
@@ -351,6 +374,12 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         glue_queue: Vec::new(),
         clone_labels: HashMap::new(),
         clone_queue: Vec::new(),
+        eq_labels: HashMap::new(),
+        repr_labels: HashMap::new(),
+        text_queue: Vec::new(),
+        rt_number,
+        rt_contract,
+        uses_errors: false,
         closures: Vec::new(),
         thunks: HashMap::new(),
         thunk_queue: Vec::new(),
@@ -398,18 +427,47 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             _ => {}
         }
     }
+    // Only the functions that `main` reaches are compiled: the rest (what
+    // only tests use, for one) does not have to be supported, or carried.
+    let by_name: HashMap<&str, &Rc<FnDecl>> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Fn(f) => Some((f.name.as_str(), f)),
+            _ => None,
+        })
+        .collect();
+    let mut reached: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut todo = vec!["main"];
+    while let Some(name) = todo.pop() {
+        let Some(f) = by_name.get(name) else { continue };
+        if !reached.insert(f.name.as_str()) {
+            continue;
+        }
+        let mut note = |e: &Expr| {
+            match &e.kind {
+                ExprKind::Call { name, local: false, .. } | ExprKind::FnRef(name) => {
+                    if let Some(callee) = by_name.get(name.as_str()) {
+                        todo.push(callee.name.as_str());
+                    }
+                }
+                _ => {}
+            }
+            false
+        };
+        any_block(&f.body, &mut note);
+        for clause in f.requires.iter().chain(&f.ensures) {
+            any_expr(clause, &mut note);
+        }
+    }
     let mut decls = Vec::new();
     for item in &program.items {
-        // Tests are not part of the built program.
         let Item::Fn(f) = item else { continue };
+        if !reached.contains(f.name.as_str()) {
+            continue;
+        }
         if !f.type_params.is_empty() {
             return unsupported("generic functions", f.name_span);
-        }
-        if !f.requires.is_empty() || !f.ensures.is_empty() {
-            return unsupported("`requires` / `ensures`", f.name_span);
-        }
-        if f.params.len() > 4 {
-            return unsupported("functions with more than four parameters", f.name_span);
         }
         let mut params = Vec::new();
         for p in &f.params {
@@ -420,7 +478,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             None => Ty::Unit,
         };
         let label = n.a.label();
-        n.fns.insert(f.name.clone(), FnInfo { label, params, ret });
+        let contracts = !f.requires.is_empty() || !f.ensures.is_empty();
+        n.fns.insert(f.name.clone(), FnInfo { label, params, ret, contracts });
         decls.push(f.clone());
     }
     let Some(main) = n.fns.get("main") else { return unsupported("a program without `main`", nowhere) };
@@ -462,6 +521,12 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             }
         } else if let Some(id) = n.clone_queue.pop() {
             n.emit_clone(id);
+        } else if let Some((text, id)) = n.text_queue.pop() {
+            if text {
+                n.emit_repr(id);
+            } else {
+                n.emit_eq(id);
+            }
         } else if let Some((label, target)) = n.thunk_queue.pop() {
             // The block comes first; the arguments move up by one.
             n.a.bind(label);
@@ -472,6 +537,9 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         } else {
             break;
         }
+    }
+    if n.uses_errors {
+        n.error_runtime();
     }
     if let Some(label) = n.plain_free {
         n.a.bind(label);
@@ -1519,6 +1587,72 @@ impl Native<'_> {
         self.call_label(self.rt_fail);
     }
 
+    /// More of the runtime: errors that are put together when they happen.
+    fn error_runtime(&mut self) {
+        // number(rcx = value, r8 = record): the record holds two lengths (4
+        // bytes each) and then two pieces of text; the value is printed between them.
+        self.a.bind(self.rt_number);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.mov_rr(RBX, RCX);
+        self.a.mov_rr(RDI, R8);
+        self.a.buf.extend_from_slice(&[0x48, 0x8D, 0x4F, 8]); // lea rcx, [rdi + 8]
+        self.a.buf.extend_from_slice(&[0x8B, 0x17]); // mov edx, [rdi]
+        self.a.mov_imm64(R8, STDERR);
+        self.call_label(self.rt_write);
+        self.a.mov_rr(RCX, RBX);
+        self.a.mov_imm64(RDX, STDERR);
+        self.call_label(self.rt_print_int);
+        self.a.buf.extend_from_slice(&[0x8B, 0x07]); // mov eax, [rdi]
+        self.a.buf.extend_from_slice(&[0x48, 0x8D, 0x4C, 0x07, 8]); // lea rcx, [rdi + rax + 8]
+        self.a.buf.extend_from_slice(&[0x8B, 0x57, 4]); // mov edx, [rdi + 4]
+        self.a.mov_imm64(R8, STDERR);
+        self.call_label(self.rt_write);
+        self.a.buf.extend_from_slice(&[0xB9, 1, 0, 0, 0]); // mov ecx, 1
+        self.call_import(EXIT_PROCESS);
+
+        // contract(rcx = text, rdx = length, r8 = the caller's place: a
+        // length (4 bytes) and text): writes both and exits with 1.
+        self.a.bind(self.rt_contract);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.mov_rr(RBX, R8);
+        self.a.mov_imm64(R8, STDERR);
+        self.call_label(self.rt_write);
+        self.a.buf.extend_from_slice(&[0x48, 0x8D, 0x4B, 4]); // lea rcx, [rbx + 4]
+        self.a.buf.extend_from_slice(&[0x8B, 0x13]); // mov edx, [rbx]
+        self.a.mov_imm64(R8, STDERR);
+        self.call_label(self.rt_write);
+        self.a.buf.extend_from_slice(&[0xB9, 1, 0, 0, 0]); // mov ecx, 1
+        self.call_import(EXIT_PROCESS);
+    }
+
+    /// What a caller tells a function with contracts about itself: the part
+    /// of the error text that shows the place of the call.
+    fn site(&mut self, span: Span) -> usize {
+        self.uses_errors = true;
+        let text = self.error_text(&Diagnostic::new("E0502", "", span));
+        let place = text.split_once('\n').map(|(_, rest)| rest).unwrap_or("");
+        let mut blob = (place.len() as u32).to_le_bytes().to_vec();
+        blob.extend(place.as_bytes());
+        self.constant(&blob)
+    }
+
+    /// Reserves code that reports an error whose message contains the value
+    /// of `value` where `d`'s message has the mark `\u{1}`.
+    fn number_stub(&mut self, value: u8, d: Diagnostic) -> usize {
+        self.uses_errors = true;
+        let text = self.error_text(&d);
+        let (before, after) = text.split_once('\u{1}').unwrap_or((&text, ""));
+        let mut record = Vec::new();
+        record.extend((before.len() as u32).to_le_bytes());
+        record.extend((after.len() as u32).to_le_bytes());
+        record.extend(before.as_bytes());
+        record.extend(after.as_bytes());
+        let record = self.constant(&record);
+        let label = self.a.label();
+        self.stubs.push(Stub::Number { label, value, record });
+        label
+    }
+
     /// The text `yui run` prints for a runtime error.
     fn error_text(&self, d: &Diagnostic) -> String {
         format!("{}\n1 error(s)\n", render_human(d, self.sources))
@@ -1609,6 +1743,46 @@ impl Native<'_> {
                     }
                     self.a.jmp(back);
                 }
+                Stub::Number { label, value, record } => {
+                    self.a.bind(label);
+                    self.mov(RCX, value);
+                    self.lea_label(R8, record);
+                    self.call_label(self.rt_number);
+                }
+                Stub::Contract { label, header, len, site, result } => {
+                    self.a.bind(label);
+                    match result {
+                        None => {
+                            self.lea_label(RCX, header);
+                            self.a.mov_imm64(RDX, len as i64);
+                        }
+                        Some((ty, at)) => {
+                            // The first line so far, then the result as text, then its end.
+                            self.lea_label(RCX, header);
+                            self.a.mov_imm64(RDX, len as i64);
+                            self.a.mov_imm64(R8, STDERR);
+                            self.call_label(self.rt_write);
+                            if ty == Ty::Unit {
+                                self.write(b"()", STDERR);
+                            } else {
+                                self.a.mov_imm64(RCX, 32);
+                                self.call_rt("str_new");
+                                self.a.mov_rr(RCX, RAX);
+                                self.load_loc(RDX, at);
+                                self.repr_call(ty);
+                                self.a.lea(RCX, M(RAX, ELEMENTS));
+                                self.a.load(RDX, M(RAX, LENGTH));
+                                self.a.mov_imm64(R8, STDERR);
+                                self.call_label(self.rt_write);
+                            }
+                            let end = self.constant(b")\n");
+                            self.lea_label(RCX, end);
+                            self.a.mov_imm64(RDX, 2);
+                        }
+                    }
+                    self.load_loc(R8, site);
+                    self.call_label(self.rt_contract);
+                }
                 Stub::Bounds { label, list, index, record } => {
                     self.a.bind(label);
                     // The index is in neither rcx nor rdx; the list may be in rcx.
@@ -1665,12 +1839,12 @@ impl Native<'_> {
         let (label, ret) = (info.label, info.ret);
         let params: Vec<(String, usize, Ty)> =
             f.params.iter().zip(&info.params).map(|(p, ty)| (p.name.clone(), p.span.start, *ty)).collect();
-        self.emit_fn(label, &params, &[], ret, Body::Block(&f.body), f.name_span)
+        self.emit_fn(label, &params, &[], ret, Body::Block(&f.body), f.name_span, Some(f))
     }
 
     /// Compiles the body of a closure, and the code that frees its block.
     fn closure(&mut self, c: Closure) -> R<()> {
-        self.emit_fn(c.code, &c.params, &c.captures, c.ret, Body::Expr(&c.body), c.body.span)?;
+        self.emit_fn(c.code, &c.params, &c.captures, c.ret, Body::Expr(&c.body), c.body.span, None)?;
         self.a.bind(c.free);
         let counted: Vec<(usize, Ty)> =
             c.captures.iter().enumerate().filter(|(_, (_, ty))| ty.heap()).map(|(i, (_, ty))| (i, *ty)).collect();
@@ -1698,7 +1872,8 @@ impl Native<'_> {
 
     /// Compiles one function. With `captures`, it is the code of a closure:
     /// the closure's block arrives in rcx, before the parameters, and the
-    /// captured values are read out of it.
+    /// captured values are read out of it. `decl` gives the contracts.
+    #[allow(clippy::too_many_arguments)]
     fn emit_fn(
         &mut self,
         label: usize,
@@ -1707,7 +1882,13 @@ impl Native<'_> {
         ret: Ty,
         body: Body,
         span: Span,
+        decl: Option<&FnDecl>,
     ) -> R<()> {
+        let (requires, ensures) = match decl {
+            Some(f) => (&f.requires[..], &f.ensures[..]),
+            None => (&[][..], &[][..]),
+        };
+        let contracts = !requires.is_empty() || !ensures.is_empty();
         // Decide where every variable lives: the most used ones in registers.
         let mut weight = HashMap::new();
         let mut decls: Decls = params.iter().map(|(name, at, _)| (*at, name.clone(), VAR)).collect();
@@ -1716,6 +1897,30 @@ impl Native<'_> {
             Body::Block(block) => weigh_block(block, 0, &mut weight, &mut decls),
             Body::Expr(e) => weigh(e, 0, &mut weight, &mut decls),
         }
+        for clause in requires.iter().chain(ensures) {
+            weigh(clause, 0, &mut weight, &mut decls);
+        }
+        if contracts {
+            decls.push((0, "%site".to_string(), SITE));
+            decls.push((0, "result".to_string(), RESULT));
+        }
+        // Arguments beyond the fourth of a call are passed in memory, just
+        // above the 32 bytes every call may use; the variables come after that.
+        let mut most = 0;
+        let mut count = |e: &Expr| {
+            if let ExprKind::Call { args, local, .. } = &e.kind {
+                most = most.max(args.len() + *local as usize);
+            }
+            false
+        };
+        match &body {
+            Body::Block(block) => any_block(block, &mut count),
+            Body::Expr(e) => any_expr(e, &mut count),
+        };
+        for clause in requires.iter().chain(ensures) {
+            any_expr(clause, &mut count);
+        }
+        let outgoing = 32 + 8 * (most.max(4) - 4) as i32;
         let mut order: Vec<usize> = (0..decls.len()).collect();
         order.sort_by_key(|i| std::cmp::Reverse(weight.get(&decls[*i].1).copied().unwrap_or(0)));
         self.decl_loc.clear();
@@ -1729,14 +1934,13 @@ impl Native<'_> {
                 }
                 None => {
                     stack_slots += 1;
-                    // Above the 32 bytes every call may use for its arguments.
-                    Loc::Stack(32 + 8 * (stack_slots - 1))
+                    Loc::Stack(outgoing + 8 * (stack_slots - 1))
                 }
             };
             let (id, _, kind) = &decls[i];
             self.decl_loc.insert((*id, *kind), loc);
         }
-        self.spill_base = 32 + 8 * stack_slots;
+        self.spill_base = outgoing + 8 * stack_slots;
         self.spill_depth = 0;
         self.spill_max = 0;
         self.free = TEMPS.to_vec();
@@ -1754,9 +1958,24 @@ impl Native<'_> {
         let mut scope = HashMap::new();
         // In the code of a function value, the block takes the first place.
         let is_value = !captures.is_empty() || matches!(body, Body::Expr(_));
+        let site = self.decl_loc.get(&(0, SITE)).copied();
+        if let Some(site) = site {
+            // The caller left the description of its place in rax.
+            self.store_loc(site, RAX);
+        }
+        // Parameters after the fourth are in the caller's frame; how far
+        // that is from here is known once this function's frame is sized.
+        let mut incoming = Vec::new();
         for (i, (name, at, ty)) in params.iter().enumerate() {
             let loc = self.decl_loc[&(*at, VAR)];
-            self.store_loc(loc, ARG_REGS[i + is_value as usize]);
+            let k = i + is_value as usize;
+            if k < 4 {
+                self.store_loc(loc, ARG_REGS[k]);
+            } else {
+                self.a.load(RAX, M(RSP, 0));
+                incoming.push((self.a.buf.len() - 4, 8 * used.len() as i32 + 40 + 8 * (k as i32 - 4)));
+                self.store_loc(loc, RAX);
+            }
             scope.insert(name.clone(), Local { ty: *ty, loc, borrowed: false });
         }
         for (i, (name, ty)) in captures.iter().enumerate() {
@@ -1767,6 +1986,16 @@ impl Native<'_> {
             scope.insert(name.clone(), Local { ty: *ty, loc, borrowed: true });
         }
         self.scopes = vec![scope];
+        let name = decl.map(|f| f.name.rsplit('.').next().unwrap_or(&f.name).to_string()).unwrap_or_default();
+        for clause in requires {
+            let Some(site) = site else { break };
+            let text = &self.sources.text[clause.span.start..clause.span.end];
+            let header = format!("error[E0502]: precondition of `{name}` violated: `{text}`\n");
+            let (label, len) = (self.a.label(), header.len());
+            let header = self.constant(header.as_bytes());
+            self.stubs.push(Stub::Contract { label, header, len, site, result: None });
+            self.cond(clause, label)?;
+        }
 
         let t = self.take_temp(span)?;
         let ty = match body {
@@ -1779,6 +2008,26 @@ impl Native<'_> {
         self.free.push(t);
 
         self.a.bind(self.epilogue);
+        if let (Some(site), false) = (site, ensures.is_empty()) {
+            // `result` in an `ensures` clause is what the function returns.
+            let at = self.decl_loc[&(0, RESULT)];
+            if ret != Ty::Unit {
+                self.store_loc(at, RAX);
+            }
+            self.scopes.push(HashMap::from([("result".to_string(), Local { ty: ret, loc: at, borrowed: true })]));
+            for clause in ensures {
+                let text = &self.sources.text[clause.span.start..clause.span.end];
+                let header = format!("error[E0502]: postcondition of `{name}` violated: `{text}` (result: ");
+                let (label, len) = (self.a.label(), header.len());
+                let header = self.constant(header.as_bytes());
+                self.stubs.push(Stub::Contract { label, header, len, site, result: Some((ret, at)) });
+                self.cond(clause, label)?;
+            }
+            self.scopes.pop();
+            if ret != Ty::Unit {
+                self.load_loc(RAX, at);
+            }
+        }
         // The parameters are the function's own references.
         self.release_scopes(0, (ret != Ty::Unit).then_some(RAX));
         self.a.alu_imm(0, RSP, 0);
@@ -1797,6 +2046,9 @@ impl Native<'_> {
         }
         for at in frame_at {
             self.a.buf[at..at + 4].copy_from_slice(&frame.to_le_bytes());
+        }
+        for (at, above) in incoming {
+            self.a.buf[at..at + 4].copy_from_slice(&(frame + above).to_le_bytes());
         }
         Ok(())
     }
@@ -2944,6 +3196,9 @@ impl Native<'_> {
                 let outer = self.arguments(args, 1)?;
                 self.load_loc(RCX, local.loc);
                 self.free = outer;
+                // Whatever is called may have contracts.
+                let site = self.site(e.span);
+                self.lea_label(RAX, site);
                 self.a.buf.extend_from_slice(&[0xFF, 0x51, FN_CODE as u8]); // call [rcx + FN_CODE]
                 if ret != Ty::Unit {
                     self.mov(dst, RAX);
@@ -3163,6 +3418,17 @@ impl Native<'_> {
                     self.a.jcc(condition(*op) ^ 1, no);
                     return Ok(());
                 }
+                if let Some((left, right, lt, _)) = direct {
+                    if self.deep(lt) && routine == "str_eq" {
+                        let eq = self.eq_label(lt);
+                        self.a.mov_rr(RCX, left);
+                        self.load_opnd(RDX, right);
+                        self.call_label(eq);
+                        self.a.alu_imm(7, RAX, 1);
+                        self.a.jcc(condition(*op) ^ 1, no);
+                        return Ok(());
+                    }
+                }
                 let (left, b, temp, spilled, owned, lt, rt) = match direct {
                     Some((reg, b, lt, rt)) => (Opnd::Reg(reg), b, None, false, None, lt, rt),
                     None => {
@@ -3177,11 +3443,21 @@ impl Native<'_> {
                             self.a.jcc(condition(*op) ^ 1, no);
                             return Ok(());
                         }
+                        if self.deep(lt) && routine == "str_eq" {
+                            // Lists, structs and enums: compared part by part.
+                            let slot = self.push_spill();
+                            self.a.store(slot, t);
+                            self.eq_op((slot, true), r, lt, t)?;
+                            self.free.push(t);
+                            self.a.alu_imm(7, RAX, 1);
+                            self.a.jcc(condition(*op) ^ 1, no);
+                            return Ok(());
+                        }
                         let (a, b, rt, temp, spilled) = self.operands(t, r)?;
                         (a, b, temp, spilled, Some(t), lt, rt)
                     }
                 };
-                if lt != rt || !matches!(lt, Ty::Int | Ty::Bool) {
+                if lt != rt || !(matches!(lt, Ty::Int | Ty::Bool) || self.plain_enum(lt)) {
                     return unsupported("comparing anything but Ints, Bools and Strings", e.span);
                 }
                 self.load_opnd(RAX, left);
@@ -3225,10 +3501,14 @@ impl Native<'_> {
         if info.params.len() != args.len() {
             return unsupported("a call with the wrong number of arguments", span);
         }
-        let (label, ret) = (info.label, info.ret);
+        let (label, ret, contracts) = (info.label, info.ret, info.contracts);
 
         let outer = self.arguments(args, 0)?;
         self.free = outer;
+        if contracts {
+            let site = self.site(span);
+            self.lea_label(RAX, site);
+        }
         self.call_label(label);
         if ret != Ty::Unit {
             self.mov(dst, RAX);
@@ -3245,6 +3525,31 @@ impl Native<'_> {
         // its own temp; the temps of later arguments serve as scratch.
         let outer = std::mem::take(&mut self.free);
         let held = self.pending.len();
+        if first + args.len() > 4 {
+            // More than the registers take: every argument is parked, then
+            // the first four go to the registers and the rest to the frame.
+            let mut slots = Vec::new();
+            for arg in args {
+                self.free = TEMPS[1..].to_vec();
+                let ty = self.eval(arg, TEMPS[0])?;
+                let slot = self.push_spill();
+                self.a.store(slot, TEMPS[0]);
+                self.hold(slot, ty);
+                slots.push(slot);
+            }
+            self.pending.truncate(held);
+            for (i, slot) in slots.iter().enumerate() {
+                let k = first + i;
+                if k < 4 {
+                    self.a.load(ARG_REGS[k], *slot);
+                } else {
+                    self.a.load(RAX, *slot);
+                    self.a.store(M(RSP, 32 + 8 * (k as i32 - 4)), RAX);
+                }
+            }
+            self.spill_depth -= slots.len() as i32;
+            return Ok(outer);
+        }
         let mut parked: Vec<Option<M>> = vec![None; args.len()];
         let mut arg_tys = Vec::new();
         for (i, arg) in args.iter().enumerate() {
@@ -3394,6 +3699,17 @@ impl Native<'_> {
                                 self.a.load(RAX, building);
                             }
                         }
+                        Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) => {
+                            self.a.load(RCX, building);
+                            self.a.load(RDX, slot);
+                            self.repr_call(ty);
+                            if owned {
+                                self.a.store(building, RAX);
+                                self.a.load(RCX, slot);
+                                self.drop_value(ty);
+                                self.a.load(RAX, building);
+                            }
+                        }
                         _ => return unsupported("this kind of value inside a string", value.span),
                     }
                     self.spill_depth -= 1;
@@ -3535,6 +3851,25 @@ impl Native<'_> {
     /// A method call. Which methods there are depends on the receiver.
     fn method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (self.recv_ty(recv)?, name, args) {
+            (ty @ (Ty::List(_) | Ty::Struct(_) | Ty::Enum(_)), "to_string", []) => {
+                self.eval(recv, dst)?;
+                let slot = self.push_spill();
+                self.a.store(slot, dst);
+                self.a.mov_imm64(RCX, 32);
+                self.call_rt("str_new");
+                self.a.mov_rr(RCX, RAX);
+                self.a.load(RDX, slot);
+                self.repr_call(ty);
+                self.a.load(RCX, slot);
+                self.a.store(slot, RAX);
+                self.drop_value(ty);
+                self.a.load(dst, slot);
+                self.spill_depth -= 1;
+                Ok(Ty::Str)
+            }
+            (Ty::Int, "abs" | "min" | "max" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr", _) => {
+                self.int_method(e, recv, name, name_span, args, dst)
+            }
             (Ty::List(_), ..) => self.list_method(e, recv, name, name_span, args, dst),
             (ty @ Ty::Enum(_), ..) => self.enum_method(recv, ty, name, name_span, args, dst),
             (Ty::Str, "to_string", []) => self.eval(recv, dst),
@@ -3572,6 +3907,345 @@ impl Native<'_> {
             }
             _ => unsupported(format!("the method `{name}` here"), name_span),
         }
+    }
+
+    /// A method of an Int.
+    fn int_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        match (name, args) {
+            ("abs", []) => {
+                self.eval(recv, dst)?;
+                let stub = self.fail_stub(Diagnostic::new("E0503", "integer overflow in `abs`", e.span));
+                let done = self.a.label();
+                self.a.mov_rr(RAX, dst);
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_NS, done);
+                self.a.buf.extend_from_slice(&[0x48, 0xF7, 0xD8]); // neg rax
+                self.a.jcc(CC_O, stub);
+                self.a.bind(done);
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            (_, [other]) => {
+                self.eval(recv, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, other)?;
+                self.load_opnd(RAX, a);
+                self.load_opnd(RCX, b);
+                match name {
+                    "min" | "max" => {
+                        self.a.alu_rr(0x39, RAX, RCX);
+                        // cmovg / cmovl rax, rcx
+                        self.a.buf.extend_from_slice(&[0x48, 0x0F, if name == "min" { 0x4F } else { 0x4C }, 0xC1]);
+                    }
+                    "bit_and" => self.a.buf.extend_from_slice(&[0x48, 0x21, 0xC8]), // and rax, rcx
+                    "bit_or" => self.a.buf.extend_from_slice(&[0x48, 0x09, 0xC8]),  // or rax, rcx
+                    "bit_xor" => self.a.buf.extend_from_slice(&[0x48, 0x31, 0xC8]), // xor rax, rcx
+                    _ => {
+                        let d = Diagnostic::new("E0509", "shift amount \u{1} is out of range", e.span)
+                            .hint("the amount must be between 0 and 63");
+                        let stub = self.number_stub(RCX, d);
+                        // Unsigned, so that a negative amount is out of range too.
+                        self.a.alu_imm(7, RCX, 63);
+                        self.a.jcc(CC_A, stub);
+                        // shl rax, cl / sar rax, cl: bits shifted out are lost, `shr` keeps the sign.
+                        self.a.buf.extend_from_slice(&[0x48, 0xD3, if name == "shl" { 0xE0 } else { 0xF8 }]);
+                    }
+                }
+                self.a.mov_rr(dst, RAX);
+                self.release(temp, spilled);
+                Ok(Ty::Int)
+            }
+            _ => unsupported(format!("the method `{name}` here"), name_span),
+        }
+    }
+
+    /// Whether values of this type are compared and written part by part.
+    fn deep(&self, ty: Ty) -> bool {
+        matches!(ty, Ty::List(_) | Ty::Struct(_)) || (matches!(ty, Ty::Enum(_)) && !self.plain_enum(ty))
+    }
+
+    /// The label of the generated code that compares two values of type `ty`.
+    fn eq_label(&mut self, ty: Ty) -> usize {
+        let (Ty::List(id) | Ty::Struct(id) | Ty::Enum(id)) = ty else { return self.rt_fail };
+        self.uses_heap = true;
+        if let Some(label) = self.eq_labels.get(&id) {
+            return *label;
+        }
+        let label = self.a.label();
+        self.eq_labels.insert(id, label);
+        self.text_queue.push((false, id));
+        label
+    }
+
+    /// Compares the parked value `left` (see `park`) with `right`, both of
+    /// type `ty`, and leaves 1 or 0 in rax. Frees the slots and gives up owned references.
+    fn eq_op(&mut self, left: (M, bool), right: &Expr, ty: Ty, dst: u8) -> R<()> {
+        let held = self.pending.len();
+        if left.1 {
+            self.hold(left.0, ty);
+        }
+        let (slot, owned, right_ty) = self.park(right, dst)?;
+        self.pending.truncate(held);
+        if right_ty != ty {
+            return unsupported("comparing values of different types", right.span);
+        }
+        let eq = self.eq_label(ty);
+        self.a.load(RCX, left.0);
+        self.a.load(RDX, slot);
+        self.call_label(eq);
+        for (slot, owned) in [left, (slot, owned)] {
+            if owned {
+                self.a.load(RCX, slot);
+                self.a.store(slot, RAX);
+                self.drop_value(ty);
+                self.a.load(RAX, slot);
+            }
+        }
+        self.spill_depth -= 2;
+        Ok(())
+    }
+
+    /// Jumps to `differ` unless the values in rcx and rdx, of type `ty`, are equal.
+    fn eq_values(&mut self, ty: Ty, differ: usize) {
+        match ty {
+            Ty::Unit | Ty::Never => {}
+            Ty::Str => {
+                self.call_rt("str_eq");
+                self.a.alu_imm(7, RAX, 1);
+                self.a.jcc(CC_NE, differ);
+            }
+            _ if self.deep(ty) => {
+                let eq = self.eq_label(ty);
+                self.call_label(eq);
+                self.a.alu_imm(7, RAX, 1);
+                self.a.jcc(CC_NE, differ);
+            }
+            _ => {
+                self.a.alu_rr(0x39, RCX, RDX);
+                self.a.jcc(CC_NE, differ);
+            }
+        }
+    }
+
+    /// `eq(rcx, rdx) -> rax`: 1 if the two values of the type are equal, else 0.
+    fn emit_eq(&mut self, id: u32) {
+        let def = self.defs[id as usize].clone();
+        let (equal, differ, done) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.bind(self.eq_labels[&id]);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.push(RDI);
+        self.a.alu_imm(5, RSP, 32);
+        self.a.mov_rr(RBX, RCX);
+        self.a.mov_rr(RSI, RDX);
+        // The same block (or the same variant without fields) is equal to itself.
+        self.a.alu_rr(0x39, RBX, RSI);
+        self.a.jcc(CC_E, equal);
+        match def {
+            Def::Struct(fields) => {
+                for (i, (_, ty)) in fields.iter().enumerate() {
+                    let at = 8 + 8 * i as i32;
+                    self.a.load(RCX, M(RBX, at));
+                    self.a.load(RDX, M(RSI, at));
+                    self.eq_values(*ty, differ);
+                }
+            }
+            Def::Enum(variants) => {
+                // Different numbers, or a number and a block: not equal.
+                self.a.alu_imm(7, RBX, SMALL);
+                self.a.jcc(CC_B, differ);
+                self.a.alu_imm(7, RSI, SMALL);
+                self.a.jcc(CC_B, differ);
+                self.a.load(RAX, M(RBX, 8));
+                self.a.alu_m(0x3B, RAX, M(RSI, 8));
+                self.a.jcc(CC_NE, differ);
+                for (tag, (_, fields)) in variants.iter().enumerate() {
+                    if fields.is_empty() {
+                        continue;
+                    }
+                    let next = self.a.label();
+                    self.a.cmp_imm(M(RBX, 8), tag as i32);
+                    self.a.jcc(CC_NE, next);
+                    for (i, ty) in fields.iter().enumerate() {
+                        let at = 16 + 8 * i as i32;
+                        self.a.load(RCX, M(RBX, at));
+                        self.a.load(RDX, M(RSI, at));
+                        self.eq_values(*ty, differ);
+                    }
+                    self.a.jmp(equal);
+                    self.a.bind(next);
+                }
+            }
+            Def::List(item) => {
+                let top = self.a.label();
+                self.a.load(RAX, M(RBX, LENGTH));
+                self.a.alu_m(0x3B, RAX, M(RSI, LENGTH));
+                self.a.jcc(CC_NE, differ);
+                self.a.mov_imm64(RDI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RDI, M(RBX, LENGTH));
+                self.a.jcc(CC_GE, equal);
+                self.element(0x8B, RCX, RBX, RDI);
+                self.element(0x8B, RDX, RSI, RDI);
+                self.eq_values(item, differ);
+                self.a.alu_imm(0, RDI, 1);
+                self.a.jmp(top);
+            }
+            Def::Fn(..) => self.a.jmp(differ),
+        }
+        self.a.bind(equal);
+        self.a.mov_imm64(RAX, 1);
+        self.a.jmp(done);
+        self.a.bind(differ);
+        self.a.mov_imm64(RAX, 0);
+        self.a.bind(done);
+        self.a.alu_imm(0, RSP, 32);
+        self.a.pop(RDI);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
+    }
+
+    /// Adds the text of a value, as it appears inside other values (strings
+    /// in quotes), to a string being built: rcx = the string, rdx = the
+    /// value; the string comes back in rax.
+    fn repr_call(&mut self, ty: Ty) {
+        match ty {
+            Ty::Int => self.call_rt("str_append_int"),
+            Ty::Str => self.call_rt("str_append_quoted"),
+            Ty::Bool => {
+                let (yes, no) = (self.constant(b"true"), self.constant(b"false"));
+                let (is_false, done) = (self.a.label(), self.a.label());
+                self.a.alu_rr(0x85, RDX, RDX);
+                self.a.jcc(CC_Z, is_false);
+                self.lea_label(RDX, yes);
+                self.a.mov_imm64(R8, 4);
+                self.a.jmp(done);
+                self.a.bind(is_false);
+                self.lea_label(RDX, no);
+                self.a.mov_imm64(R8, 5);
+                self.a.bind(done);
+                self.call_rt("str_append");
+            }
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => {
+                self.uses_heap = true;
+                let label = match self.repr_labels.get(&id) {
+                    Some(label) => *label,
+                    None => {
+                        let label = self.a.label();
+                        self.repr_labels.insert(id, label);
+                        self.text_queue.push((true, id));
+                        label
+                    }
+                };
+                self.call_label(label);
+            }
+            Ty::Fn(_) => self.repr_text("<closure>", RCX),
+            Ty::Unit | Ty::Never => self.repr_text("()", RCX),
+        }
+    }
+
+    /// Adds fixed text to the string in `string`; the string comes back in rax.
+    fn repr_text(&mut self, text: &str, string: u8) {
+        let bytes = self.constant(text.as_bytes());
+        self.mov(RCX, string);
+        self.lea_label(RDX, bytes);
+        self.a.mov_imm64(R8, text.len() as i64);
+        self.call_rt("str_append");
+    }
+
+    /// `repr(rcx = string being built, rdx = value) -> rax`: adds the text
+    /// of a value of the type, in the form `yui run` shows it.
+    fn emit_repr(&mut self, id: u32) {
+        let def = self.defs[id as usize].clone();
+        // The name as written, without type arguments.
+        let name = self.def_keys[id as usize].split('<').next().unwrap_or("").rsplit('.').next().unwrap_or("").to_string();
+        self.a.bind(self.repr_labels[&id]);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.push(RDI);
+        self.a.alu_imm(5, RSP, 32);
+        self.a.mov_rr(RBX, RCX);
+        self.a.mov_rr(RSI, RDX);
+        // rbx = the string, rsi = the value. Each piece: the string in, the string out.
+        match def {
+            Def::Struct(fields) => {
+                self.repr_text(&format!("{name} {{ "), RBX);
+                self.a.mov_rr(RBX, RAX);
+                for (i, (field, ty)) in fields.iter().enumerate() {
+                    let label = if i == 0 { format!("{field}: ") } else { format!(", {field}: ") };
+                    self.repr_text(&label, RBX);
+                    self.a.mov_rr(RCX, RAX);
+                    self.a.load(RDX, M(RSI, 8 + 8 * i as i32));
+                    self.repr_call(*ty);
+                    self.a.mov_rr(RBX, RAX);
+                }
+                self.repr_text(" }", RBX);
+            }
+            Def::Enum(variants) => {
+                let (block, known, done) = (self.a.label(), self.a.label(), self.a.label());
+                // rdi = the number of the variant.
+                self.a.mov_rr(RDI, RSI);
+                self.a.alu_imm(7, RSI, SMALL);
+                self.a.jcc(CC_B, known);
+                self.a.bind(block);
+                self.a.load(RDI, M(RSI, 8));
+                self.a.bind(known);
+                self.a.mov_rr(RAX, RBX);
+                for (tag, (variant, fields)) in variants.iter().enumerate() {
+                    let next = self.a.label();
+                    self.a.alu_imm(7, RDI, tag as i32);
+                    self.a.jcc(CC_NE, next);
+                    let shown = match name.as_str() {
+                        "Option" | "Result" => variant.clone(),
+                        _ => format!("{name}.{variant}"),
+                    };
+                    let shown = if fields.is_empty() { shown } else { format!("{shown}(") };
+                    self.repr_text(&shown, RBX);
+                    for (i, ty) in fields.iter().enumerate() {
+                        if i > 0 {
+                            self.repr_text(", ", RAX);
+                        }
+                        self.a.mov_rr(RCX, RAX);
+                        self.a.load(RDX, M(RSI, 16 + 8 * i as i32));
+                        self.repr_call(*ty);
+                    }
+                    if !fields.is_empty() {
+                        self.repr_text(")", RAX);
+                    }
+                    self.a.jmp(done);
+                    self.a.bind(next);
+                }
+                self.a.bind(done);
+            }
+            Def::List(item) => {
+                let (top, first, end) = (self.a.label(), self.a.label(), self.a.label());
+                self.repr_text("[", RBX);
+                self.a.mov_rr(RBX, RAX);
+                self.a.mov_imm64(RDI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RDI, M(RSI, LENGTH));
+                self.a.jcc(CC_GE, end);
+                self.a.alu_rr(0x85, RDI, RDI);
+                self.a.jcc(CC_Z, first);
+                self.repr_text(", ", RBX);
+                self.a.mov_rr(RBX, RAX);
+                self.a.bind(first);
+                self.a.mov_rr(RCX, RBX);
+                self.element(0x8B, RDX, RSI, RDI);
+                self.repr_call(item);
+                self.a.mov_rr(RBX, RAX);
+                self.a.alu_imm(0, RDI, 1);
+                self.a.jmp(top);
+                self.a.bind(end);
+                self.repr_text("]", RBX);
+            }
+            Def::Fn(..) => self.repr_text("<closure>", RBX),
+        }
+        self.a.alu_imm(0, RSP, 32);
+        self.a.pop(RDI);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
     }
 
     /// A method of an `Option` or a `Result`.
@@ -3677,17 +4351,28 @@ impl Native<'_> {
                 self.a.mov_rr(dst, RAX);
                 Ok(ty)
             }
-            ("get", [index]) => {
+            ("get", [_]) | ("first" | "last", []) => {
                 // `Some(item)` if the index is inside the list, else `None` (the number 0).
                 let result = self.expr_ty(e)?;
                 let (slot, owned, list_ty) = self.park(recv, dst)?;
                 let item = self.item_ty(list_ty);
-                let held = self.pending.len();
-                if owned {
-                    self.hold(slot, list_ty);
+                match (name, args) {
+                    ("get", [index]) => {
+                        let held = self.pending.len();
+                        if owned {
+                            self.hold(slot, list_ty);
+                        }
+                        self.eval(index, dst)?;
+                        self.pending.truncate(held);
+                    }
+                    ("first", _) => self.a.mov_imm64(dst, 0),
+                    _ => {
+                        // The last index; for an empty list it is -1, which is outside.
+                        self.a.load(RCX, slot);
+                        self.a.load(dst, M(RCX, LENGTH));
+                        self.a.alu_imm(5, dst, 1);
+                    }
                 }
-                self.eval(index, dst)?;
-                self.pending.truncate(held);
                 let (none, done) = (self.a.label(), self.a.label());
                 self.a.load(RCX, slot);
                 self.a.alu_m(0x3B, dst, M(RCX, LENGTH));
@@ -3786,6 +4471,8 @@ impl Native<'_> {
             self.load_loc(RDX, out);
         }
         self.load_loc(RCX, func);
+        let site = self.site(e.span);
+        self.lea_label(RAX, site);
         self.a.buf.extend_from_slice(&[0xFF, 0x51, FN_CODE as u8]); // call [rcx + FN_CODE]
         match name {
             "map" => {
@@ -4033,6 +4720,27 @@ impl Native<'_> {
                     self.call_rt("str_release");
                 }
                 self.spill_depth -= 1;
+            }
+            Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) => {
+                // Written out as text first.
+                let slot = self.push_spill();
+                self.a.store(slot, t);
+                self.a.mov_imm64(RCX, 32);
+                self.call_rt("str_new");
+                self.a.mov_rr(RCX, RAX);
+                self.a.load(RDX, slot);
+                self.repr_call(ty);
+                let text = self.push_spill();
+                self.a.store(text, RAX);
+                self.a.lea(RCX, M(RAX, ELEMENTS));
+                self.a.load(RDX, M(RAX, LENGTH));
+                self.a.mov_imm64(R8, STDOUT);
+                self.call_label(self.rt_write);
+                self.a.load(RCX, text);
+                self.call_rt("str_release");
+                self.a.load(RCX, slot);
+                self.drop_value(ty);
+                self.spill_depth -= 2;
             }
             _ => return unsupported("printing this kind of value", value.span),
         }

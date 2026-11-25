@@ -142,6 +142,62 @@ fn str_append_int(s: Int, value: Int) -> Int {
   out
 }
 
+// 引用符で囲み、特別な文字を \ 付きの表記にして足す（値の中にある文字列の見せ方）
+fn str_append_quoted(s: Int, piece: Int) -> Int {
+  let count = __load(piece + 8)
+  // いちばん長くなるのは制御文字の \u{7f}（6 バイト）
+  let out = str_reserve(s, count * 6 + 2)
+  let start = out + 24
+  let mut at = start + __load(out + 8)
+  __store8(at, 34)
+  at = at + 1
+  let mut i = 0
+  while i < count {
+    let byte = __load8(piece + 24 + i)
+    if byte == 34 || byte == 92 {
+      __store8(at, 92)
+      __store8(at + 1, byte)
+      at = at + 2
+    } else if byte == 10 {
+      __store8(at, 92)
+      __store8(at + 1, 110)
+      at = at + 2
+    } else if byte == 13 {
+      __store8(at, 92)
+      __store8(at + 1, 114)
+      at = at + 2
+    } else if byte == 9 {
+      __store8(at, 92)
+      __store8(at + 1, 116)
+      at = at + 2
+    } else if byte == 0 {
+      __store8(at, 92)
+      __store8(at + 1, 48)
+      at = at + 2
+    } else if byte < 32 || byte == 127 {
+      __store8(at, 92)
+      __store8(at + 1, 117)
+      __store8(at + 2, 123)
+      at = at + 3
+      if byte >= 16 {
+        __store8(at, 48 + byte / 16)
+        at = at + 1
+      }
+      let low = byte % 16
+      if low < 10 { __store8(at, 48 + low) } else { __store8(at, 87 + low) }
+      __store8(at + 1, 125)
+      at = at + 2
+    } else {
+      __store8(at, byte)
+      at = at + 1
+    }
+    i = i + 1
+  }
+  __store8(at, 34)
+  __store(out + 8, at + 1 - start)
+  out
+}
+
 fn str_from_int(value: Int) -> Int {
   str_append_int(str_new(20), value)
 }

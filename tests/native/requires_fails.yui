@@ -1,0 +1,12 @@
+fn checked_half(n: Int) -> Int
+  requires n % 2 == 0
+  ensures result * 2 == n
+{
+  n / 2
+}
+
+fn main() uses io {
+  print("{checked_half(8)}")
+  let total = 1 + checked_half(7)
+  print("not reached {total}")
+}

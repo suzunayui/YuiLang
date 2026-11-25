@@ -1,0 +1,15 @@
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+fn mirror(p: Point) -> Point
+  ensures result.x >= 0
+{
+  Point { x: 0 - p.x, y: p.y }
+}
+
+fn main() uses io {
+  let ps = [Point { x: -1, y: 1 }, Point { x: 2, y: 2 }]
+  print("{ps.map(mirror)}")
+}

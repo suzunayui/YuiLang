@@ -1,0 +1,11 @@
+fn biggest(xs: List<Int>) -> Int
+  requires xs.len() > 0
+  ensures xs.all(|x| x <= result)
+{
+  xs[0]
+}
+
+fn main() uses io {
+  print("{biggest([3, 1, 2])}")
+  print("{biggest([1, 5, 2])}")
+}

@@ -1,0 +1,5 @@
+fn main() uses io {
+  let n = 64
+  print("{1.shl(n - 1)}")
+  print("{1.shl(n)}")
+}
