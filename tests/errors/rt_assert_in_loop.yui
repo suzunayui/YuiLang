@@ -1,0 +1,8 @@
+// expect: E0501
+test "assert reads loop variables" {
+  let mut total = 0
+  for i in 0..10 {
+    total = total + i
+    assert total < 20
+  }
+}

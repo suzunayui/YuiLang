@@ -154,6 +154,10 @@ pub struct Func {
     /// Free value-stack cells the function needs before it may be entered.
     /// Set together with `native`.
     pub need: Cell<usize>,
+    /// For each local slot: it only ever holds an `Int`.
+    pub int_slots: Vec<bool>,
+    /// For each op: it is an `Arith` or `Cmp` whose operands are `Int`.
+    pub int_ops: Vec<bool>,
 }
 
 /// Everything shared between the functions of one program.
@@ -162,6 +166,7 @@ pub struct Globals {
     pub fn_index: HashMap<String, u32>,
     pub struct_fields: HashMap<String, Vec<String>>,
     pub funcs: Vec<Rc<Func>>,
+    pub types: TypeInfo,
 }
 
 pub fn compile_fn(g: &mut Globals, f: &FnDecl) -> Func {
@@ -169,7 +174,7 @@ pub fn compile_fn(g: &mut Globals, f: &FnDecl) -> Func {
     c.func.unit_ret = f.ret.is_none();
     c.push_scope();
     for p in &f.params {
-        let slot = c.alloc();
+        let slot = c.alloc_var(p.span);
         c.bind(&p.name, slot);
     }
     for r in &f.requires {
@@ -257,6 +262,7 @@ impl<'g> Compiler<'g> {
     fn emit(&mut self, op: Op, span: Span) -> usize {
         self.func.code.push(op);
         self.func.spans.push(span);
+        self.func.int_ops.push(false);
         self.func.code.len() - 1
     }
 
@@ -315,10 +321,27 @@ impl<'g> Compiler<'g> {
         self.next_slot = scope.first_slot;
     }
 
+    /// A slot for a value of any type.
     fn alloc(&mut self) -> u32 {
+        self.alloc_kind(false)
+    }
+
+    /// A slot for the variable declared at `span`.
+    fn alloc_var(&mut self, span: Span) -> u32 {
+        let int = self.g.types.int_vars.contains(&span.start);
+        self.alloc_kind(int)
+    }
+
+    /// Slots are reused once their scope ends, so a slot counts as an `Int`
+    /// slot only if every variable that ever lives in it is an `Int`.
+    fn alloc_kind(&mut self, int: bool) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;
         self.func.nlocals = self.func.nlocals.max(self.next_slot as usize);
+        match self.func.int_slots.get_mut(slot as usize) {
+            Some(known) => *known = *known && int,
+            None => self.func.int_slots.push(int),
+        }
         slot
     }
 
@@ -415,12 +438,12 @@ impl<'g> Compiler<'g> {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, value, span, .. } => {
+            Stmt::Let { name, name_span, value, span, .. } => {
                 self.expr(value);
                 if name == "_" {
                     self.emit(Op::Pop, *span);
                 } else {
-                    let slot = self.alloc();
+                    let slot = self.alloc_var(*name_span);
                     self.bind(name, slot);
                     self.emit(Op::Store(slot), *span);
                 }
@@ -447,8 +470,9 @@ impl<'g> Compiler<'g> {
             }
             Stmt::For { var, iter, end: Some(end), body, span, .. } => {
                 self.push_scope();
-                let counter = self.alloc();
-                let limit = self.alloc();
+                // A range always counts in `Int`.
+                let counter = self.alloc_kind(true);
+                let limit = self.alloc_kind(true);
                 let sp_slot = self.alloc();
                 self.expr(iter);
                 self.expr(end);
@@ -807,8 +831,10 @@ impl<'g> Compiler<'g> {
                     return;
                 }
                 self.expr(rhs);
+                let int = self.g.types.int_ops.contains(&(span.start, span.end));
                 let op = if op.is_comparison() { Op::Cmp(*op) } else { Op::Arith(*op) };
-                self.emit(op, span);
+                let at = self.emit(op, span);
+                self.func.int_ops[at] = int;
             }
             ExprKind::Call { name, local, args, .. } => {
                 self.args(args);
@@ -917,14 +943,17 @@ impl<'g> Compiler<'g> {
             }
             ExprKind::Block(b) => self.block(b),
             ExprKind::Closure { params, captures, body } => {
-                let captured: Vec<(&String, u32)> =
-                    captures.iter().filter_map(|name| self.resolve(name).map(|slot| (name, slot))).collect();
+                let captured: Vec<(&String, u32, bool)> =
+                    captures
+                    .iter()
+                    .filter_map(|name| self.resolve(name).map(|slot| (name, slot, self.func.int_slots[slot as usize])))
+                    .collect();
                 let func = {
                     let mut c = Compiler::new(&mut *self.g, "<closure>");
                     c.push_scope();
-                    let slots: Vec<u32> = params.iter().map(|_| c.alloc()).collect();
-                    for (name, _) in &captured {
-                        let slot = c.alloc();
+                    let slots: Vec<u32> = params.iter().map(|p| c.alloc_var(p.span)).collect();
+                    for (name, _, int) in &captured {
+                        let slot = c.alloc_kind(*int);
                         c.bind(name, slot);
                     }
                     // Bound last, so a parameter shadows a captured variable of the same name.
@@ -937,7 +966,7 @@ impl<'g> Compiler<'g> {
                 };
                 self.g.funcs.push(Rc::new(func));
                 let index = (self.g.funcs.len() - 1) as u32;
-                for (_, slot) in &captured {
+                for (_, slot, _) in &captured {
                     self.emit(Op::Load(*slot), span);
                 }
                 self.emit(Op::MakeClosure(index, captured.len() as u32), span);

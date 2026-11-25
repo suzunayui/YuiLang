@@ -35,7 +35,7 @@ pub fn parse_file(src: &str, base: usize, module: &str, resolve: bool) -> P<Prog
     while *p.peek() != Tok::Eof {
         items.push(p.item()?);
     }
-    Ok(Program { imports, items })
+    Ok(Program { imports, items, types: TypeInfo::default() })
 }
 
 struct Parser {

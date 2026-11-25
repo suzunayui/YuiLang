@@ -1,0 +1,13 @@
+// expect: E0503
+test "adding two variables in a loop" {
+  let mut a = 1
+  let mut b = 1
+  let mut n = 0
+  while n < 200 {
+    let next = a + b
+    a = b
+    b = next
+    n = n + 1
+  }
+  assert b > 0
+}

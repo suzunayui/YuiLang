@@ -1,0 +1,10 @@
+// expect: E0503
+test "stepping past the largest Int" {
+  let mut x = 9223372036854775800
+  let mut n = 0
+  while n < 100 {
+    x = x + 1
+    n = n + 1
+  }
+  assert x > 0
+}

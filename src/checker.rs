@@ -84,9 +84,15 @@ struct Checker {
     in_contract: bool,
     loop_depth: usize,
     diags: Vec<Diagnostic>,
+    /// Type of every declared variable, by the start of its declaration span.
+    decl_types: Vec<(usize, Type)>,
+    /// Operand type of every arithmetic and comparison expression, by span.
+    op_types: Vec<((usize, usize), Type)>,
 }
 
-pub fn check(program: &Program) -> Vec<Diagnostic> {
+/// Checks the program. The second result tells the code generator which
+/// variables and operations are known to work on `Int`.
+pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
     let mut c = Checker {
         structs: HashMap::new(),
         enums: HashMap::new(),
@@ -101,6 +107,8 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
         in_contract: false,
         loop_depth: 0,
         diags: Vec::new(),
+        decl_types: Vec::new(),
+        op_types: Vec::new(),
     };
     let sigs = c.collect(program);
     let mut sigs = sigs.into_iter();
@@ -115,7 +123,19 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
         }
     }
     c.diags.sort_by_key(|d| d.span.start);
-    c.diags
+    // Inference is complete, so every recorded type can now be resolved.
+    let mut info = TypeInfo::default();
+    for (at, ty) in &c.decl_types {
+        if c.apply(ty) == Type::Int {
+            info.int_vars.insert(*at);
+        }
+    }
+    for (at, ty) in &c.op_types {
+        if c.apply(ty) == Type::Int {
+            info.int_ops.insert(*at);
+        }
+    }
+    (c.diags, info)
 }
 
 /// Last segment of a module-qualified name.
@@ -576,6 +596,7 @@ impl Checker {
         self.infer_effects = None;
         for (p, ty) in f.params.iter().zip(&sig.params) {
             self.scopes[0].insert(p.name.clone(), (ty.clone(), false));
+            self.decl_types.push((p.span.start, ty.clone()));
         }
 
         // Contracts must be pure.
@@ -643,6 +664,7 @@ impl Checker {
         if name == "_" {
             return;
         }
+        self.decl_types.push((span.start, ty.clone()));
         let scope = self.scopes.last_mut().expect("scope");
         if scope.contains_key(name) {
             self.error_hint(
@@ -1250,6 +1272,7 @@ impl Checker {
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Type {
         let l = self.expr(lhs, true);
         let r = self.expr(rhs, true);
+        self.op_types.push(((span.start, span.end), l.clone()));
         match op {
             BinOp::And | BinOp::Or => {
                 self.expect(&l, &Type::Bool, lhs.span);

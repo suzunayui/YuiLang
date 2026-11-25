@@ -629,7 +629,7 @@ pub struct Interp<'a> {
 impl<'a> Interp<'a> {
     /// `src` is the text of the source map the program was parsed from.
     pub fn new(program: &Program, src: &'a str) -> Interp<'a> {
-        let mut g = Globals::default();
+        let mut g = Globals { types: program.types.clone(), ..Globals::default() };
         let mut decls = Vec::new();
         let mut main = None;
         for item in &program.items {

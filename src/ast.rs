@@ -15,6 +15,18 @@ pub const EFFECTS: &[&str] = &["io", "fs"];
 pub struct Program {
     pub imports: Vec<Import>,
     pub items: Vec<Item>,
+    /// What the type checker learned, for the code generator.
+    pub types: TypeInfo,
+}
+
+/// Static types the code generator relies on. Everything not listed here is
+/// handled without assuming a type.
+#[derive(Clone, Default)]
+pub struct TypeInfo {
+    /// Variables of type `Int`, by the start of the span they are declared at.
+    pub int_vars: std::collections::HashSet<usize>,
+    /// Binary operations whose operands are `Int`, by span.
+    pub int_ops: std::collections::HashSet<(usize, usize)>,
 }
 
 pub struct Import {

@@ -1,0 +1,8 @@
+// expect: E0504
+test "dividing by a literal zero in a loop" {
+  let mut total = 0
+  for i in 0..3 {
+    total = total + i / 0
+  }
+  assert total == 0
+}

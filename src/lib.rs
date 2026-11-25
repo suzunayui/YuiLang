@@ -86,7 +86,8 @@ fn load(name: &str, src: &str, root: &Path, entry: Option<&Path>) -> Result<Load
         }
     }
 
-    let diags = checker::check(&program);
+    let (diags, types) = checker::check(&program);
+    program.types = types;
     if diags.is_empty() {
         Ok(Loaded { program, sources })
     } else {

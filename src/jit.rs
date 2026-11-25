@@ -7,13 +7,27 @@
 //! op, the code calls back into the interpreter to run that single op. The
 //! two therefore always agree.
 //!
+//! The type checker tells the compiler which variables and operations work
+//! on `Int`. Those need no checks at all: their values are kept in registers
+//! while an expression is evaluated (the "virtual stack"), and the busiest
+//! `Int` variables of a function with loops live in registers throughout.
+//!
 //! Register use inside generated code:
 //!   rbx  the machine's `Stack` (see `interp`)
 //!   r12  address of the current call's first local slot
 //!   r13  address just past the top of the value stack
+//!   r14  address just past the innermost frame on the frame stack
+//!   r15, rbp  `Int` variables kept in registers
+//!   r8-r11, rsi, rdi  values on the virtual stack
+//!   rax, rcx, rdx  scratch
 //!
-//! Generated functions and the helpers they call use the System V calling
-//! convention on every operating system, so one code generator serves them all.
+//! Helpers use the System V calling convention on every operating system, so
+//! one code generator serves them all. Each function starts with a short
+//! entry sequence for the interpreter, which saves registers and loads r13
+//! and r14 from the `Stack`; generated code calls the body behind it
+//! directly, with rbx, r13 and r14 simply staying in place. Keeping the two
+//! stack tops in registers matters: a call that stores and reloads them
+//! spends most of its time waiting for those memory round trips.
 
 use crate::ast::BinOp;
 use crate::bytecode::{Func, InPlace, Op, NONE};
@@ -94,8 +108,109 @@ const RDX: u8 = 2;
 const RBX: u8 = 3;
 const RSI: u8 = 6;
 const RDI: u8 = 7;
+const RBP: u8 = 5;
 const R8: u8 = 8;
 const R9: u8 = 9;
+const R10: u8 = 10;
+const R11: u8 = 11;
+const R14: u8 = 14;
+const R15: u8 = 15;
+
+/// Registers for values on the virtual stack. All are free to clobber
+/// across calls, so the virtual stack is written to memory before any call.
+const TEMPS: [u8; 6] = [R8, R9, R10, R11, RSI, RDI];
+/// Registers for `Int` variables. Calls preserve them.
+const SLOT_REGS: [u8; 2] = [R15, RBP];
+
+/// A value on the virtual stack: known to the compiler but not yet in memory.
+#[derive(Clone, Copy)]
+enum VItem {
+    /// An `Int` in a register from `TEMPS`.
+    Reg(u8),
+    Imm(i64),
+    /// A `Bool` that is true when this condition code holds. Only ever the
+    /// top item, and only until the next instruction that changes the flags.
+    Cond(u8),
+}
+
+/// The op this op may jump to.
+fn target_of(op: Op) -> Option<u32> {
+    match op {
+        Op::Jump(t)
+        | Op::JumpIfFalse(t)
+        | Op::AndJump(t)
+        | Op::OrJump(t)
+        | Op::ForRange(_, t)
+        | Op::ForRangeNext(_, t)
+        | Op::ForList(_, t)
+        | Op::JumpUnlessSlotInt(_, _, _, t)
+        | Op::JumpUnlessInt(_, _, t) => Some(t),
+        Op::Try(t) if t != NONE => Some(t),
+        _ => None,
+    }
+}
+
+/// The local slots an op reads or writes. The flag says whether the compiler
+/// handles the op itself when the slot lives in a register; any other use
+/// keeps the slot in memory.
+fn slot_refs(op: Op) -> Vec<(u32, bool)> {
+    match op {
+        Op::Load(s) | Op::Store(s) => vec![(s, true)],
+        Op::ArithSlotInt(_, s, _) | Op::CmpSlotInt(_, s, _) | Op::JumpUnlessSlotInt(_, s, _, _) => vec![(s, true)],
+        Op::ForRange(s, _) | Op::ForRangeNext(s, _) => vec![(s, true), (s + 1, true)],
+        Op::ForList(s, _) => vec![(s, false), (s + 1, false), (s + 2, false)],
+        Op::Take(s)
+        | Op::NewListFor(s)
+        | Op::StoreIndex(s)
+        | Op::StoreField(s, _)
+        | Op::Assign(s, _)
+        | Op::InPlace(s, _, _)
+        | Op::SaveSp(s)
+        | Op::RestoreSp(s)
+        | Op::IsVariant(s, _, _)
+        | Op::EnumArg(s, _)
+        | Op::Ensure(_, s) => vec![(s, false)],
+        _ => Vec::new(),
+    }
+}
+
+/// Picks the `Int` variables that live in registers: the ones used most
+/// inside loops. A function without loops keeps everything in memory, since
+/// saving and loading the registers would cost more than it gains.
+fn choose_slot_regs(func: &Func) -> Vec<Option<u8>> {
+    let mut regs = vec![None; func.nlocals];
+    let mut weight_at = vec![1usize; func.code.len()];
+    let mut has_loop = false;
+    for (pc, op) in func.code.iter().enumerate() {
+        if let Some(t) = target_of(*op).map(|t| t as usize).filter(|t| *t <= pc) {
+            has_loop = true;
+            for w in &mut weight_at[t..=pc] {
+                *w = w.saturating_mul(8);
+            }
+        }
+    }
+    if !has_loop {
+        return regs;
+    }
+    let mut eligible: Vec<bool> = (0..func.nlocals).map(|s| func.int_slots.get(s).copied().unwrap_or(false)).collect();
+    let mut weight = vec![0usize; func.nlocals];
+    for (pc, op) in func.code.iter().enumerate() {
+        for (slot, handled) in slot_refs(*op) {
+            let Some(ok) = eligible.get_mut(slot as usize) else { continue };
+            if handled {
+                weight[slot as usize] = weight[slot as usize].saturating_add(weight_at[pc]);
+            } else {
+                *ok = false;
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..func.nlocals).filter(|s| eligible[*s] && weight[*s] >= 8).collect();
+    order.sort_by_key(|s| std::cmp::Reverse(weight[*s]));
+    for (slot, reg) in order.into_iter().zip(SLOT_REGS) {
+        regs[slot] = Some(reg);
+    }
+    regs
+}
 const R12: u8 = 12;
 const R13: u8 = 13;
 
@@ -316,6 +431,42 @@ impl Asm {
         self.b(0xC0 | (reg & 7) << 3 | (rm & 7));
     }
 
+    /// `imul dst, src`
+    fn imul_rr(&mut self, dst: u8, src: u8) {
+        self.b(0x48 | (dst >> 3) << 2 | (src >> 3));
+        self.b(0x0F);
+        self.b(0xAF);
+        self.b(0xC0 | (dst & 7) << 3 | (src & 7));
+    }
+
+    /// Writes virtual-stack items to memory above the stack top, in order.
+    /// Leaves the flags alone, so that a pending `Cond` stays valid.
+    fn materialize(&mut self, items: &[VItem]) {
+        for item in items {
+            match *item {
+                VItem::Reg(r) => {
+                    self.store_imm(top(0), TAG_INT as i32);
+                    self.store(top(0).at(8), r);
+                }
+                VItem::Imm(n) => {
+                    self.store_imm(top(0), TAG_INT as i32);
+                    match i32::try_from(n) {
+                        Ok(n) => self.store_imm(top(0).at(8), n),
+                        Err(_) => {
+                            self.mov_imm64(RAX, n);
+                            self.store(top(0).at(8), RAX);
+                        }
+                    }
+                }
+                VItem::Cond(cc) => {
+                    self.store_imm(top(0), TAG_BOOL as i32);
+                    self.setcc(cc, top(0).at(1));
+                }
+            }
+            self.lea(R13, top(0).at(V));
+        }
+    }
+
     /// `inc qword [m]`
     fn inc_mem(&mut self, m: M) {
         self.rex_m(true, 0, m);
@@ -385,6 +536,13 @@ impl Asm {
     /// Makes the stack top visible to the interpreter.
     fn sync(&mut self) {
         self.store(M(RBX, STACK_TOP_OFFSET), R13);
+        self.store(M(RBX, FRAMES_TOP_OFFSET), R14);
+    }
+
+    /// Takes over both stack tops after the interpreter changed them.
+    fn reload_all(&mut self) {
+        self.load(R13, M(RBX, STACK_TOP_OFFSET));
+        self.load(R14, M(RBX, FRAMES_TOP_OFFSET));
     }
 
     fn reload(&mut self) {
@@ -544,6 +702,11 @@ enum StubKind {
     Call { index: u32, argc: u32, pc: u32 },
     CallValue { argc: u32, pc: u32 },
     Return,
+    /// Write these values to memory, then finish the call in the interpreter.
+    ReturnValue { items: Vec<VItem> },
+    /// An unchecked `Int` op overflowed: put its operands back in memory and
+    /// let the interpreter run the op, which reports the error.
+    Fail { pc: u32, items: Vec<VItem> },
 }
 
 struct Gen<'a> {
@@ -551,9 +714,20 @@ struct Gen<'a> {
     helpers: &'a Helpers,
     func: &'a Func,
     callee: &'a dyn Fn(u32) -> Option<Callee>,
+    /// Values computed but not yet written to the value stack.
+    vstack: Vec<VItem>,
+    /// Registers from `TEMPS` that hold nothing.
+    free: Vec<u8>,
+    /// The register each local slot lives in, if any.
+    slot_reg: Vec<Option<u8>>,
     /// One label per op, plus one for the end of the code.
     ops: Vec<usize>,
     stubs: Vec<Stub>,
+    /// The first instruction of the function body.
+    entry: usize,
+    /// Distance from the start of a function's code to its body. The same
+    /// for every function.
+    body_offset: i32,
     exit: usize,
     fail: usize,
     status: usize,
@@ -630,6 +804,7 @@ impl Gen<'_> {
         let func_native = std::mem::offset_of!(Func, native) as i32;
         let func_need = std::mem::offset_of!(Func, need) as i32;
         let func_nlocals = std::mem::offset_of!(Func, nlocals) as i32;
+        let body_offset = self.body_offset;
         let a = &mut self.a;
         let (is_fn, common) = (a.label(), a.label());
         let (copy, copied, fill, filled) = (a.label(), a.label(), a.label(), a.label());
@@ -660,8 +835,7 @@ impl Gen<'_> {
         a.load(RDI, M(RSI, func_native));
         a.alu_rr(0x85, RDI, RDI);
         a.jcc(CC_E, slow);
-        a.load(RCX, M(RBX, FRAMES_TOP_OFFSET));
-        a.alu_m(0x3B, RCX, M(RBX, FRAMES_LIMIT_OFFSET));
+        a.alu_m(0x3B, R14, M(RBX, FRAMES_LIMIT_OFFSET));
         a.jcc(CC_AE, slow);
         a.load(RDX, M(RSI, func_need));
         a.imul_imm(RDX, V);
@@ -673,7 +847,7 @@ impl Gen<'_> {
         a.dec_mem(M(RAX, 0));
         a.alu_imm(5, R13, V);
         a.lea(RDX, top(argc as i32));
-        a.store(M(RCX, FRAME_BASE), RDX);
+        a.store(M(R14, FRAME_BASE), RDX);
         a.bind(copy);
         a.alu_rr(0x85, R9, R9);
         a.jcc(CC_E, copied);
@@ -695,20 +869,16 @@ impl Gen<'_> {
         a.jmp(fill);
         a.bind(filled);
 
-        a.store(M(RCX, FRAME_FUNC), RSI);
-        a.store_imm(M(RCX, FRAME_PC), 0);
-        a.store_value(M(RCX, FRAME_SPAN), span.start, RDX);
-        a.store_value(M(RCX, FRAME_SPAN + 8), span.end, RDX);
-        a.alu_imm(0, RCX, FRAME_SIZE);
-        a.store(M(RBX, FRAMES_TOP_OFFSET), RCX);
+        a.store(M(R14, FRAME_FUNC), RSI);
+        a.store_imm(M(R14, FRAME_PC), 0);
+        a.store_value(M(R14, FRAME_SPAN), span.start, RDX);
+        a.store_value(M(R14, FRAME_SPAN + 8), span.end, RDX);
+        a.alu_imm(0, R14, FRAME_SIZE);
 
-        a.sync();
-        a.mov_rr(RAX, RDI);
-        a.mov_rr(RDI, RBX);
+        a.lea(RAX, M(RDI, body_offset));
         a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
         a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
         a.jcc(CC_NE, fail);
-        a.reload();
         a.bind(resume);
     }
 
@@ -727,6 +897,7 @@ impl Gen<'_> {
         a.sync();
         a.mov_rr(RDI, RBX);
         a.call(self.helpers.ret);
+        a.reload_all();
         a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
         a.jmp(self.exit);
     }
@@ -749,14 +920,19 @@ impl Gen<'_> {
         let fail = self.fail;
         let a = &mut self.a;
 
-        // rax = the callee's machine code, if it has been compiled.
-        a.mov_imm64(RAX, callee.native as i64);
-        a.load(RAX, M(RAX, 0));
-        a.buf.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
-        a.jcc(CC_E, slow);
-        // rcx = the new frame; the interpreter reports running out of room.
-        a.load(RCX, M(RBX, FRAMES_TOP_OFFSET));
-        a.alu_m(0x3B, RCX, M(RBX, FRAMES_LIMIT_OFFSET));
+        // A function that calls itself is certainly compiled, and its
+        // address is known. Otherwise: rax = the callee's machine code, if any.
+        let recursive = callee.func == self.func as *const Func as usize;
+        let entry = self.entry;
+        let body_offset = self.body_offset;
+        if !recursive {
+            a.mov_imm64(RAX, callee.native as i64);
+            a.load(RAX, M(RAX, 0));
+            a.buf.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+            a.jcc(CC_E, slow);
+        }
+        // r14 is the new frame; the interpreter reports running out of room.
+        a.alu_m(0x3B, R14, M(RBX, FRAMES_LIMIT_OFFSET));
         a.jcc(CC_AE, slow);
         a.lea(RDX, top(0).at(callee.need as i32 * V));
         a.alu_m(0x3B, RDX, M(RBX, STACK_END_OFFSET));
@@ -764,27 +940,59 @@ impl Gen<'_> {
 
         // The arguments are the first locals; the rest start out as `()`.
         a.lea(RDX, top(argc as i32));
-        a.store(M(RCX, FRAME_BASE), RDX);
+        a.store(M(R14, FRAME_BASE), RDX);
         for i in 0..extra {
             a.store_imm(top(0).at(i * V), TAG_UNIT as i32);
         }
         if extra > 0 {
             a.alu_imm(0, R13, extra * V);
         }
-        a.store_value(M(RCX, FRAME_FUNC), callee.func, RDX);
-        a.store_imm(M(RCX, FRAME_PC), 0);
-        a.store_value(M(RCX, FRAME_SPAN), span.start, RDX);
-        a.store_value(M(RCX, FRAME_SPAN + 8), span.end, RDX);
-        a.alu_imm(0, RCX, FRAME_SIZE);
-        a.store(M(RBX, FRAMES_TOP_OFFSET), RCX);
+        a.store_value(M(R14, FRAME_FUNC), callee.func, RDX);
+        a.store_imm(M(R14, FRAME_PC), 0);
+        a.store_value(M(R14, FRAME_SPAN), span.start, RDX);
+        a.store_value(M(R14, FRAME_SPAN + 8), span.end, RDX);
+        a.alu_imm(0, R14, FRAME_SIZE);
 
-        a.sync();
-        a.mov_rr(RDI, RBX);
-        a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        // Enter the body. It returns with its result on top of the stack
+        // (r13) and its frame gone (r14).
+        if recursive {
+            a.b(0xE8); // call rel32
+            a.rel32(entry);
+        } else {
+            a.alu_imm(0, RAX, body_offset);
+            a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        }
         a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
         a.jcc(CC_NE, fail);
-        a.reload();
         a.bind(resume);
+    }
+
+    /// Returns the single `Int` on the virtual stack by writing it straight
+    /// into the result position, without first storing it on the stack.
+    fn ret_value(&mut self, item: VItem) {
+        let nlocals = self.func.nlocals;
+        let (slow, _) = self.stub_of(StubKind::ReturnValue { items: vec![item] });
+        let exit = self.exit;
+        let checked: Vec<u32> = (0..nlocals as u32).filter(|s| !self.int_slot(*s)).collect();
+        let a = &mut self.a;
+        // The stack must hold exactly the locals, none of which needs dropping.
+        a.lea(RAX, slot(nlocals as u32));
+        a.buf.extend_from_slice(&[0x4C, 0x39, 0xE8]); // cmp rax, r13
+        a.jcc(CC_NE, slow);
+        for s in checked {
+            a.cmp_byte(slot(s), FIRST_HEAP_TAG);
+            a.jcc(CC_AE, slow);
+        }
+        a.store_imm(slot(0), TAG_INT as i32);
+        match item {
+            VItem::Reg(r) => a.store(slot(0).at(8), r),
+            VItem::Imm(n) => a.store_value(slot(0).at(8), n as usize, RAX),
+            VItem::Cond(_) => {}
+        }
+        a.lea(R13, slot(1));
+        a.alu_imm(5, R14, FRAME_SIZE);
+        a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+        a.jmp(exit);
     }
 
     /// A return, without leaving machine code when no local needs dropping.
@@ -804,6 +1012,10 @@ impl Gen<'_> {
         a.buf.extend_from_slice(&[0x4C, 0x39, 0xE8]); // cmp rax, r13
         a.jcc(CC_NE, slow);
         for i in 0..nlocals as u32 {
+            // An `Int` slot never holds anything that needs dropping.
+            if self.func.int_slots.get(i as usize).copied().unwrap_or(false) {
+                continue;
+            }
             a.cmp_byte(slot(i), FIRST_HEAP_TAG);
             a.jcc(CC_AE, slow);
         }
@@ -820,8 +1032,7 @@ impl Gen<'_> {
         }
         // The result replaces the locals, and the frame is gone.
         a.lea(R13, slot(1));
-        a.sync();
-        a.alu_mem_imm(5, M(RBX, FRAMES_TOP_OFFSET), FRAME_SIZE);
+        a.alu_imm(5, R14, FRAME_SIZE);
         a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
         a.jmp(exit);
     }
@@ -840,8 +1051,287 @@ impl Gen<'_> {
         self.a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
         self.a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
         self.a.jcc(CC_NE, self.fail);
-        self.a.reload();
+        self.a.reload_all();
     }
+
+    // ---- typed code: `Int` values in registers ----
+
+    fn int_slot(&self, s: u32) -> bool {
+        self.func.int_slots.get(s as usize).copied().unwrap_or(false)
+    }
+
+    fn reg_of(&self, s: u32) -> Option<u8> {
+        self.slot_reg.get(s as usize).copied().flatten()
+    }
+
+    /// Writes the virtual stack to memory.
+    fn flush(&mut self) {
+        let items = std::mem::take(&mut self.vstack);
+        self.a.materialize(&items);
+        for item in items {
+            if let VItem::Reg(r) = item {
+                self.free.push(r);
+            }
+        }
+    }
+
+    /// A free register for the virtual stack.
+    fn tmp(&mut self) -> u8 {
+        if self.free.is_empty() {
+            self.flush();
+        }
+        self.free.pop().expect("a virtual-stack register is free after a flush")
+    }
+
+    /// Pops the top value, known to be an `Int`, into a register the caller owns.
+    fn pop_int(&mut self) -> u8 {
+        match self.vstack.pop() {
+            Some(VItem::Reg(r)) => r,
+            Some(VItem::Imm(n)) => {
+                let r = self.tmp();
+                self.a.mov_imm64(r, n);
+                r
+            }
+            other => {
+                // In memory (a `Cond` is never an `Int`, and is flushed before any op).
+                if let Some(item) = other {
+                    self.vstack.push(item);
+                    self.flush();
+                }
+                let r = self.tmp();
+                self.a.load(r, top(1).at(8));
+                self.a.alu_imm(5, R13, V);
+                r
+            }
+        }
+    }
+
+    /// Stores the registers that hold variables back into their slots.
+    fn write_back(&mut self) {
+        for (s, reg) in self.slot_reg.clone().into_iter().enumerate() {
+            if let Some(reg) = reg {
+                self.a.store_imm(slot(s as u32), TAG_INT as i32);
+                self.a.store(slot(s as u32).at(8), reg);
+            }
+        }
+    }
+
+    /// Loads the value of an `Int` slot into rax.
+    fn slot_to_rax(&mut self, s: u32) {
+        match self.reg_of(s) {
+            Some(r) => self.a.mov_rr(RAX, r),
+            None => self.a.load(RAX, slot(s).at(8)),
+        }
+    }
+
+    /// `cmp slot, imm` for an `Int` slot.
+    fn cmp_slot_imm(&mut self, s: u32, n: i32) {
+        match self.reg_of(s) {
+            Some(r) => self.a.alu_imm(7, r, n),
+            None => self.a.cmp_imm(slot(s).at(8), n),
+        }
+    }
+
+    /// `cmp rax, slot` for an `Int` slot.
+    fn cmp_rax_slot(&mut self, s: u32) {
+        match self.reg_of(s) {
+            Some(r) => self.a.alu_rr(0x39, RAX, r),
+            None => self.a.alu_m(0x3B, RAX, slot(s).at(8)),
+        }
+    }
+
+    /// The label of code that reports the failure of the op at `pc`, whose
+    /// operands are `operands` on top of the current virtual stack.
+    fn fail_stub(&mut self, pc: u32, operands: &[u8]) -> usize {
+        let mut items = self.vstack.clone();
+        items.extend(operands.iter().map(|r| VItem::Reg(*r)));
+        self.stub_of(StubKind::Fail { pc, items }).0
+    }
+
+    /// Generates unchecked code for an op on `Int` values. Returns false when
+    /// the op is not one of those, and must go through `op`.
+    fn typed(&mut self, pc: u32, op: Op) -> bool {
+        match op {
+            Op::Int(n) => self.vstack.push(VItem::Imm(n)),
+            Op::Load(s) if self.int_slot(s) => {
+                let t = self.tmp();
+                match self.reg_of(s) {
+                    Some(r) => self.a.mov_rr(t, r),
+                    None => self.a.load(t, slot(s).at(8)),
+                }
+                self.vstack.push(VItem::Reg(t));
+            }
+            Op::Store(s) if self.int_slot(s) => match (self.reg_of(s), self.vstack.pop()) {
+                (Some(r), Some(VItem::Imm(n))) => self.a.mov_imm64(r, n),
+                (reg, item) => {
+                    if let Some(item) = item {
+                        self.vstack.push(item);
+                    }
+                    let x = self.pop_int();
+                    match reg {
+                        Some(r) => self.a.mov_rr(r, x),
+                        None => {
+                            self.a.store_imm(slot(s), TAG_INT as i32);
+                            self.a.store(slot(s).at(8), x);
+                        }
+                    }
+                    self.free.push(x);
+                }
+            },
+            Op::Pop if !self.vstack.is_empty() => {
+                if let Some(VItem::Reg(r)) = self.vstack.pop() {
+                    self.free.push(r);
+                }
+            }
+            Op::ArithSlotInt(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), s, n) => {
+                let t = self.tmp();
+                let slow = self.fail_stub(pc, &[]);
+                self.slot_to_rax(s);
+                self.a.int_op_imm(op, n);
+                self.a.jcc(CC_O, slow);
+                self.a.mov_rr(t, RAX);
+                self.vstack.push(VItem::Reg(t));
+            }
+            Op::ArithSlotInt(op @ (BinOp::Div | BinOp::Rem), s, n) if n != 0 && n != -1 => {
+                let t = self.tmp();
+                self.slot_to_rax(s);
+                self.a.divide_by(op, n);
+                self.a.mov_rr(t, RAX);
+                self.vstack.push(VItem::Reg(t));
+            }
+            Op::ArithSlotInt(..) => {
+                // Division by 0 or -1: the interpreter reads the slot from memory.
+                self.flush();
+                self.write_back();
+                self.run_op(pc, None);
+            }
+            Op::ArithInt(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), n) => {
+                let x = self.pop_int();
+                let slow = self.fail_stub(pc, &[x]);
+                self.a.mov_rr(RAX, x);
+                self.a.int_op_imm(op, n);
+                self.a.jcc(CC_O, slow);
+                self.a.mov_rr(x, RAX);
+                self.vstack.push(VItem::Reg(x));
+            }
+            Op::ArithInt(op @ (BinOp::Div | BinOp::Rem), n) if n != 0 && n != -1 => {
+                let x = self.pop_int();
+                self.a.mov_rr(RAX, x);
+                self.a.divide_by(op, n);
+                self.a.mov_rr(x, RAX);
+                self.vstack.push(VItem::Reg(x));
+            }
+            Op::Arith(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul)) if self.func.int_ops[pc as usize] => {
+                let y = self.pop_int();
+                let x = self.pop_int();
+                let slow = self.fail_stub(pc, &[x, y]);
+                self.a.mov_rr(RAX, x);
+                match op {
+                    BinOp::Add => self.a.alu_rr(0x01, RAX, y),
+                    BinOp::Sub => self.a.alu_rr(0x29, RAX, y),
+                    _ => self.a.imul_rr(RAX, y),
+                }
+                self.a.jcc(CC_O, slow);
+                self.a.mov_rr(x, RAX);
+                self.free.push(y);
+                self.vstack.push(VItem::Reg(x));
+            }
+            Op::CmpSlotInt(op, s, n) => {
+                self.cmp_slot_imm(s, n);
+                self.vstack.push(VItem::Cond(condition(op)));
+            }
+            Op::CmpInt(op, n) => {
+                let x = self.pop_int();
+                self.a.alu_imm(7, x, n);
+                self.free.push(x);
+                self.vstack.push(VItem::Cond(condition(op)));
+            }
+            Op::Cmp(op) if self.func.int_ops[pc as usize] => {
+                let y = self.pop_int();
+                let x = self.pop_int();
+                self.a.alu_rr(0x39, x, y);
+                self.free.push(x);
+                self.free.push(y);
+                self.vstack.push(VItem::Cond(condition(op)));
+            }
+            Op::JumpIfFalse(target) if matches!(self.vstack.last(), Some(VItem::Cond(_))) => {
+                let Some(VItem::Cond(cc)) = self.vstack.pop() else { return false };
+                let target = self.ops[target as usize];
+                self.flush();
+                self.a.jcc(cc ^ 1, target);
+            }
+            Op::JumpUnlessSlotInt(op, s, n, target) => {
+                let target = self.ops[target as usize];
+                self.flush();
+                self.cmp_slot_imm(s, n);
+                self.a.jcc(condition(op) ^ 1, target);
+            }
+            Op::JumpUnlessInt(op, n, target) => {
+                let target = self.ops[target as usize];
+                let x = self.pop_int();
+                self.flush();
+                self.a.alu_imm(7, x, n);
+                self.free.push(x);
+                self.a.jcc(condition(op) ^ 1, target);
+            }
+            Op::Jump(target) => {
+                let target = self.ops[target as usize];
+                self.flush();
+                self.a.jmp(target);
+            }
+            Op::ForRange(s, target) => {
+                let target = self.ops[target as usize];
+                self.flush();
+                self.slot_to_rax(s);
+                self.cmp_rax_slot(s + 1);
+                self.a.jcc(CC_GE, target);
+            }
+            Op::ForRangeNext(s, target) => {
+                let target = self.ops[target as usize];
+                self.flush();
+                match self.reg_of(s) {
+                    Some(r) => {
+                        self.a.alu_imm(0, r, 1);
+                        self.a.mov_rr(RAX, r);
+                    }
+                    None => {
+                        self.a.load(RAX, slot(s).at(8));
+                        self.a.alu_imm(0, RAX, 1);
+                        self.a.store(slot(s).at(8), RAX);
+                    }
+                }
+                self.cmp_rax_slot(s + 1);
+                self.a.jcc(CC_L, target);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Generates code for one op.
+    fn step(&mut self, pc: u32, op: Op) {
+        // A pending condition is only usable by the jump that tests it.
+        if matches!(self.vstack.last(), Some(VItem::Cond(_))) && !matches!(op, Op::JumpIfFalse(_)) {
+            self.flush();
+        }
+        if let (Op::Return, [item @ (VItem::Reg(_) | VItem::Imm(_))]) = (op, self.vstack.as_slice()) {
+            if !self.func.unit_ret && self.func.nlocals <= MAX_INLINE_LOCALS {
+                let item = *item;
+                self.ret_value(item);
+                self.vstack.clear();
+                if let VItem::Reg(r) = item {
+                    self.free.push(r);
+                }
+                return;
+            }
+        }
+        if !self.typed(pc, op) {
+            self.flush();
+            self.op(pc, op);
+        }
+    }
+
+    // ---- code that makes no assumption about types ----
 
     fn op(&mut self, pc: u32, op: Op) {
         let a = &mut self.a;
@@ -1145,27 +1635,93 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
     let mut a = Asm::default();
     let ops = (0..=func.code.len()).map(|_| a.label()).collect();
     let (exit, fail, status) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, helpers, func, callee, ops, stubs: Vec::new(), exit, fail, status };
+    let entry = a.label();
+    let slot_reg = choose_slot_regs(func);
+    let uses_slot_regs = slot_reg.iter().any(|r| r.is_some());
+    let mut is_target = vec![false; func.code.len() + 1];
+    for op in &func.code {
+        if let Some(t) = target_of(*op) {
+            is_target[t as usize] = true;
+        }
+    }
+    let mut g = Gen {
+        a,
+        helpers,
+        func,
+        callee,
+        vstack: Vec::new(),
+        free: TEMPS.to_vec(),
+        slot_reg,
+        ops,
+        stubs: Vec::new(),
+        entry,
+        body_offset: 0,
+        exit,
+        fail,
+        status,
+    };
 
-    // Three pushes leave the native stack aligned for calls.
-    g.a.push(RBX);
-    g.a.push(R12);
-    g.a.push(R13);
+    // Entry from the interpreter: save every register generated code uses,
+    // load both stack tops, run the body, and store the tops back.
+    // Seven pushes leave the native stack aligned for the call.
+    let saved = [RBX, R12, R13, R14, R15, RBP, RAX];
+    for reg in saved {
+        g.a.push(reg);
+    }
     g.a.mov_rr(RBX, RDI);
-    g.a.reload();
+    g.a.reload_all();
+    g.a.b(0xE8); // call rel32
+    g.a.rel32(entry);
+    // After a failure the interpreter's own record of the stacks stands.
+    let failed = g.a.label();
+    g.a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+    g.a.jcc(CC_NE, failed);
+    g.a.sync();
+    g.a.bind(failed);
+    g.a.pop(RCX);
+    for reg in saved[..6].iter().rev() {
+        g.a.pop(*reg);
+    }
+    g.a.b(0xC3);
+    g.body_offset = g.a.buf.len() as i32;
+
+    // The body, which generated code calls directly. rbx, r13 and r14 stay as
+    // they are; it preserves the other registers it uses. One or three pushes
+    // keep the native stack aligned.
+    g.a.bind(entry);
+    g.a.push(R12);
+    if uses_slot_regs {
+        for reg in SLOT_REGS {
+            g.a.push(reg);
+        }
+    }
     g.a.lea(R12, M(R13, -(func.nlocals as i32) * V));
+    // Arguments arrive in their slots; the other slots hold nothing yet.
+    for (s, reg) in g.slot_reg.clone().into_iter().enumerate() {
+        if let Some(reg) = reg {
+            g.a.load(reg, slot(s as u32).at(8));
+        }
+    }
 
     for (pc, op) in func.code.iter().enumerate() {
+        // Every way of reaching a jump target must agree on what is in memory.
+        if is_target[pc] {
+            g.flush();
+        }
         g.a.bind(g.ops[pc]);
-        g.op(pc as u32, *op);
+        g.step(pc as u32, *op);
     }
+    g.flush();
     g.a.bind(g.ops[func.code.len()]);
 
     // Leave with the status in eax: 0 for success, 1 for a runtime error.
     g.a.bind(exit);
-    g.a.pop(R13);
+    if uses_slot_regs {
+        for reg in SLOT_REGS.iter().rev() {
+            g.a.pop(*reg);
+        }
+    }
     g.a.pop(R12);
-    g.a.pop(RBX);
     g.a.b(0xC3);
     g.a.bind(fail);
     g.a.mov_imm32(RAX, 1);
@@ -1173,6 +1729,9 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
     // A helper answered RETURNED or FAILED.
     g.a.bind(status);
     g.a.buf.extend_from_slice(&[0x83, 0xE8, RETURNED as u8]); // sub eax, RETURNED
+    g.a.jcc(CC_NE, exit);
+    // The interpreter finished the call: take over the stack tops it left.
+    g.a.reload_all();
     g.a.jmp(exit);
 
     for stub in std::mem::take(&mut g.stubs) {
@@ -1191,6 +1750,17 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
                 g.a.jmp(stub.resume);
             }
             StubKind::Return => g.return_helper(),
+            StubKind::ReturnValue { items } => {
+                g.a.materialize(&items);
+                g.return_helper();
+            }
+            StubKind::Fail { pc, items } => {
+                g.a.materialize(&items);
+                g.write_back();
+                g.run_op(pc, None);
+                // The interpreter reports the error, so this is not reached.
+                g.a.jmp(g.fail);
+            }
         }
     }
     g.a.finish()
