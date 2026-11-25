@@ -1,10 +1,13 @@
 //! YuiLang: a programming language designed for AI-driven development.
 
 pub mod ast;
+pub mod bytecode;
 pub mod checker;
 pub mod diag;
 pub mod fmt;
 pub mod interp;
+#[cfg(target_arch = "x86_64")]
+pub mod jit;
 pub mod lexer;
 pub mod parser;
 

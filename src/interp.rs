@@ -1,27 +1,40 @@
-//! Tree-walking interpreter. Runs programs that have passed the type checker.
+//! Runs programs that have passed the type checker.
+//!
+//! `bytecode` compiles every function to a flat list of ops that work on a
+//! value stack; local variables live in numbered slots at the bottom of each
+//! call's part of that stack. On x86-64 the ops are then translated to machine
+//! code by `jit`, which calls back into `exec` here for everything it does not
+//! generate itself. Elsewhere, and when `Interp::jit` is off, `run` interprets
+//! the ops directly.
 
 use crate::ast::*;
+use crate::bytecode::{self, Func, Globals, InPlace, Op, PathElem, NONE};
 use crate::diag::{Diagnostic, Span};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 /// Maximum depth of nested function calls.
 pub const MAX_DEPTH: usize = 10_000;
 
+/// A runtime value. The layout is fixed because generated machine code reads
+/// and writes values directly: the discriminant is the first byte, an Int's
+/// number is at offset 8 and a Bool's flag at offset 1. Variants below
+/// `Str` own no heap memory, so that code may copy and overwrite them freely.
 #[derive(Clone)]
+#[repr(u8)]
 pub enum Value {
-    Int(i64),
-    Float(f64),
-    Bool(bool),
-    Str(Rc<str>),
-    Unit,
-    List(Rc<Vec<Value>>),
-    Map(Rc<BTreeMap<Key, Value>>),
-    Struct(Rc<StructVal>),
-    Enum(Rc<EnumVal>),
-    Fn(Rc<FnDecl>),
-    Closure(Rc<ClosureVal>),
+    Int(i64) = 0,
+    Float(f64) = 1,
+    Bool(bool) = 2,
+    Unit = 3,
+    Str(Rc<str>) = 4,
+    List(Rc<Vec<Value>>) = 5,
+    Map(Rc<BTreeMap<Key, Value>>) = 6,
+    Struct(Rc<StructVal>) = 7,
+    Enum(Rc<EnumVal>) = 8,
+    Fn(Rc<Func>) = 9,
+    Closure(Rc<ClosureVal>) = 10,
 }
 
 /// Map keys are restricted to types with a simple total order.
@@ -34,21 +47,21 @@ pub enum Key {
 
 #[derive(Clone, PartialEq)]
 pub struct StructVal {
-    pub name: String,
-    pub fields: Vec<(String, Value)>,
+    pub name: Rc<str>,
+    pub fields: Vec<(Rc<str>, Value)>,
 }
 
 #[derive(Clone, PartialEq)]
 pub struct EnumVal {
-    pub enum_name: String,
-    pub variant: String,
+    pub enum_name: Rc<str>,
+    pub variant: Rc<str>,
     pub args: Vec<Value>,
 }
 
 pub struct ClosureVal {
-    params: Vec<String>,
-    body: Rc<Expr>,
-    captured: HashMap<String, Value>,
+    func: Rc<Func>,
+    /// Copies of the captured variables, in the order the function expects them.
+    captured: Vec<Value>,
 }
 
 impl std::fmt::Debug for Value {
@@ -90,6 +103,28 @@ impl Key {
     }
 }
 
+/// Names of the built-in enums, shared so that building an Option or a Result
+/// does not allocate them again.
+struct Names {
+    option: Rc<str>,
+    some: Rc<str>,
+    result: Rc<str>,
+    ok: Rc<str>,
+    err: Rc<str>,
+    none: Value,
+}
+
+thread_local! {
+    static NAMES: Names = Names {
+        option: Rc::from("Option"),
+        some: Rc::from("Some"),
+        result: Rc::from("Result"),
+        ok: Rc::from("Ok"),
+        err: Rc::from("Err"),
+        none: Value::variant(Rc::from("Option"), Rc::from("None"), Vec::new()),
+    };
+}
+
 impl Value {
     fn str(s: impl AsRef<str>) -> Value {
         Value::Str(Rc::from(s.as_ref()))
@@ -99,16 +134,24 @@ impl Value {
         Value::List(Rc::new(items))
     }
 
-    fn variant(enum_name: &str, variant: &str, args: Vec<Value>) -> Value {
-        Value::Enum(Rc::new(EnumVal { enum_name: enum_name.to_string(), variant: variant.to_string(), args }))
+    pub fn variant(enum_name: Rc<str>, variant: Rc<str>, args: Vec<Value>) -> Value {
+        Value::Enum(Rc::new(EnumVal { enum_name, variant, args }))
     }
 
     fn some(v: Value) -> Value {
-        Value::variant("Option", "Some", vec![v])
+        NAMES.with(|n| Value::variant(n.option.clone(), n.some.clone(), vec![v]))
     }
 
     fn none() -> Value {
-        Value::variant("Option", "None", vec![])
+        NAMES.with(|n| n.none.clone())
+    }
+
+    fn ok(v: Value) -> Value {
+        NAMES.with(|n| Value::variant(n.result.clone(), n.ok.clone(), vec![v]))
+    }
+
+    fn err(v: Value) -> Value {
+        NAMES.with(|n| Value::variant(n.result.clone(), n.err.clone(), vec![v]))
     }
 
     fn option(v: Option<Value>) -> Value {
@@ -155,8 +198,8 @@ impl Value {
                 format!("{} {{ {} }}", short(&s.name), parts.join(", "))
             }
             Value::Enum(e) => {
-                let mut out = match e.enum_name.as_str() {
-                    "Option" | "Result" => e.variant.clone(),
+                let mut out = match &*e.enum_name {
+                    "Option" | "Result" => e.variant.to_string(),
                     name => format!("{}.{}", short(name), e.variant),
                 };
                 if !e.args.is_empty() {
@@ -170,28 +213,24 @@ impl Value {
     }
 }
 
-enum Ctrl {
-    Return(Value),
-    Break,
-    Continue,
-    Panic(Box<Diagnostic>),
+/// A runtime error. Boxed so that the common, successful path stays small.
+type Fault = Box<Diagnostic>;
+type R<T> = Result<T, Fault>;
+
+fn panic(code: &'static str, msg: impl Into<String>, span: Span) -> Fault {
+    Box::new(Diagnostic::new(code, msg, span))
 }
 
-type R<T> = Result<T, Ctrl>;
-
-fn panic(code: &'static str, msg: impl Into<String>, span: Span) -> Ctrl {
-    Ctrl::Panic(Box::new(Diagnostic::new(code, msg, span)))
+fn panic_hint(code: &'static str, msg: impl Into<String>, span: Span, hint: &str) -> Fault {
+    Box::new(Diagnostic::new(code, msg, span).hint(hint))
 }
 
-fn panic_hint(code: &'static str, msg: impl Into<String>, span: Span, hint: &str) -> Ctrl {
-    Ctrl::Panic(Box::new(Diagnostic::new(code, msg, span).hint(hint)))
-}
-
-fn internal(span: Span) -> Ctrl {
+#[cold]
+fn internal(span: Span) -> Fault {
     panic("E0599", "internal error: the interpreter reached a state the type checker should prevent", span)
 }
 
-fn out_of_bounds(index: i64, len: usize, span: Span) -> Ctrl {
+fn out_of_bounds(index: i64, len: usize, span: Span) -> Fault {
     panic_hint(
         "E0505",
         format!("index {index} is out of bounds for a list of length {len}"),
@@ -200,7 +239,7 @@ fn out_of_bounds(index: i64, len: usize, span: Span) -> Ctrl {
     )
 }
 
-fn missing_key(key: &Key, span: Span) -> Ctrl {
+fn missing_key(key: &Key, span: Span) -> Fault {
     panic_hint(
         "E0507",
         format!("key {} is not in the map", key.to_value().repr()),
@@ -245,12 +284,295 @@ fn order(a: &Value, b: &Value) -> Option<Ordering> {
     }
 }
 
+fn ordering_matches(op: BinOp, o: Ordering) -> bool {
+    match op {
+        BinOp::Lt => o == Ordering::Less,
+        BinOp::Le => o != Ordering::Greater,
+        BinOp::Gt => o == Ordering::Greater,
+        BinOp::Ge => o != Ordering::Less,
+        BinOp::Eq => o == Ordering::Equal,
+        BinOp::Ne => o != Ordering::Equal,
+        _ => false,
+    }
+}
+
+fn compare(op: BinOp, l: &Value, r: &Value) -> bool {
+    match op {
+        BinOp::Eq => l == r,
+        BinOp::Ne => l != r,
+        _ => order(l, r).is_some_and(|o| ordering_matches(op, o)),
+    }
+}
+
+/// The overflow-checked operations that cannot fail in any other way.
+/// Returns None for the rest, and on overflow, so the caller can take the slow path.
+#[inline(always)]
+fn int_fast(op: BinOp, a: i64, b: i64) -> Option<i64> {
+    match op {
+        BinOp::Add => a.checked_add(b),
+        BinOp::Sub => a.checked_sub(b),
+        BinOp::Mul => a.checked_mul(b),
+        _ => None,
+    }
+}
+
+#[inline(never)]
+fn int_arith(op: BinOp, a: i64, b: i64, span: Span) -> R<Value> {
+    let result = match op {
+        BinOp::Add => a.checked_add(b),
+        BinOp::Sub => a.checked_sub(b),
+        BinOp::Mul => a.checked_mul(b),
+        BinOp::Div | BinOp::Rem if b == 0 => {
+            return Err(panic_hint(
+                "E0504",
+                "division by zero",
+                span,
+                "check the divisor first, or add a `requires` clause",
+            ));
+        }
+        BinOp::Div => a.checked_div(b),
+        BinOp::Rem => a.checked_rem(b),
+        _ => return Err(internal(span)),
+    };
+    match result {
+        Some(v) => Ok(Value::Int(v)),
+        None => Err(panic("E0503", format!("integer overflow in `{a} {} {b}`", op.symbol()), span)),
+    }
+}
+
+#[inline(never)]
+fn arith(op: BinOp, l: &Value, r: &Value, span: Span) -> R<Value> {
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => int_arith(op, *a, *b, span),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(match op {
+            BinOp::Add => a + b,
+            BinOp::Sub => a - b,
+            BinOp::Mul => a * b,
+            BinOp::Div => a / b,
+            BinOp::Rem => a % b,
+            _ => return Err(internal(span)),
+        })),
+        _ => Err(internal(span)),
+    }
+}
+
+fn field_mut<'v>(value: &'v mut Value, name: &str, span: Span) -> R<&'v mut Value> {
+    match value {
+        Value::Struct(s) => Rc::make_mut(s)
+            .fields
+            .iter_mut()
+            .find(|(n, _)| **n == *name)
+            .map(|(_, v)| v)
+            .ok_or_else(|| internal(span)),
+        _ => Err(internal(span)),
+    }
+}
+
+/// Mutable access to `value[index]` for an existing element.
+fn element_mut(value: &mut Value, index: Value, span: Span) -> R<&mut Value> {
+    match (value, index) {
+        (Value::List(items), Value::Int(i)) => {
+            let len = items.len();
+            if i < 0 || i as usize >= len {
+                return Err(out_of_bounds(i, len, span));
+            }
+            Ok(&mut Rc::make_mut(items)[i as usize])
+        }
+        (Value::Map(entries), index) => {
+            let key = to_key(&index, span)?;
+            match Rc::make_mut(entries).get_mut(&key) {
+                Some(v) => Ok(v),
+                None => Err(missing_key(&key, span)),
+            }
+        }
+        _ => Err(internal(span)),
+    }
+}
+
+/// `value[index] = v`. Assigning to a map entry may insert a new key.
+fn store_index(value: &mut Value, index: Value, v: Value, span: Span) -> R<()> {
+    if let Value::Map(entries) = value {
+        let key = to_key(&index, span)?;
+        Rc::make_mut(entries).insert(key, v);
+        return Ok(());
+    }
+    *element_mut(value, index, span)? = v;
+    Ok(())
+}
+
+/// Follows a path of struct fields down from a variable.
+fn fields_mut<'v>(root: &'v mut Value, path: &[PathElem], span: Span) -> R<&'v mut Value> {
+    let mut cur = root;
+    for elem in path {
+        cur = match elem {
+            PathElem::Field(name, span) => field_mut(cur, name, *span)?,
+            PathElem::Index(_) => return Err(internal(span)),
+        };
+    }
+    Ok(cur)
+}
+
+/// The value stack: one fixed block of memory, so that generated code can keep
+/// addresses into it. `#[repr(C)]` because that code reads and writes `top`.
+#[repr(C)]
+pub struct Stack {
+    base: *mut Value,
+    /// Just past the last value.
+    top: *mut Value,
+    end: *mut Value,
+    /// The interpreter that owns this stack, for helpers called by generated code.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    owner: *mut u8,
+}
+
+impl Stack {
+    const CAPACITY: usize = 1 << 22;
+
+    fn new() -> Stack {
+        let mut block: Vec<Value> = Vec::with_capacity(Self::CAPACITY);
+        let base = block.as_mut_ptr();
+        std::mem::forget(block);
+        // Safety: `base + CAPACITY` is the end of the allocation.
+        let end = unsafe { base.add(Self::CAPACITY) };
+        Stack { base, top: base, end, owner: std::ptr::null_mut() }
+    }
+
+    fn len(&self) -> usize {
+        // Safety: both point into the same allocation, and `top >= base`.
+        unsafe { self.top.offset_from(self.base) as usize }
+    }
+
+    /// Number of values that can still be pushed.
+    fn remaining(&self) -> usize {
+        // Safety: as in `len`.
+        unsafe { self.end.offset_from(self.top) as usize }
+    }
+
+    #[inline]
+    fn push(&mut self, v: Value) {
+        if self.top == self.end {
+            stack_full();
+        }
+        // Safety: `top` is inside the allocation and holds no live value.
+        unsafe {
+            self.top.write(v);
+            self.top = self.top.add(1);
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<Value> {
+        if self.top == self.base {
+            return None;
+        }
+        // Safety: the cell below `top` holds a live value, which is moved out.
+        unsafe {
+            self.top = self.top.sub(1);
+            Some(self.top.read())
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        while self.len() > len {
+            self.pop();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.truncate(0);
+    }
+
+    /// Removes and returns everything from index `at` up.
+    fn split_off(&mut self, at: usize) -> Vec<Value> {
+        let count = self.len() - at;
+        let mut out = Vec::with_capacity(count);
+        // Safety: the top `count` values are live; they are moved into `out`
+        // and `top` is lowered so the stack no longer owns them.
+        unsafe {
+            let from = self.base.add(at);
+            std::ptr::copy_nonoverlapping(from, out.as_mut_ptr(), count);
+            out.set_len(count);
+            self.top = from;
+        }
+        out
+    }
+
+    fn extend(&mut self, items: impl IntoIterator<Item = Value>) {
+        for v in items {
+            self.push(v);
+        }
+    }
+
+    fn extend_from_slice(&mut self, items: &[Value]) {
+        for v in items {
+            self.push(v.clone());
+        }
+    }
+}
+
+impl std::ops::Deref for Stack {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        // Safety: the cells from `base` up to `top` hold live values.
+        unsafe { std::slice::from_raw_parts(self.base, self.len()) }
+    }
+}
+
+impl std::ops::DerefMut for Stack {
+    fn deref_mut(&mut self) -> &mut [Value] {
+        // Safety: as in `deref`.
+        unsafe { std::slice::from_raw_parts_mut(self.base, self.len()) }
+    }
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        self.clear();
+        // Safety: `base` came from a Vec with this capacity, and is now empty.
+        unsafe { drop(Vec::from_raw_parts(self.base, 0, Self::CAPACITY)) };
+    }
+}
+
+#[cold]
+fn stack_full() -> ! {
+    eprintln!("fatal: the value stack is full");
+    std::process::abort();
+}
+
+/// What the machine does after an op.
+enum Flow {
+    Next,
+    Jump(usize),
+    Return(Value),
+}
+
+struct Frame {
+    func: Rc<Func>,
+    /// Where to continue in `func` once the call it made returns.
+    pc: usize,
+    /// Stack index of the function's first local slot.
+    base: usize,
+    /// Where the function was called from, for contract violations.
+    call_span: Span,
+}
+
 pub struct Interp<'a> {
     src: &'a str,
-    fns: HashMap<String, Rc<FnDecl>>,
-    struct_fields: HashMap<String, Vec<String>>,
-    env: Vec<HashMap<String, Value>>,
-    depth: usize,
+    g: Globals,
+    main: Option<(u32, Span)>,
+    stack: Stack,
+    frames: Vec<Frame>,
+    /// The error that made generated code stop.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    fault: Option<Fault>,
+    #[cfg(target_arch = "x86_64")]
+    code: crate::jit::CodeArena,
+    /// Run generated machine code instead of interpreting the bytecode.
+    /// Only available on x86-64; set `YUI_JIT=0` to turn it off.
+    pub jit: bool,
+    /// Frames that do not count as a call: 1 while running a test body.
+    free_frames: usize,
     /// Command line arguments returned by `args()`.
     pub args: Vec<String>,
     /// When set, `print` appends here instead of writing to stdout.
@@ -260,52 +582,84 @@ pub struct Interp<'a> {
 impl<'a> Interp<'a> {
     /// `src` is the text of the source map the program was parsed from.
     pub fn new(program: &Program, src: &'a str) -> Interp<'a> {
-        let mut fns = HashMap::new();
-        let mut struct_fields = HashMap::new();
+        let mut g = Globals::default();
+        let mut decls = Vec::new();
+        let mut main = None;
         for item in &program.items {
             match item {
                 Item::Fn(f) => {
-                    fns.entry(f.name.clone()).or_insert_with(|| f.clone());
+                    if !g.fn_index.contains_key(&f.name) {
+                        let index = g.funcs.len() as u32;
+                        g.fn_index.insert(f.name.clone(), index);
+                        g.funcs.push(Rc::new(Func::default()));
+                        if f.name == "main" {
+                            main = Some((index, f.name_span));
+                        }
+                        decls.push((index, f));
+                    }
                 }
                 Item::Struct(s) => {
-                    struct_fields.insert(s.name.clone(), s.fields.iter().map(|f| f.name.clone()).collect());
+                    g.struct_fields.insert(s.name.clone(), s.fields.iter().map(|f| f.name.clone()).collect());
                 }
                 _ => {}
             }
         }
-        Interp { src, fns, struct_fields, env: Vec::new(), depth: 0, args: Vec::new(), captured: None }
+        for (index, f) in decls {
+            let func = bytecode::compile_fn(&mut g, f);
+            g.funcs[index as usize] = Rc::new(func);
+        }
+        let mut interp = Interp {
+            src,
+            g,
+            main,
+            stack: Stack::new(),
+            frames: Vec::new(),
+            fault: None,
+            #[cfg(target_arch = "x86_64")]
+            code: Default::default(),
+            jit: false,
+            free_frames: 0,
+            args: Vec::new(),
+            captured: None,
+        };
+        interp.jit = std::env::var_os("YUI_JIT").is_none_or(|v| v != "0") && interp.native_available();
+        interp
     }
 
     pub fn run_main(&mut self) -> Result<(), Diagnostic> {
-        let Some(main) = self.fns.get("main").cloned() else {
+        let Some((index, span)) = self.main else {
             return Err(Diagnostic::new("E0207", "no `main` function found", Span::new(0, 0))
                 .hint("add `fn main() uses io { ... }`"));
         };
-        self.env = vec![HashMap::new()];
-        self.depth = 0;
-        match self.call_fn(&main, Vec::new(), main.name_span) {
-            Ok(_) | Err(Ctrl::Return(_)) | Err(Ctrl::Break) | Err(Ctrl::Continue) => Ok(()),
-            Err(Ctrl::Panic(d)) => Err(*d),
-        }
+        let func = self.g.funcs[index as usize].clone();
+        self.start(func, 0, span)
     }
 
     pub fn run_test(&mut self, test: &TestDecl) -> Result<(), Diagnostic> {
-        self.env = vec![HashMap::new()];
-        self.depth = 0;
-        match self.block(&test.body) {
-            Ok(_) | Err(Ctrl::Return(_)) | Err(Ctrl::Break) | Err(Ctrl::Continue) => Ok(()),
-            Err(Ctrl::Panic(d)) => Err(*d),
-        }
+        let func = Rc::new(bytecode::compile_test(&mut self.g, test));
+        self.start(func, 1, test.name_span)
     }
 
-    fn text(&self, span: Span) -> &str {
+    fn start(&mut self, func: Rc<Func>, free_frames: usize, span: Span) -> Result<(), Diagnostic> {
+        self.stack.clear();
+        self.frames.clear();
+        self.free_frames = free_frames;
+        let result = self.push_frame(func, 0, &[], span).and_then(|_| self.enter());
+        self.stack.clear();
+        self.frames.clear();
+        result.map(|_| ()).map_err(|d| *d)
+    }
+
+    fn text(&self, span: Span) -> &'a str {
         self.src.get(span.start..span.end).unwrap_or("")
     }
 
     // ---- calls ----
 
-    fn enter(&mut self, span: Span) -> R<()> {
-        if self.depth >= MAX_DEPTH {
+    /// Starts a call whose `argc` arguments are on top of the stack.
+    #[inline]
+    fn push_frame(&mut self, func: Rc<Func>, argc: usize, captured: &[Value], span: Span) -> R<()> {
+        if self.frames.len() >= MAX_DEPTH + self.free_frames {
             return Err(panic_hint(
                 "E0506",
                 format!("stack overflow: more than {MAX_DEPTH} nested calls"),
@@ -313,445 +667,544 @@ impl<'a> Interp<'a> {
                 "check that the recursion has a base case",
             ));
         }
+        // Generated code pushes temporaries without checking; a function never
+        // needs more of them than it has ops.
+        if self.stack.remaining() < func.nlocals + func.code.len() + 64 {
+            return Err(panic_hint(
+                "E0506",
+                "stack overflow: the value stack is full",
+                span,
+                "check that the recursion has a base case",
+            ));
+        }
+        let base = self.stack.len() - argc;
+        if !captured.is_empty() {
+            self.stack.extend_from_slice(captured);
+        }
+        for _ in self.stack.len()..base + func.nlocals {
+            self.stack.push(Value::Unit);
+        }
+        self.frames.push(Frame { func, pc: 0, base, call_span: span });
         Ok(())
     }
 
-    fn call_fn(&mut self, f: &Rc<FnDecl>, args: Vec<Value>, span: Span) -> R<Value> {
-        self.enter(span)?;
-        let mut scope = HashMap::new();
-        for (p, a) in f.params.iter().zip(args) {
-            scope.insert(p.name.clone(), a);
-        }
-        let saved = std::mem::replace(&mut self.env, vec![scope]);
-        self.depth += 1;
-        let result = self.call_body(f, span);
-        self.depth -= 1;
-        self.env = saved;
-        result
-    }
-
-    fn call_body(&mut self, f: &FnDecl, span: Span) -> R<Value> {
-        for r in &f.requires {
-            if self.eval(r)? != Value::Bool(true) {
-                let msg = format!("precondition of `{}` violated: `{}`", short(&f.name), self.text(r.span));
-                return Err(panic("E0502", msg, span));
-            }
-        }
-        let value = match self.block(&f.body) {
-            Ok(v) => v,
-            Err(Ctrl::Return(v)) => v,
-            Err(other) => return Err(other),
-        };
-        let value = if f.ret.is_none() { Value::Unit } else { value };
-        if !f.ensures.is_empty() {
-            let mut scope = HashMap::new();
-            scope.insert("result".to_string(), value.clone());
-            self.env.push(scope);
-            for e in &f.ensures {
-                if self.eval(e)? != Value::Bool(true) {
-                    let msg = format!(
-                        "postcondition of `{}` violated: `{}` (result: {})",
-                        short(&f.name),
-                        self.text(e.span),
-                        value.repr()
-                    );
-                    return Err(panic("E0502", msg, span));
-                }
-            }
-            self.env.pop();
-        }
-        Ok(value)
-    }
-
-    /// Calls a function value (a named function or a closure).
-    fn call_value(&mut self, f: &Value, args: Vec<Value>, span: Span) -> R<Value> {
+    /// Starts a call to a function value (a named function or a closure).
+    fn push_value_frame(&mut self, f: &Value, argc: usize, span: Span) -> R<()> {
         match f {
-            Value::Fn(decl) => self.call_fn(decl, args, span),
-            Value::Closure(c) => {
-                self.enter(span)?;
-                let mut scope = c.captured.clone();
-                for (p, a) in c.params.iter().zip(args) {
-                    if p != "_" {
-                        scope.insert(p.clone(), a);
-                    }
-                }
-                let saved = std::mem::replace(&mut self.env, vec![scope]);
-                self.depth += 1;
-                let result = match self.eval(&c.body) {
-                    Ok(v) | Err(Ctrl::Return(v)) => Ok(v),
-                    Err(other) => Err(other),
-                };
-                self.depth -= 1;
-                self.env = saved;
-                result
-            }
+            Value::Fn(func) => self.push_frame(func.clone(), argc, &[], span),
+            Value::Closure(c) => self.push_frame(c.func.clone(), argc, &c.captured, span),
             _ => Err(internal(span)),
         }
     }
 
-    // ---- statements ----
-
-    fn block(&mut self, block: &Block) -> R<Value> {
-        self.env.push(HashMap::new());
-        let result = self.stmts(block);
-        self.env.pop();
-        result
+    /// Calls a function value from native code and waits for its result.
+    fn call_value(&mut self, f: &Value, args: Vec<Value>, span: Span) -> R<Value> {
+        let depth = self.frames.len();
+        let argc = args.len();
+        self.stack.extend(args);
+        self.push_value_frame(f, argc, span)?;
+        if self.jit {
+            self.enter_native()
+        } else {
+            self.run(depth)
+        }
     }
 
-    fn stmts(&mut self, block: &Block) -> R<Value> {
-        let mut value = Value::Unit;
-        for stmt in &block.stmts {
-            value = match stmt {
-                Stmt::Expr(e) => self.eval(e)?,
-                other => {
-                    self.stmt(other)?;
-                    Value::Unit
+    /// Runs the frame that was just pushed and returns its result.
+    fn enter(&mut self) -> R<Value> {
+        if self.jit {
+            self.enter_native()
+        } else {
+            self.run(self.frames.len() - 1)
+        }
+    }
+
+    /// Ends the current call, leaving `value` on the stack as its result.
+    fn finish_call(&mut self, value: Value) {
+        let frame = self.frames.pop().expect("frame");
+        let value = if frame.func.unit_ret { Value::Unit } else { value };
+        self.stack.truncate(frame.base);
+        self.stack.push(value);
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Value {
+        self.stack.pop().expect("value stack is empty")
+    }
+
+    // ---- the machine ----
+
+    /// Interprets the top frame until the call stack is back down to `stop`
+    /// frames, and returns the value that last call returned.
+    fn run(&mut self, stop: usize) -> R<Value> {
+        let (mut func, mut pc, mut base) = {
+            let frame = self.frames.last().expect("frame");
+            (frame.func.clone(), frame.pc, frame.base)
+        };
+        // Continue in whichever frame is now on top.
+        macro_rules! resume {
+            () => {{
+                let frame = self.frames.last().expect("frame");
+                func = frame.func.clone();
+                pc = frame.pc;
+                base = frame.base;
+            }};
+        }
+        macro_rules! ret {
+            ($value:expr) => {{
+                self.finish_call($value);
+                if self.frames.len() == stop {
+                    return Ok(self.pop());
                 }
+                resume!();
+            }};
+        }
+        loop {
+            let op = func.code[pc];
+            pc += 1;
+            match op {
+                Op::Jump(target) => pc = target as usize,
+                Op::Call(index, argc) => {
+                    let callee = self.g.funcs[index as usize].clone();
+                    self.frames.last_mut().expect("frame").pc = pc;
+                    self.push_frame(callee, argc as usize, &[], func.spans[pc - 1])?;
+                    resume!();
+                }
+                Op::CallValue(argc) => {
+                    let callee = self.pop();
+                    self.frames.last_mut().expect("frame").pc = pc;
+                    self.push_value_frame(&callee, argc as usize, func.spans[pc - 1])?;
+                    resume!();
+                }
+                Op::Return => {
+                    let v = self.pop();
+                    ret!(v);
+                }
+                op => match self.exec(&func, op, pc, base)? {
+                    Flow::Next => {}
+                    Flow::Jump(target) => pc = target,
+                    Flow::Return(v) => ret!(v),
+                },
+            }
+        }
+    }
+
+    /// Runs one op of `func`. `pc` is the position after the op, and `base` the
+    /// stack index of the current call's first local slot. Calls, returns and
+    /// plain jumps are left to the caller.
+    #[inline(always)]
+    fn exec(&mut self, func: &Func, op: Op, pc: usize, base: usize) -> R<Flow> {
+        macro_rules! span {
+            () => {
+                func.spans[pc - 1]
             };
         }
-        Ok(value)
-    }
-
-    fn define(&mut self, name: &str, value: Value) {
-        if name != "_" {
-            self.env.last_mut().expect("scope").insert(name.to_string(), value);
-        }
-    }
-
-    /// Runs one iteration of a loop. Returns false when the loop should stop.
-    fn iteration(&mut self, var: Option<(&str, Value)>, body: &Block) -> R<bool> {
-        self.env.push(HashMap::new());
-        if let Some((name, value)) = var {
-            self.define(name, value);
-        }
-        let result = self.block(body);
-        self.env.pop();
-        match result {
-            Ok(_) | Err(Ctrl::Continue) => Ok(true),
-            Err(Ctrl::Break) => Ok(false),
-            Err(other) => Err(other),
-        }
-    }
-
-    fn stmt(&mut self, stmt: &Stmt) -> R<()> {
-        match stmt {
-            Stmt::Let { name, value, .. } => {
-                let v = self.eval(value)?;
-                self.define(name, v);
+        match op {
+            Op::Int(n) => self.stack.push(Value::Int(n)),
+            Op::Const(k) => self.stack.push(func.consts[k as usize].clone()),
+            Op::Bool(b) => self.stack.push(Value::Bool(b)),
+            Op::Unit => self.stack.push(Value::Unit),
+            Op::Load(slot) => {
+                let v = self.stack[base + slot as usize].clone();
+                self.stack.push(v);
             }
-            Stmt::Assign { target, value } => {
-                let v = self.eval(value)?;
-                // Assigning to a map entry may insert a new key.
-                if let ExprKind::Index(base, index) = &target.kind {
-                    let index = self.eval(index)?;
-                    if let Value::Map(entries) = self.place(base)? {
-                        let key = to_key(&index, target.span)?;
-                        Rc::make_mut(entries).insert(key, v);
-                        return Ok(());
-                    }
-                    *self.element(base, index, target.span)? = v;
-                    return Ok(());
-                }
-                *self.place(target)? = v;
+            Op::Store(slot) => {
+                let v = self.pop();
+                self.stack[base + slot as usize] = v;
             }
-            Stmt::While { cond, body, .. } => {
-                while self.eval(cond)? == Value::Bool(true) {
-                    if !self.iteration(None, body)? {
-                        break;
-                    }
-                }
+            Op::Pop => {
+                self.stack.pop();
             }
-            Stmt::For { var, iter, end, body, .. } => {
-                let start = self.eval(iter)?;
-                match end {
-                    Some(end) => match (start, self.eval(end)?) {
-                        (Value::Int(a), Value::Int(b)) => {
-                            for i in a..b {
-                                if !self.iteration(Some((var, Value::Int(i))), body)? {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => return Err(internal(iter.span)),
+            Op::Unary(op) => {
+                let v = match (op, self.pop()) {
+                    (UnOp::Not, Value::Bool(b)) => Value::Bool(!b),
+                    (UnOp::Neg, Value::Float(f)) => Value::Float(-f),
+                    (UnOp::Neg, Value::Int(n)) => match n.checked_neg() {
+                        Some(n) => Value::Int(n),
+                        None => return Err(panic("E0503", "integer overflow in negation", span!())),
                     },
-                    None => match start {
-                        Value::List(items) => {
-                            for item in items.iter() {
-                                if !self.iteration(Some((var, item.clone())), body)? {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => return Err(internal(iter.span)),
-                    },
-                }
-            }
-            Stmt::Assert { cond, span } => {
-                if let ExprKind::Binary(op, lhs, rhs) = &cond.kind {
-                    if op.is_comparison() {
-                        let l = self.eval(lhs)?;
-                        let r = self.eval(rhs)?;
-                        if self.compare(*op, &l, &r) {
-                            return Ok(());
-                        }
-                        let msg = format!(
-                            "assertion failed: `{}` (left: {}, right: {})",
-                            self.text(cond.span),
-                            l.repr(),
-                            r.repr()
-                        );
-                        return Err(panic("E0501", msg, *span));
-                    }
-                }
-                if self.eval(cond)? != Value::Bool(true) {
-                    let msg = format!("assertion failed: `{}`", self.text(cond.span));
-                    return Err(panic("E0501", msg, *span));
-                }
-            }
-            Stmt::Expr(e) => {
-                self.eval(e)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Mutable access to `base[index]` for an existing element.
-    fn element(&mut self, base: &Expr, index: Value, span: Span) -> R<&mut Value> {
-        match (self.place(base)?, index) {
-            (Value::List(items), Value::Int(i)) => {
-                let len = items.len();
-                if i < 0 || i as usize >= len {
-                    return Err(out_of_bounds(i, len, span));
-                }
-                Ok(&mut Rc::make_mut(items)[i as usize])
-            }
-            (Value::Map(entries), index) => {
-                let key = to_key(&index, span)?;
-                match Rc::make_mut(entries).get_mut(&key) {
-                    Some(v) => Ok(v),
-                    None => Err(missing_key(&key, span)),
-                }
-            }
-            _ => Err(internal(span)),
-        }
-    }
-
-    /// Mutable access to an assignment target.
-    fn place(&mut self, target: &Expr) -> R<&mut Value> {
-        match &target.kind {
-            ExprKind::Ident(name) => {
-                for scope in self.env.iter_mut().rev() {
-                    if let Some(v) = scope.get_mut(name) {
-                        return Ok(v);
-                    }
-                }
-                Err(internal(target.span))
-            }
-            ExprKind::Field(base, name, _) => match self.place(base)? {
-                Value::Struct(s) => Rc::make_mut(s)
-                    .fields
-                    .iter_mut()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, v)| v)
-                    .ok_or_else(|| internal(target.span)),
-                _ => Err(internal(target.span)),
-            },
-            ExprKind::Index(base, index) => {
-                let index = self.eval(index)?;
-                self.element(base, index, target.span)
-            }
-            _ => Err(internal(target.span)),
-        }
-    }
-
-    // ---- expressions ----
-
-    fn lookup(&self, name: &str) -> Option<&Value> {
-        self.env.iter().rev().find_map(|s| s.get(name))
-    }
-
-    fn eval_args(&mut self, args: &[Expr]) -> R<Vec<Value>> {
-        let mut out = Vec::with_capacity(args.len());
-        for a in args {
-            out.push(self.eval(a)?);
-        }
-        Ok(out)
-    }
-
-    fn eval(&mut self, e: &Expr) -> R<Value> {
-        match &e.kind {
-            ExprKind::Int(n) => Ok(Value::Int(*n)),
-            ExprKind::Float(f) => Ok(Value::Float(*f)),
-            ExprKind::Bool(b) => Ok(Value::Bool(*b)),
-            ExprKind::Unit => Ok(Value::Unit),
-            ExprKind::Str(parts) => {
-                let mut out = String::new();
-                for part in parts {
-                    match part {
-                        StrPart::Lit(s) => out.push_str(s),
-                        StrPart::Expr(inner) => out.push_str(&self.eval(inner)?.display()),
-                    }
-                }
-                Ok(Value::str(out))
-            }
-            ExprKind::Ident(name) => self.lookup(name).cloned().ok_or_else(|| internal(e.span)),
-            ExprKind::FnRef(name) => self.fns.get(name).cloned().map(Value::Fn).ok_or_else(|| internal(e.span)),
-            ExprKind::List(items) => Ok(Value::list(self.eval_args(items)?)),
-            ExprKind::MapLit(entries) => {
-                let mut map = BTreeMap::new();
-                for (k, v) in entries {
-                    let key = self.eval(k)?;
-                    let key = to_key(&key, k.span)?;
-                    map.insert(key, self.eval(v)?);
-                }
-                Ok(Value::Map(Rc::new(map)))
-            }
-            ExprKind::Unary(op, operand) => {
-                let v = self.eval(operand)?;
-                match (op, v) {
-                    (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
-                    (UnOp::Neg, Value::Int(n)) => n
-                        .checked_neg()
-                        .map(Value::Int)
-                        .ok_or_else(|| panic("E0503", "integer overflow in negation", e.span)),
-                    _ => Err(internal(e.span)),
-                }
-            }
-            ExprKind::Binary(op, lhs, rhs) => {
-                let l = self.eval(lhs)?;
-                match (op, &l) {
-                    (BinOp::And, Value::Bool(false)) => return Ok(Value::Bool(false)),
-                    (BinOp::Or, Value::Bool(true)) => return Ok(Value::Bool(true)),
-                    (BinOp::And | BinOp::Or, _) => return self.eval(rhs),
-                    _ => {}
-                }
-                let r = self.eval(rhs)?;
-                if op.is_comparison() {
-                    return Ok(Value::Bool(self.compare(*op, &l, &r)));
-                }
-                self.arith(*op, l, r, e.span)
-            }
-            ExprKind::Call { name, local, args, .. } => {
-                let args = self.eval_args(args)?;
-                if *local {
-                    let f = self.lookup(name).cloned().ok_or_else(|| internal(e.span))?;
-                    return self.call_value(&f, args, e.span);
-                }
-                match self.fns.get(name).cloned() {
-                    Some(f) => self.call_fn(&f, args, e.span),
-                    None => self.builtin(name, args, e.span),
-                }
-            }
-            ExprKind::MethodCall { recv, name, args, .. } => {
-                let recv = self.eval(recv)?;
-                let args = self.eval_args(args)?;
-                self.method(recv, name, args, e.span)
-            }
-            ExprKind::Field(base, name, _) => match self.eval(base)? {
-                Value::Struct(s) => s
-                    .fields
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, v)| v.clone())
-                    .ok_or_else(|| internal(e.span)),
-                _ => Err(internal(e.span)),
-            },
-            ExprKind::Index(base, index) => match (self.eval(base)?, self.eval(index)?) {
-                (Value::List(items), Value::Int(i)) => {
-                    if i < 0 || i as usize >= items.len() {
-                        return Err(out_of_bounds(i, items.len(), e.span));
-                    }
-                    Ok(items[i as usize].clone())
-                }
-                (Value::Map(entries), index) => {
-                    let key = to_key(&index, e.span)?;
-                    entries.get(&key).cloned().ok_or_else(|| missing_key(&key, e.span))
-                }
-                _ => Err(internal(e.span)),
-            },
-            ExprKind::StructLit { name, fields } => {
-                let mut given = Vec::with_capacity(fields.len());
-                for (fname, _, value) in fields {
-                    given.push((fname.clone(), self.eval(value)?));
-                }
-                // Store fields in declaration order so equality and display are stable.
-                let order = self.struct_fields.get(name).cloned().unwrap_or_default();
-                let mut ordered = Vec::with_capacity(given.len());
-                for fname in &order {
-                    match given.iter().position(|(n, _)| n == fname) {
-                        Some(i) => ordered.push(given.swap_remove(i)),
-                        None => return Err(internal(e.span)),
-                    }
-                }
-                Ok(Value::Struct(Rc::new(StructVal { name: name.clone(), fields: ordered })))
-            }
-            ExprKind::Ctor { enum_name, variant, args } => {
-                let args = self.eval_args(args)?;
-                Ok(Value::variant(enum_name, variant, args))
-            }
-            ExprKind::If { cond, then, els } => {
-                if self.eval(cond)? == Value::Bool(true) {
-                    self.block(then)
-                } else {
-                    match els {
-                        Some(els) => self.eval(els),
-                        None => Ok(Value::Unit),
-                    }
-                }
-            }
-            ExprKind::Match { scrutinee, arms } => {
-                let value = self.eval(scrutinee)?;
-                for arm in arms {
-                    let mut scope = HashMap::new();
-                    if matches(&arm.pat, &value, &mut scope) {
-                        self.env.push(scope);
-                        let result = self.eval(&arm.body);
-                        self.env.pop();
-                        return result;
-                    }
-                }
-                Err(internal(e.span))
-            }
-            ExprKind::Block(b) => self.block(b),
-            ExprKind::Closure { params, captures, body } => {
-                let mut captured = HashMap::new();
-                for name in captures {
-                    if let Some(v) = self.lookup(name) {
-                        captured.insert(name.clone(), v.clone());
-                    }
-                }
-                Ok(Value::Closure(Rc::new(ClosureVal {
-                    params: params.iter().map(|p| p.name.clone()).collect(),
-                    body: body.clone(),
-                    captured,
-                })))
-            }
-            ExprKind::Return(value) => {
-                let v = match value {
-                    Some(v) => self.eval(v)?,
-                    None => Value::Unit,
+                    _ => return Err(internal(span!())),
                 };
-                Err(Ctrl::Return(v))
+                self.stack.push(v);
             }
-            ExprKind::Break => Err(Ctrl::Break),
-            ExprKind::Continue => Err(Ctrl::Continue),
-            ExprKind::Try(inner) => {
-                let v = self.eval(inner)?;
-                match &v {
-                    Value::Enum(en) if en.variant == "Some" || en.variant == "Ok" => Ok(en.args[0].clone()),
-                    Value::Enum(_) => Err(Ctrl::Return(v)),
-                    _ => Err(internal(e.span)),
+            Op::Arith(op) => {
+                let r = self.pop();
+                let l = self.pop();
+                if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
+                    if let Some(v) = int_fast(op, *a, *b) {
+                        self.stack.push(Value::Int(v));
+                        return Ok(Flow::Next);
+                    }
+                }
+                let v = arith(op, &l, &r, span!())?;
+                self.stack.push(v);
+            }
+            Op::Cmp(op) => {
+                let r = self.pop();
+                let l = self.pop();
+                let v = match (&l, &r) {
+                    (Value::Int(a), Value::Int(b)) => ordering_matches(op, a.cmp(b)),
+                    _ => compare(op, &l, &r),
+                };
+                self.stack.push(Value::Bool(v));
+            }
+            Op::ArithSlotInt(op, slot, n) => {
+                let v = match &self.stack[base + slot as usize] {
+                    Value::Int(a) => match int_fast(op, *a, n as i64) {
+                        Some(v) => Value::Int(v),
+                        None => int_arith(op, *a, n as i64, span!())?,
+                    },
+                    other => arith(op, other, &Value::Int(n as i64), span!())?,
+                };
+                self.stack.push(v);
+            }
+            Op::CmpSlotInt(op, slot, n) => {
+                let v = match &self.stack[base + slot as usize] {
+                    Value::Int(a) => ordering_matches(op, a.cmp(&(n as i64))),
+                    other => compare(op, other, &Value::Int(n as i64)),
+                };
+                self.stack.push(Value::Bool(v));
+            }
+            Op::ArithInt(op, n) => {
+                let v = match self.pop() {
+                    Value::Int(a) => match int_fast(op, a, n as i64) {
+                        Some(v) => Value::Int(v),
+                        None => int_arith(op, a, n as i64, span!())?,
+                    },
+                    other => arith(op, &other, &Value::Int(n as i64), span!())?,
+                };
+                self.stack.push(v);
+            }
+            Op::CmpInt(op, n) => {
+                let v = match self.pop() {
+                    Value::Int(a) => ordering_matches(op, a.cmp(&(n as i64))),
+                    other => compare(op, &other, &Value::Int(n as i64)),
+                };
+                self.stack.push(Value::Bool(v));
+            }
+            Op::JumpUnlessSlotInt(op, slot, n, target) => {
+                let holds = match &self.stack[base + slot as usize] {
+                    Value::Int(a) => ordering_matches(op, a.cmp(&(n as i64))),
+                    other => compare(op, other, &Value::Int(n as i64)),
+                };
+                if !holds {
+                    return Ok(Flow::Jump(target as usize));
                 }
             }
+            Op::JumpUnlessInt(op, n, target) => {
+                let holds = match self.pop() {
+                    Value::Int(a) => ordering_matches(op, a.cmp(&(n as i64))),
+                    other => compare(op, &other, &Value::Int(n as i64)),
+                };
+                if !holds {
+                    return Ok(Flow::Jump(target as usize));
+                }
+            }
+            Op::JumpIfFalse(target) => {
+                if !matches!(self.pop(), Value::Bool(true)) {
+                    return Ok(Flow::Jump(target as usize));
+                }
+            }
+            Op::AndJump(target) => {
+                if matches!(self.stack.last(), Some(Value::Bool(false))) {
+                    return Ok(Flow::Jump(target as usize));
+                } else {
+                    self.stack.pop();
+                }
+            }
+            Op::OrJump(target) => {
+                if matches!(self.stack.last(), Some(Value::Bool(true))) {
+                    return Ok(Flow::Jump(target as usize));
+                } else {
+                    self.stack.pop();
+                }
+            }
+            Op::CallBuiltin(name, argc) => {
+                let args = self.stack.split_off(self.stack.len() - argc as usize);
+                let Value::Str(name) = &func.consts[name as usize] else {
+                    return Err(internal(span!()));
+                };
+                let v = self.builtin(name, args, span!())?;
+                self.stack.push(v);
+            }
+            Op::CallMethod(name, argc) => {
+                let args = self.stack.split_off(self.stack.len() - argc as usize);
+                let recv = self.pop();
+                let Value::Str(name) = &func.consts[name as usize] else {
+                    return Err(internal(span!()));
+                };
+                let v = self.method(recv, name, args, span!())?;
+                self.stack.push(v);
+            }
+            Op::Try(target) => {
+                let v = self.pop();
+                let inner = match &v {
+                    Value::Enum(e) if matches!(&*e.variant, "Some" | "Ok") => Some(e.args[0].clone()),
+                    Value::Enum(_) => None,
+                    _ => return Err(internal(span!())),
+                };
+                match inner {
+                    Some(inner) => self.stack.push(inner),
+                    None if target == NONE => return Ok(Flow::Return(v)),
+                    None => {
+                        self.stack.push(v);
+                        return Ok(Flow::Jump(target as usize));
+                    }
+                }
+            }
+            Op::MakeList(n) => {
+                let items = self.stack.split_off(self.stack.len() - n as usize);
+                self.stack.push(Value::list(items));
+            }
+            Op::MakeMap(n) => {
+                let mut map = BTreeMap::new();
+                let mut items = self.stack.split_off(self.stack.len() - 2 * n as usize).into_iter();
+                while let (Some(k), Some(v)) = (items.next(), items.next()) {
+                    map.insert(to_key(&k, span!())?, v);
+                }
+                self.stack.push(Value::Map(Rc::new(map)));
+            }
+            Op::MakeStruct(index) => {
+                let tmpl = &func.structs[index as usize];
+                let given = self.stack.split_off(self.stack.len() - tmpl.argc);
+                let fields = tmpl.fields.iter().map(|(name, i)| (name.clone(), given[*i].clone())).collect();
+                self.stack.push(Value::Struct(Rc::new(StructVal { name: tmpl.name.clone(), fields })));
+            }
+            Op::MakeEnum(index, argc) => {
+                let args = self.stack.split_off(self.stack.len() - argc as usize);
+                let (enum_name, variant) = &func.enums[index as usize];
+                self.stack.push(Value::variant(enum_name.clone(), variant.clone(), args));
+            }
+            Op::MakeClosure(index, n) => {
+                let captured = self.stack.split_off(self.stack.len() - n as usize);
+                let func = self.g.funcs[index as usize].clone();
+                self.stack.push(Value::Closure(Rc::new(ClosureVal { func, captured })));
+            }
+            Op::FnRef(index) => self.stack.push(Value::Fn(self.g.funcs[index as usize].clone())),
+            Op::GetField(name) => {
+                let Value::Str(name) = &func.consts[name as usize] else {
+                    return Err(internal(span!()));
+                };
+                let v = match self.pop() {
+                    Value::Struct(s) => s.fields.iter().find(|(n, _)| **n == **name).map(|(_, v)| v.clone()),
+                    _ => None,
+                };
+                self.stack.push(v.ok_or_else(|| internal(span!()))?);
+            }
+            Op::Index => {
+                let index = self.pop();
+                let v = match (self.pop(), index) {
+                    (Value::List(items), Value::Int(i)) => {
+                        if i < 0 || i as usize >= items.len() {
+                            return Err(out_of_bounds(i, items.len(), span!()));
+                        }
+                        items[i as usize].clone()
+                    }
+                    (Value::Map(entries), index) => {
+                        let key = to_key(&index, span!())?;
+                        entries.get(&key).cloned().ok_or_else(|| missing_key(&key, span!()))?
+                    }
+                    _ => return Err(internal(span!())),
+                };
+                self.stack.push(v);
+            }
+            Op::Concat(n) => {
+                let start = self.stack.len() - n as usize;
+                let mut out = String::new();
+                for v in &self.stack[start..] {
+                    match v {
+                        Value::Str(s) => out.push_str(s),
+                        other => out.push_str(&other.repr()),
+                    }
+                }
+                self.stack.truncate(start);
+                self.stack.push(Value::str(out));
+            }
+            Op::StoreIndex(slot) => {
+                let index = self.pop();
+                let v = self.pop();
+                store_index(&mut self.stack[base + slot as usize], index, v, span!())?;
+            }
+            Op::StoreField(slot, name) => {
+                let v = self.pop();
+                let Value::Str(name) = &func.consts[name as usize] else {
+                    return Err(internal(span!()));
+                };
+                *field_mut(&mut self.stack[base + slot as usize], name, span!())? = v;
+            }
+            Op::Assign(slot, path) => {
+                let span = span!();
+                let path = &func.paths[path as usize];
+                let Some((last, init)) = path.split_last() else {
+                    return Err(internal(span));
+                };
+                // Indexes were pushed outermost first, so they pop from the root down.
+                let count = path.iter().filter(|e| matches!(e, PathElem::Index(_))).count();
+                let mut indexes = Vec::with_capacity(count);
+                for _ in 0..count {
+                    indexes.push(self.pop());
+                }
+                let mut indexes = indexes.into_iter();
+                let v = self.pop();
+                let mut cur = &mut self.stack[base + slot as usize];
+                for elem in init {
+                    cur = match elem {
+                        PathElem::Field(name, span) => field_mut(cur, name, *span)?,
+                        PathElem::Index(at) => {
+                            let index = indexes.next().ok_or_else(|| internal(span))?;
+                            element_mut(cur, index, *at)?
+                        }
+                    };
+                }
+                match last {
+                    PathElem::Field(name, span) => *field_mut(cur, name, *span)? = v,
+                    PathElem::Index(at) => {
+                        let index = indexes.next().ok_or_else(|| internal(span))?;
+                        store_index(cur, index, v, *at)?;
+                    }
+                }
+            }
+            Op::InPlace(slot, path, kind) => {
+                let span = span!();
+                // `first` is the pushed value or the key; `second` is the value for `set`.
+                let second = if kind == InPlace::Set { self.pop() } else { Value::Unit };
+                let first = self.pop();
+                let path: &[PathElem] = if path == NONE { &[] } else { &func.paths[path as usize] };
+                let place = fields_mut(&mut self.stack[base + slot as usize], path, span)?;
+                match (place, kind) {
+                    (Value::List(items), InPlace::Push) => Rc::make_mut(items).push(first),
+                    (Value::Map(entries), InPlace::Set) => {
+                        let key = to_key(&first, span)?;
+                        Rc::make_mut(entries).insert(key, second);
+                    }
+                    (Value::Map(entries), InPlace::Remove) => {
+                        let key = to_key(&first, span)?;
+                        Rc::make_mut(entries).remove(&key);
+                    }
+                    (other, _) => {
+                        let recv = other.clone();
+                        let args = if kind == InPlace::Set { vec![first, second] } else { vec![first] };
+                        let v = self.method(recv, kind.method(), args, span)?;
+                        *fields_mut(&mut self.stack[base + slot as usize], path, span)? = v;
+                    }
+                }
+            }
+            Op::ForRange(slot, target) => {
+                let slot = base + slot as usize;
+                match (&self.stack[slot], &self.stack[slot + 1]) {
+                    (Value::Int(a), Value::Int(b)) => {
+                        if a >= b {
+                            return Ok(Flow::Jump(target as usize));
+                        }
+                    }
+                    _ => return Err(internal(span!())),
+                }
+            }
+            Op::ForRangeNext(slot, target) => {
+                let slot = base + slot as usize;
+                let end = match &self.stack[slot + 1] {
+                    Value::Int(end) => *end,
+                    _ => return Err(internal(span!())),
+                };
+                if let Value::Int(i) = &mut self.stack[slot] {
+                    *i += 1;
+                    if *i < end {
+                        return Ok(Flow::Jump(target as usize));
+                    }
+                }
+            }
+            Op::ForList(slot, target) => {
+                let slot = base + slot as usize;
+                let item = match (&self.stack[slot], &self.stack[slot + 1]) {
+                    (Value::List(items), Value::Int(i)) => items.get(*i as usize).cloned(),
+                    _ => return Err(internal(span!())),
+                };
+                match item {
+                    Some(item) => {
+                        self.stack[slot + 2] = item;
+                        if let Value::Int(i) = &mut self.stack[slot + 1] {
+                            *i += 1;
+                        }
+                    }
+                    None => return Ok(Flow::Jump(target as usize)),
+                }
+            }
+            Op::SaveSp(slot) => {
+                self.stack[base + slot as usize] = Value::Int(self.stack.len() as i64);
+            }
+            Op::RestoreSp(slot) => {
+                if let Value::Int(height) = self.stack[base + slot as usize] {
+                    self.stack.truncate(height as usize);
+                }
+            }
+            Op::IsVariant(slot, name, argc) => {
+                let Value::Str(name) = &func.consts[name as usize] else {
+                    return Err(internal(span!()));
+                };
+                let is = matches!(
+                    &self.stack[base + slot as usize],
+                    Value::Enum(e) if *e.variant == **name && e.args.len() == argc as usize
+                );
+                self.stack.push(Value::Bool(is));
+            }
+            Op::EnumArg(slot, i) => {
+                let v = match &self.stack[base + slot as usize] {
+                    Value::Enum(e) => e.args.get(i as usize).cloned(),
+                    _ => None,
+                };
+                self.stack.push(v.ok_or_else(|| internal(span!()))?);
+            }
+            Op::Assert(aux) => {
+                if self.pop() != Value::Bool(true) {
+                    let msg = format!("assertion failed: `{}`", self.text(func.aux[aux as usize]));
+                    return Err(panic("E0501", msg, span!()));
+                }
+            }
+            Op::AssertCmp(op, aux) => {
+                let r = self.pop();
+                let l = self.pop();
+                if !compare(op, &l, &r) {
+                    let msg = format!(
+                        "assertion failed: `{}` (left: {}, right: {})",
+                        self.text(func.aux[aux as usize]),
+                        l.repr(),
+                        r.repr()
+                    );
+                    return Err(panic("E0501", msg, span!()));
+                }
+            }
+            Op::Require(aux) => {
+                if self.pop() != Value::Bool(true) {
+                    let msg = format!(
+                        "precondition of `{}` violated: `{}`",
+                        short(&func.name),
+                        self.text(func.aux[aux as usize])
+                    );
+                    return Err(panic("E0502", msg, self.frames.last().expect("frame").call_span));
+                }
+            }
+            Op::Ensure(aux, slot) => {
+                if self.pop() != Value::Bool(true) {
+                    let msg = format!(
+                        "postcondition of `{}` violated: `{}` (result: {})",
+                        short(&func.name),
+                        self.text(func.aux[aux as usize]),
+                        self.stack[base + slot as usize].repr()
+                    );
+                    return Err(panic("E0502", msg, self.frames.last().expect("frame").call_span));
+                }
+            }
+            Op::Internal => return Err(internal(span!())),
+            Op::Jump(_) | Op::Call(..) | Op::CallValue(_) | Op::Return => return Err(internal(span!())),
         }
+        Ok(Flow::Next)
     }
 
     fn builtin(&mut self, name: &str, mut args: Vec<Value>, span: Span) -> R<Value> {
         let text = |v: Option<Value>| v.map(|v| v.display()).unwrap_or_default();
         let result = |r: Result<Value, String>| match r {
-            Ok(v) => Value::variant("Result", "Ok", vec![v]),
-            Err(e) => Value::variant("Result", "Err", vec![Value::str(e)]),
+            Ok(v) => Value::ok(v),
+            Err(e) => Value::err(Value::str(e)),
         };
         match name {
             "print" => {
@@ -787,55 +1240,6 @@ impl<'a> Interp<'a> {
                         .map_err(|e| format!("cannot write `{path}`: {e}")),
                 ))
             }
-            _ => Err(internal(span)),
-        }
-    }
-
-    fn compare(&self, op: BinOp, l: &Value, r: &Value) -> bool {
-        match op {
-            BinOp::Eq => l == r,
-            BinOp::Ne => l != r,
-            _ => match (op, order(l, r)) {
-                (BinOp::Lt, Some(o)) => o == Ordering::Less,
-                (BinOp::Le, Some(o)) => o != Ordering::Greater,
-                (BinOp::Gt, Some(o)) => o == Ordering::Greater,
-                (BinOp::Ge, Some(o)) => o != Ordering::Less,
-                _ => false,
-            },
-        }
-    }
-
-    fn arith(&self, op: BinOp, l: Value, r: Value, span: Span) -> R<Value> {
-        match (l, r) {
-            (Value::Int(a), Value::Int(b)) => {
-                if b == 0 && matches!(op, BinOp::Div | BinOp::Rem) {
-                    return Err(panic_hint(
-                        "E0504",
-                        "division by zero",
-                        span,
-                        "check the divisor first, or add a `requires` clause",
-                    ));
-                }
-                let result = match op {
-                    BinOp::Add => a.checked_add(b),
-                    BinOp::Sub => a.checked_sub(b),
-                    BinOp::Mul => a.checked_mul(b),
-                    BinOp::Div => a.checked_div(b),
-                    BinOp::Rem => a.checked_rem(b),
-                    _ => return Err(internal(span)),
-                };
-                result
-                    .map(Value::Int)
-                    .ok_or_else(|| panic("E0503", format!("integer overflow in `{a} {} {b}`", op.symbol()), span))
-            }
-            (Value::Float(a), Value::Float(b)) => Ok(Value::Float(match op {
-                BinOp::Add => a + b,
-                BinOp::Sub => a - b,
-                BinOp::Mul => a * b,
-                BinOp::Div => a / b,
-                BinOp::Rem => a % b,
-                _ => return Err(internal(span)),
-            })),
             _ => Err(internal(span)),
         }
     }
@@ -984,34 +1388,175 @@ impl<'a> Interp<'a> {
             (Value::Float(a), "min", [Value::Float(b)]) => Ok(Value::Float(a.min(*b))),
             (Value::Float(a), "max", [Value::Float(b)]) => Ok(Value::Float(a.max(*b))),
 
-            (Value::Enum(e), "unwrap_or", [default]) => Ok(match e.variant.as_str() {
+            (Value::Enum(e), "unwrap_or", [default]) => Ok(match &*e.variant {
                 "Some" | "Ok" => e.args[0].clone(),
                 _ => default.clone(),
             }),
-            (Value::Enum(e), "is_some", []) => Ok(Value::Bool(e.variant == "Some")),
-            (Value::Enum(e), "is_none", []) => Ok(Value::Bool(e.variant == "None")),
-            (Value::Enum(e), "is_ok", []) => Ok(Value::Bool(e.variant == "Ok")),
-            (Value::Enum(e), "is_err", []) => Ok(Value::Bool(e.variant == "Err")),
+            (Value::Enum(e), "is_some", []) => Ok(Value::Bool(&*e.variant == "Some")),
+            (Value::Enum(e), "is_none", []) => Ok(Value::Bool(&*e.variant == "None")),
+            (Value::Enum(e), "is_ok", []) => Ok(Value::Bool(&*e.variant == "Ok")),
+            (Value::Enum(e), "is_err", []) => Ok(Value::Bool(&*e.variant == "Err")),
             _ => Err(internal(span)),
         }
     }
 }
 
-fn matches(pat: &Pattern, value: &Value, binds: &mut HashMap<String, Value>) -> bool {
-    match (&pat.kind, value) {
-        (PatKind::Wildcard, _) => true,
-        (PatKind::Bind(name), v) => {
-            binds.insert(name.clone(), v.clone());
-            true
+// ---- generated code ----
+
+#[cfg(not(target_arch = "x86_64"))]
+impl Interp<'_> {
+    fn native_available(&mut self) -> bool {
+        false
+    }
+
+    fn enter_native(&mut self) -> R<Value> {
+        Err(internal(Span::new(0, 0)))
+    }
+}
+
+/// The interpreter's side of generated machine code: entering it, and the
+/// helpers it calls back.
+#[cfg(target_arch = "x86_64")]
+mod native {
+    use super::*;
+    use crate::jit;
+
+    type Entry = unsafe extern "sysv64" fn(*mut Stack) -> u32;
+
+    /// The interpreter a stack belongs to.
+    ///
+    /// Safety: `stack` must be the stack of an interpreter that is inside
+    /// `enter_native`, which is where `owner` is set.
+    unsafe fn owner<'i>(stack: *mut Stack) -> &'i mut Interp<'static> {
+        &mut *((*stack).owner as *mut Interp<'static>)
+    }
+
+    unsafe extern "sysv64" fn op(stack: *mut Stack, pc: u32) -> u32 {
+        owner(stack).native_op(pc as usize)
+    }
+
+    unsafe extern "sysv64" fn call(stack: *mut Stack, index: u32, argc: u32, pc: u32) -> usize {
+        owner(stack).native_call(index as usize, argc as usize, pc as usize)
+    }
+
+    unsafe extern "sysv64" fn call_value(stack: *mut Stack, argc: u32, pc: u32) -> usize {
+        owner(stack).native_call_value(argc as usize, pc as usize)
+    }
+
+    unsafe extern "sysv64" fn ret(stack: *mut Stack) {
+        let interp = owner(stack);
+        let value = interp.pop();
+        interp.finish_call(value);
+    }
+
+    fn helpers() -> jit::Helpers {
+        jit::Helpers {
+            op: op as *const () as usize,
+            call: call as *const () as usize,
+            call_value: call_value as *const () as usize,
+            ret: ret as *const () as usize,
         }
-        (PatKind::Int(a), Value::Int(b)) => a == b,
-        (PatKind::Bool(a), Value::Bool(b)) => a == b,
-        (PatKind::Str(a), Value::Str(b)) => a.as_str() == &**b,
-        (PatKind::Ctor { variant, args, .. }, Value::Enum(e)) => {
-            *variant == e.variant
-                && args.len() == e.args.len()
-                && args.iter().zip(&e.args).all(|(p, v)| matches(p, v, binds))
+    }
+
+    /// Generated code relies on how `Value` and `Stack` are laid out.
+    fn layout_matches() -> bool {
+        let byte = |v: &Value, at: usize| unsafe { *(v as *const Value as *const u8).add(at) };
+        let int = Value::Int(0x0102_0304_0506_0708);
+        let number = unsafe { *((&int as *const Value as *const u8).add(8) as *const i64) };
+        let truth = Value::Bool(true);
+        std::mem::size_of::<Value>() == jit::VALUE_SIZE
+            && byte(&int, 0) == jit::TAG_INT
+            && number == 0x0102_0304_0506_0708
+            && byte(&truth, 0) == jit::TAG_BOOL
+            && byte(&truth, 1) == 1
+            && byte(&Value::Bool(false), 1) == 0
+            && byte(&Value::Unit, 0) == jit::TAG_UNIT
+            && byte(&Value::Float(0.0), 0) < jit::FIRST_HEAP_TAG
+            && byte(&Value::str(""), 0) == jit::FIRST_HEAP_TAG
+            && std::mem::offset_of!(Stack, top) == jit::STACK_TOP_OFFSET as usize
+    }
+
+    impl Interp<'_> {
+        /// True when machine code can be generated and run here.
+        pub(super) fn native_available(&mut self) -> bool {
+            layout_matches() && self.code.install(&[0xC3]).is_some()
         }
-        _ => false,
+
+        /// Address of the machine code for the top frame's function.
+        fn entry(&mut self) -> R<usize> {
+            let frame = self.frames.last().expect("frame");
+            let address = frame.func.native.get();
+            if address != 0 {
+                return Ok(address);
+            }
+            let func = frame.func.clone();
+            let span = frame.call_span;
+            let code = jit::compile(&func, &helpers());
+            match self.code.install(&code) {
+                Some(address) => {
+                    func.native.set(address);
+                    Ok(address)
+                }
+                None => Err(panic("E0599", "internal error: cannot allocate executable memory", span)),
+            }
+        }
+
+        /// Runs the frame that was just pushed as machine code and returns its result.
+        pub(super) fn enter_native(&mut self) -> R<Value> {
+            let entry = self.entry()?;
+            self.stack.owner = self as *mut Interp<'_> as *mut u8;
+            // Safety: `entry` is the address of code generated for the top
+            // frame's function, which follows the `Entry` calling convention.
+            let status = unsafe { std::mem::transmute::<usize, Entry>(entry)(&mut self.stack) };
+            if status != 0 {
+                return Err(self.fault.take().unwrap_or_else(|| internal(Span::new(0, 0))));
+            }
+            Ok(self.pop())
+        }
+
+        fn native_op(&mut self, pc: usize) -> u32 {
+            let frame = self.frames.last().expect("frame");
+            let base = frame.base;
+            // Safety: the frame keeps the function alive, and `exec` never
+            // removes the frame it runs in.
+            let func = unsafe { &*Rc::as_ptr(&frame.func) };
+            match self.exec(func, func.code[pc], pc + 1, base) {
+                Ok(Flow::Next) => jit::NEXT,
+                Ok(Flow::Jump(_)) => jit::JUMP,
+                Ok(Flow::Return(value)) => {
+                    self.finish_call(value);
+                    jit::RETURNED
+                }
+                Err(fault) => {
+                    self.fault = Some(fault);
+                    jit::FAILED
+                }
+            }
+        }
+
+        /// Starts a call and returns the callee's entry address, or 0 on failure.
+        fn native_call(&mut self, index: usize, argc: usize, pc: usize) -> usize {
+            let span = self.frames.last().expect("frame").func.spans[pc];
+            let callee = self.g.funcs[index].clone();
+            let entry = self.push_frame(callee, argc, &[], span).and_then(|_| self.entry());
+            self.entry_or_fault(entry)
+        }
+
+        fn native_call_value(&mut self, argc: usize, pc: usize) -> usize {
+            let span = self.frames.last().expect("frame").func.spans[pc];
+            let callee = self.pop();
+            let entry = self.push_value_frame(&callee, argc, span).and_then(|_| self.entry());
+            self.entry_or_fault(entry)
+        }
+
+        fn entry_or_fault(&mut self, entry: R<usize>) -> usize {
+            match entry {
+                Ok(address) => address,
+                Err(fault) => {
+                    self.fault = Some(fault);
+                    0
+                }
+            }
+        }
     }
 }

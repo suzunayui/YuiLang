@@ -33,7 +33,8 @@ Options:
 ";
 
 fn main() {
-    // The interpreter recurses on the native stack, so give it plenty of room.
+    // Closures called from built-in methods (`map`, `fold`, ...) recurse on the
+    // native stack, so give it plenty of room.
     let handle = std::thread::Builder::new()
         .stack_size(1024 * 1024 * 1024)
         .spawn(real_main)

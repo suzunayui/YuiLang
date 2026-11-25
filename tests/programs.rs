@@ -30,7 +30,8 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
 }
 
-/// The interpreter recurses on the native stack, so run it like the `yui` binary does.
+/// Closures called from built-in methods recurse on the native stack, so run
+/// programs like the `yui` binary does.
 fn with_big_stack(f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(1024 * 1024 * 1024)
@@ -41,12 +42,15 @@ fn with_big_stack(f: impl FnOnce() + Send + 'static) {
 }
 
 /// Loads and runs a program. Returns the code of the first error, if any.
-fn first_error(path: &Path) -> Option<&'static str> {
+/// `jit` false forces the bytecode interpreter; true uses machine code where
+/// this platform supports it.
+fn first_error(path: &Path, jit: bool) -> Option<&'static str> {
     let loaded = match yuilang::load_path(path, None) {
         Ok(l) => l,
         Err((diags, _)) => return Some(diags[0].code),
     };
     let mut interp = Interp::new(&loaded.program, &loaded.sources.text);
+    interp.jit = interp.jit && jit;
     interp.captured = Some(String::new());
     for item in &loaded.program.items {
         if let Item::Test(t) = item {
@@ -75,7 +79,9 @@ fn example_files() -> Vec<PathBuf> {
 fn examples_pass() {
     with_big_stack(|| {
         for path in example_files() {
-            assert_eq!(first_error(&path), None, "{}", path.display());
+            for jit in [true, false] {
+                assert_eq!(first_error(&path, jit), None, "{} (jit: {jit})", path.display());
+            }
         }
     });
 }
@@ -92,7 +98,9 @@ fn error_cases_report_expected_code() {
                 .unwrap_or_else(|| panic!("{} must start with `// expect: E0xxx`", path.display()))
                 .trim()
                 .to_string();
-            assert_eq!(first_error(&path), Some(expected.as_str()), "{}", path.display());
+            for jit in [true, false] {
+                assert_eq!(first_error(&path, jit), Some(expected.as_str()), "{} (jit: {jit})", path.display());
+            }
         }
     });
 }

@@ -1,0 +1,203 @@
+// 制御フロー、契約、入れ子の代入など、実行系の細かい動作を確かめるサンプル
+
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+struct Line {
+  a: Point,
+  b: Point,
+  tags: List<String>,
+}
+
+enum Tree {
+  Leaf(Int),
+  Node(Tree, Tree),
+  Empty,
+}
+
+fn depth(t: Tree) -> Int {
+  match t {
+    Tree.Empty => 0
+    Tree.Leaf(_) => 1
+    Tree.Node(Tree.Leaf(a), Tree.Leaf(b)) => if a > b { 20 } else { 21 }
+    Tree.Node(l, r) => 1 + depth(l).max(depth(r))
+  }
+}
+
+fn count_up(n: Int) -> Int
+  requires n >= 0
+  ensures result >= n
+{
+  if n > 100 { return n }
+  let mut i = 0
+  while true {
+    i = i + 1
+    if i > n { break }
+  }
+  n + i
+}
+
+fn first_above(xs: List<Int>, limit: Int) -> Option<Int>
+  ensures result.is_none() || result.unwrap_or(0) > limit
+{
+  for x in xs {
+    if x > limit { return Some(x) }
+  }
+  None
+}
+
+fn to_result(s: String) -> Result<Int, String> {
+  match s.to_int() {
+    Some(n) => Ok(n)
+    None => Err("bad: {s}")
+  }
+}
+
+fn parse_sum(a: String, b: String) -> Result<Int, String>
+  ensures result.is_ok() || result.is_err()
+{
+  let x = to_result(a)?
+  let y = to_result(b)?
+  Ok(x + y)
+}
+
+fn make_adder(n: Int) -> (fn(Int) -> Int) {
+  |x| x + n
+}
+
+fn compose(f: fn(Int) -> Int, g: fn(Int) -> Int) -> (fn(Int) -> Int) {
+  |x| g(f(x))
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn fib(n: Int) -> Int {
+  if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+test "nested patterns" {
+  let t = Tree.Node(Tree.Node(Tree.Leaf(1), Tree.Leaf(2)), Tree.Node(Tree.Leaf(5), Tree.Empty))
+  assert depth(t) == 22
+  assert depth(Tree.Node(Tree.Leaf(3), Tree.Leaf(2))) == 20
+  assert depth(Tree.Empty) == 0
+}
+
+test "contracts see early returns" {
+  assert count_up(3) == 7
+  assert count_up(500) == 500
+  assert first_above([1, 5, 9], 4) == Some(5)
+  assert first_above([1], 4) == None
+  assert parse_sum("1", "2") == Ok(3)
+  assert parse_sum("x", "2") == Err("bad: x")
+  assert parse_sum("1", "y") == Err("bad: y")
+}
+
+test "closures" {
+  let add5 = make_adder(5)
+  let both = compose(add5, double)
+  assert [add5, both, double].map(|f| f(10)) == [15, 30, 20]
+  let k = 3
+  let nested = |a: Int| {
+    let inner = |b: Int| a * b + k
+    inner(a + 1)
+  }
+  assert nested(4) == 23
+}
+
+test "break and continue inside an expression" {
+  let mut out = []
+  for i in 0..10 {
+    if i % 2 == 0 { continue }
+    if i > 7 { break }
+    let pair = [i].push(if i == 3 { continue } else { i * 10 })
+    out = out.push(pair)
+  }
+  assert out == [[1, 10], [5, 50], [7, 70]]
+
+  let mut acc = []
+  let mut i = 0
+  while i < 5 {
+    i = i + 1
+    for j in [1, 2, 3] {
+      if j == 2 { continue }
+      if i == 4 { break }
+      acc = acc.push(i * 10 + j)
+    }
+  }
+  assert acc == [11, 13, 21, 23, 31, 33, 51, 53]
+}
+
+test "a loop keeps iterating over the list it started with" {
+  let mut xs = [3, 1, 2]
+  for x in xs {
+    xs = xs.push(x * 10)
+  }
+  assert xs == [3, 1, 2, 30, 10, 20]
+}
+
+test "nested assignment leaves copies alone" {
+  let mut line = Line { a: Point { x: 1, y: 2 }, b: Point { x: 3, y: 4 }, tags: [] }
+  let copy = line
+  line.a.x = 10
+  line.b = Point { x: 7, y: 8 }
+  line.tags = line.tags.push("t1")
+  assert line.a == Point { x: 10, y: 2 }
+  assert line.b.y == 8
+  assert line.tags == ["t1"]
+  assert copy.a.x == 1
+  assert copy.tags == []
+
+  let mut grid = [[1, 2], [3, 4]]
+  let before = grid
+  grid[1][0] = 30
+  grid[0] = [9]
+  assert grid == [[9], [30, 4]]
+  assert before == [[1, 2], [3, 4]]
+
+  let mut m = Map { "a": [1], "b": [2] }
+  m["a"][0] = 5
+  m["c"] = [7, 8]
+  assert m == Map { "a": [5], "b": [2], "c": [7, 8] }
+
+  let mut points = [Point { x: 1, y: 1 }, Point { x: 2, y: 2 }]
+  points[1].y = 22
+  assert points[1] == Point { x: 2, y: 22 }
+}
+
+test "short circuit" {
+  let zero = 0
+  assert true || 1 / zero == 0
+  assert !(false && 1 / zero == 0)
+}
+
+test "integer arithmetic" {
+  let xs = [7, -7, 0, 100]
+  assert xs.map(|x| x / 3) == [2, -2, 0, 33]
+  assert xs.map(|x| x % 3) == [1, -1, 0, 1]
+  assert xs.map(|x| x / -3) == [-2, 2, 0, -33]
+  assert xs.map(|x| x % -3) == [1, -1, 0, 1]
+  let mut total = 0
+  let mut i = 0
+  while i < 1000 {
+    i = i + 1
+    if i % 3 == 0 || i % 5 == 0 {
+      total = total + i * 2 - i / 7
+    }
+    if i % 2 == 1 && i > 990 {
+      total = total - 1
+    }
+  }
+  assert total == 435080
+  let seven = 7
+  assert seven / 2 == 3
+  assert 0 - seven * 3 + 1 == -20
+  assert seven > 6 && seven >= 7 && seven < 8 && seven <= 7 && seven != 8
+}
+
+test "recursion" {
+  assert fib(20) == 6765
+}

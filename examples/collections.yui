@@ -85,3 +85,32 @@ fn main() uses io {
     print("{word}: {counts[word]}")
   }
 }
+
+struct Bag {
+  items: List<Int>,
+}
+
+test "updating in place keeps copies independent" {
+  let mut xs = [1, 2]
+  let before = xs
+  xs = xs.push(3)
+  assert before == [1, 2]
+  assert xs == [1, 2, 3]
+  xs = xs.push(xs.len())
+  assert xs == [1, 2, 3, 3]
+
+  let mut m = Map { "a": 1 }
+  let saved = m
+  m = m.set("b", 2)
+  m = m.remove("a")
+  assert saved == Map { "a": 1 }
+  assert m == Map { "b": 2 }
+
+  let mut bag = Bag { items: [] }
+  let empty = bag
+  for i in 0..3 {
+    bag.items = bag.items.push(i)
+  }
+  assert empty.items == []
+  assert bag.items == [0, 1, 2]
+}
