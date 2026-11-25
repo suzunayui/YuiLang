@@ -1,0 +1,8 @@
+fn main() uses io {
+  let xs = [10, 20, 30]
+  let mut i = 0
+  while i < 5 {
+    print("{xs[i]}")
+    i = i + 1
+  }
+}

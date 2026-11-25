@@ -1118,7 +1118,7 @@ impl<'g> Compiler<'g> {
 
 /// Whether evaluating `e` can leave the function it is in early, through
 /// `return` or `?`.
-fn can_return(e: &Expr) -> bool {
+pub(crate) fn can_return(e: &Expr) -> bool {
     let any = |es: &[Expr]| es.iter().any(can_return);
     match &e.kind {
         ExprKind::Return(_) | ExprKind::Try(_) => true,

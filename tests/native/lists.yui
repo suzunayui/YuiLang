@@ -1,0 +1,105 @@
+// 整数のリスト: 生成、追加、長さ、添字、for、map / filter / fold / any / all、関数との受け渡し
+
+fn range(n: Int) -> List<Int> {
+  let mut out = []
+  for i in 0..n {
+    out = out.push(i)
+  }
+  out
+}
+
+fn sum(xs: List<Int>) -> Int {
+  let mut total = 0
+  for x in xs {
+    total = total + x
+  }
+  total
+}
+
+fn first_over(xs: List<Int>, limit: Int) -> Int {
+  for x in xs {
+    if x > limit {
+      return x
+    }
+  }
+  -1
+}
+
+fn evens(xs: List<Int>) -> List<Int> {
+  xs.filter(|x| x % 2 == 0)
+}
+
+// クロージャの中から自分自身を呼ぶ
+fn count_calls(n: Int) -> Int {
+  if n == 0 { 0 } else { [n].map(|x| count_calls(x - 1) + 1)[0] }
+}
+
+fn pick(flag: Bool, a: List<Int>, b: List<Int>) -> List<Int> {
+  if flag { a } else { b }
+}
+
+fn main() uses io {
+  let xs = range(10)
+  print("len {xs.len()} first {xs[0]} last {xs[xs.len() - 1]}")
+  print("sum {sum(xs)} again {sum(xs)}")
+  print("squares {sum(xs.map(|x| x * x))}")
+  print("evens {sum(evens(xs))} count {evens(xs).len()}")
+  print("fold {xs.fold(0, |acc, x| acc + x)} product {range(6).filter(|x| x > 0).fold(1, |acc, x| acc * x)}")
+  print("chain {xs.map(|x| x + 1).filter(|x| x % 2 == 0).fold(1, |acc, x| acc * x)}")
+  print("any {xs.any(|x| x > 8)} {xs.any(|x| x > 9)} all {xs.all(|x| x >= 0)} {xs.all(|x| x < 9)}")
+  print("first over 4: {first_over(xs, 4)}, over 40: {first_over(xs, 40)}")
+  print("calls {count_calls(50)}")
+
+  // 値として扱われる: 片方を変えても他方は変わらない
+  let a = [1, 2, 3]
+  let mut b = a
+  b = b.push(4)
+  let c = b.push(5)
+  print("a {a.len()} b {b.len()} c {c.len()} {c[4]} {sum(a)} {sum(b)} {sum(c)}")
+
+  // 回している最中に元の変数を変えても、回しているリストは変わらない
+  let mut ys = [1, 2, 3]
+  let mut rounds = 0
+  for y in ys {
+    ys = ys.push(y * 10)
+    rounds = rounds + 1
+  }
+  print("rounds {rounds} ys {ys.len()} {ys[5]}")
+
+  // 代入で前のリストを手放す。
+  let mut zs = range(3)
+  zs = range(5)
+  zs = zs.map(|z| z * 2)
+  let kept = zs.filter(|z| z > 2)
+  print("zs {zs.len()} kept {kept.len()} {sum(kept)}")
+
+  // break / continue と、ループの中で作るリスト
+  let mut total = 0
+  for i in 0..20 {
+    let row = range(i)
+    if i % 2 == 0 {
+      continue
+    }
+    if row.len() > 15 {
+      break
+    }
+    total = total + sum(row.map(|v| v + i))
+  }
+  print("total {total}")
+
+  let mut n = 0
+  while true {
+    let grown = range(n).push(n)
+    n = grown.len()
+    if n > 6 {
+      break
+    }
+  }
+  print("n {n}")
+
+  let _ = range(4)
+  let empty = range(0)
+  print("empty {empty.len()} {sum(empty)} {empty.any(|x| x == 0)} {empty.all(|x| x == 0)}")
+  print("pick {sum(pick(true, [1, 2], [3, 4]))} {sum(pick(false, [1, 2], [3, 4]))}")
+  print("nested {xs.map(|x| range(x).fold(0, |acc, v| acc + v))[9]} literal {[xs[1] + 1, sum(xs), 7][1]}")
+}

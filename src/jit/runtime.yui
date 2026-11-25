@@ -1,0 +1,59 @@
+// ネイティブ実行ファイルに入る実行時部品。YuiLang で書き、利用側と同じコンパイラで機械語にする。
+//
+// ここだけで使える組み込み関数:
+//   __load(address) -> Int        その番地の 8 バイトを読む
+//   __store(address, value)       その番地に 8 バイトを書く
+//   __alloc(bytes) -> Int         メモリを確保して番地を返す
+//   __realloc(address, bytes) -> Int   大きさを変えて（移動するかもしれない）番地を返す
+//   __free(address)               メモリを返す
+//
+// リスト（List<Int>）の形: 先頭から 8 バイトずつ [参照カウント][長さ][容量][要素 0][要素 1]...
+
+fn list_new(capacity: Int) -> Int {
+  let list = __alloc(24 + capacity * 8)
+  __store(list, 1)
+  __store(list + 8, 0)
+  __store(list + 16, capacity)
+  list
+}
+
+// 持ち主が 1 人減る。最後の 1 人だったらメモリを返す
+fn list_release(list: Int) {
+  let count = __load(list)
+  if count == 1 {
+    __free(list)
+  } else {
+    __store(list, count - 1)
+  }
+}
+
+// list の末尾に value を足したリストを返す。list の持ち主 1 人分を受け取り、返すリストの持ち主 1 人分を渡す。
+// ほかに持ち主がいなければその場で足し、いれば複製してから足す（ほかの持ち主からは変わって見えない）
+fn list_push(list: Int, value: Int) -> Int {
+  let count = __load(list)
+  let length = __load(list + 8)
+  let capacity = __load(list + 16)
+  if count == 1 {
+    if length < capacity {
+      __store(list + 24 + length * 8, value)
+      __store(list + 8, length + 1)
+      return list
+    }
+    let room = capacity * 2 + 8
+    let grown = __realloc(list, 24 + room * 8)
+    __store(grown + 16, room)
+    __store(grown + 24 + length * 8, value)
+    __store(grown + 8, length + 1)
+    return grown
+  }
+  let copy = list_new(length * 2 + 8)
+  let mut i = 0
+  while i < length {
+    __store(copy + 24 + i * 8, __load(list + 24 + i * 8))
+    i = i + 1
+  }
+  __store(copy + 24 + length * 8, value)
+  __store(copy + 8, length + 1)
+  __store(list, count - 1)
+  copy
+}

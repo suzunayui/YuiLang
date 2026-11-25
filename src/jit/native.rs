@@ -1,11 +1,17 @@
 //! Ahead-of-time compiler: turns a program into a Windows x64 executable that
 //! contains no interpreter (see `docs/native-backend.md`).
 //!
-//! This is stage 2 of that design. It handles programs made of functions over
-//! `Int` and `Bool`: arithmetic, comparisons, `if`, `while`, `for` over a
-//! range, calls, and `print` of a string whose `{...}` parts are Ints or
-//! Bools. Anything else is reported as `Unsupported`, and the caller falls
-//! back to bundling the interpreter.
+//! It handles programs made of functions over `Int`, `Bool` and `List<Int>`:
+//! arithmetic, comparisons, `if`, `while`, `for`, calls, list literals,
+//! `push`, `len`, indexing, `map` / `filter` / `fold` / `any` / `all` with a
+//! closure written in place, and `print` of a string whose `{...}` parts are
+//! Ints or Bools. Anything else is reported as `Unsupported`.
+//!
+//! Lists live on the heap with a reference count in front (the layout is in
+//! `runtime.yui`, which also holds the list routines; they are compiled by
+//! this same compiler). Every list variable owns one reference, and every
+//! list expression produces one; a reference is given up when its variable
+//! goes out of scope or is assigned to.
 //!
 //! Values have no tags: an Int is 8 bytes in a register. Each function keeps
 //! its busiest variables in registers that calls preserve (rbx, rsi, rdi,
@@ -13,7 +19,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_E, CC_GE, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_AE, CC_E, CC_GE, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -36,10 +42,36 @@ const STDOUT: i64 = -11;
 const STDERR: i64 = -12;
 
 /// Functions imported from kernel32.dll, in the order of the import table.
-const IMPORTS: [&str; 3] = ["GetStdHandle", "WriteFile", "ExitProcess"];
+const IMPORTS: [&str; 7] =
+    ["GetStdHandle", "WriteFile", "ExitProcess", "GetProcessHeap", "HeapAlloc", "HeapFree", "HeapReAlloc"];
 const GET_STD_HANDLE: usize = 0;
 const WRITE_FILE: usize = 1;
 const EXIT_PROCESS: usize = 2;
+const GET_PROCESS_HEAP: usize = 3;
+const HEAP_ALLOC: usize = 4;
+const HEAP_FREE: usize = 5;
+const HEAP_REALLOC: usize = 6;
+
+/// The list routines, written in YuiLang.
+const RUNTIME: &str = include_str!("runtime.yui");
+
+/// Offset of an element from the start of a list (see `runtime.yui`).
+const ELEMENTS: i32 = 24;
+const LENGTH: i32 = 8;
+const CAPACITY: i32 = 16;
+
+/// What a storage place decided before code generation is for.
+const VAR: u8 = 0;
+/// The end of a `for` range.
+const LIMIT: u8 = 1;
+/// The list a loop walks, the position in it, and the result being built.
+const LIST: u8 = 2;
+const POS: u8 = 3;
+const OUT: u8 = 4;
+
+/// Writable memory (zero at start): the number of heap blocks in use, kept
+/// only when the executable is built to check for leaks.
+const LIVE_BLOCKS: usize = 0;
 
 /// Why a program cannot be compiled natively yet.
 pub struct Unsupported {
@@ -58,6 +90,8 @@ enum Ty {
     Int,
     Bool,
     Unit,
+    /// `List<Int>`: a pointer to a counted block on the heap.
+    List,
     /// The expression does not produce a value (`return`, `break`, ...).
     Never,
 }
@@ -91,16 +125,32 @@ struct FnInfo {
 enum Stub {
     Fail { label: usize, message: usize, len: usize },
     Overflow { label: usize, a: Opnd, b: Opnd, record: usize },
+    Bounds { label: usize, list: u8, index: u8, record: usize },
+    /// `variable = variable.push(value)` when the item cannot be added in place.
+    Push { label: usize, back: usize, variable: Loc, value: u8 },
 }
 
 struct Native<'a> {
     a: Asm,
     sources: &'a SourceMap,
+    types: &'a TypeInfo,
+    /// The program's functions by name; the runtime's have a `%` in front.
     fns: HashMap<String, FnInfo>,
     /// Positions of `call [rip + ...]` displacements and the import they call.
     iat_fixups: Vec<(usize, usize)>,
     /// Constant data, placed after the code.
     data: Vec<(usize, Vec<u8>)>,
+    /// Positions of rip-relative displacements into the writable memory, and the offset there.
+    bss_fixups: Vec<(usize, usize)>,
+    /// Whether the program allocates, and so needs the list routines.
+    uses_heap: bool,
+    /// Compiling `runtime.yui`: memory intrinsics are available and arithmetic is unchecked.
+    in_runtime: bool,
+    /// Count heap blocks and report at exit if any are left.
+    check_heap: bool,
+    rt_alloc: usize,
+    rt_realloc: usize,
+    rt_free: usize,
     rt_write: usize,
     rt_print_int: usize,
     rt_fail: usize,
@@ -109,13 +159,14 @@ struct Native<'a> {
     // ---- state of the function being compiled ----
     stubs: Vec<Stub>,
     scopes: Vec<HashMap<String, Local>>,
-    /// Where each declared variable lives, by the start of its declaration.
-    decl_loc: HashMap<usize, Loc>,
-    /// Where the end of each `for` range lives, by the start of the loop variable.
-    limit_loc: HashMap<usize, Loc>,
+    /// Where each variable lives, by the start of its declaration, and where
+    /// the hidden values of each loop live, by the start of the loop variable
+    /// or method name.
+    decl_loc: HashMap<(usize, u8), Loc>,
     free: Vec<u8>,
-    /// (label to leave the loop, label to start the next round)
-    loops: Vec<(usize, usize)>,
+    /// (label to leave the loop, label to start the next round, number of
+    /// scopes outside the loop body)
+    loops: Vec<(usize, usize, usize)>,
     epilogue: usize,
     ret: Ty,
     /// Offset of the first spill slot, and how many are in use / were ever used.
@@ -134,6 +185,17 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     let mut a = Asm::default();
     let mut fns = HashMap::new();
     let mut decls = Vec::new();
+    let Ok(runtime) = crate::parser::parse_file(RUNTIME, 0, "", true) else {
+        return unsupported("its own runtime (it does not parse)", nowhere);
+    };
+    let mut runtime_fns = Vec::new();
+    for item in &runtime.items {
+        if let Item::Fn(f) = item {
+            let ret = if f.ret.is_some() { Ty::Int } else { Ty::Unit };
+            fns.insert(format!("%{}", f.name), FnInfo { label: a.label(), params: vec![Ty::Int; f.params.len()], ret });
+            runtime_fns.push(f.clone());
+        }
+    }
     for item in &program.items {
         match item {
             Item::Fn(f) => {
@@ -167,12 +229,21 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     let main_label = main.label;
 
     let (rt_write, rt_print_int, rt_fail, rt_overflow) = (a.label(), a.label(), a.label(), a.label());
+    let (rt_alloc, rt_realloc, rt_free) = (a.label(), a.label(), a.label());
     let mut n = Native {
         a,
         sources,
+        types: &program.types,
         fns,
         iat_fixups: Vec::new(),
         data: Vec::new(),
+        bss_fixups: Vec::new(),
+        uses_heap: false,
+        in_runtime: false,
+        check_heap: std::env::var_os("YUI_NATIVE_CHECK_HEAP").is_some(),
+        rt_alloc,
+        rt_realloc,
+        rt_free,
         rt_write,
         rt_print_int,
         rt_fail,
@@ -180,7 +251,6 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         stubs: Vec::new(),
         scopes: Vec::new(),
         decl_loc: HashMap::new(),
-        limit_loc: HashMap::new(),
         free: Vec::new(),
         loops: Vec::new(),
         epilogue: 0,
@@ -193,18 +263,40 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     // Entry point: run `main`, then leave with exit code 0.
     n.a.alu_imm(5, RSP, 40);
     n.call_label(main_label);
+    let leak = n.a.label();
+    if n.check_heap {
+        n.rip_bss(&[0x48, 0x8B, 0x0D], LIVE_BLOCKS); // mov rcx, [live blocks]
+        n.a.alu_rr(0x85, RCX, RCX);
+        n.a.jcc(CC_NZ, leak);
+    }
     n.a.buf.extend_from_slice(&[0x31, 0xC9]); // xor ecx, ecx
     n.call_import(EXIT_PROCESS);
+    if n.check_heap {
+        n.a.bind(leak);
+        n.a.mov_imm64(RDX, STDERR);
+        n.call_label(n.rt_print_int);
+        n.write(b" block(s) of memory were not freed\n", STDERR);
+        n.a.buf.extend_from_slice(&[0xB9, 3, 0, 0, 0]); // mov ecx, 3
+        n.call_import(EXIT_PROCESS);
+    }
     n.runtime();
     for f in &decls {
-        n.function(f)?;
+        n.function(f, &f.name)?;
+    }
+    if n.uses_heap {
+        n.in_runtime = true;
+        for f in &runtime_fns {
+            n.function(f, &format!("%{}", f.name))?;
+        }
+        n.heap_runtime();
     }
     for (label, bytes) in std::mem::take(&mut n.data) {
         n.a.bind(label);
         n.a.buf.extend_from_slice(&bytes);
     }
     let iat_fixups = std::mem::take(&mut n.iat_fixups);
-    Ok(write_pe(n.a.finish(), &iat_fixups))
+    let bss_fixups = std::mem::take(&mut n.bss_fixups);
+    Ok(write_pe(n.a.finish(), &iat_fixups, &bss_fixups))
 }
 
 fn simple_type(t: &TypeExpr) -> R<Ty> {
@@ -214,6 +306,10 @@ fn simple_type(t: &TypeExpr) -> R<Ty> {
             "Bool" => Ok(Ty::Bool),
             "Unit" => Ok(Ty::Unit),
             other => unsupported(format!("the type `{other}`"), t.span),
+        },
+        TypeKind::Named(name, args) if name == "List" && args.len() == 1 => match simple_type(&args[0])? {
+            Ty::Int => Ok(Ty::List),
+            _ => unsupported("a list of anything but Ints", t.span),
         },
         _ => unsupported("this type", t.span),
     }
@@ -226,13 +322,63 @@ fn has_call(e: &Expr) -> bool {
         ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
         ExprKind::Unary(_, x) => has_call(x),
         ExprKind::Binary(_, l, r) => has_call(l) || has_call(r),
+        // Reading from a list held by a variable is done in place.
+        ExprKind::Index(list, index) => !matches!(list.kind, ExprKind::Ident(_)) || has_call(index),
+        ExprKind::MethodCall { recv, name, args, .. } => {
+            !(name == "len" && args.is_empty() && matches!(recv.kind, ExprKind::Ident(_)))
+        }
         _ => true,
     }
 }
 
+type Decls = Vec<(usize, String, u8)>;
+
+/// Registers a hidden value of the loop at `id`, used every round.
+fn hidden(id: usize, kind: u8, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Decls) {
+    let name = format!("%{kind}@{id}");
+    *weight.entry(name.clone()).or_default() += 2 * 8usize.saturating_pow(depth.min(6));
+    decls.push((id, name, kind));
+}
+
 /// How often each variable name is used, counting uses inside loops as more.
-fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Vec<(usize, String, bool)>) {
+fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Decls) {
     match &e.kind {
+        ExprKind::List(items) => {
+            for item in items {
+                weigh(item, depth, weight, decls);
+            }
+        }
+        ExprKind::Index(list, index) => {
+            weigh(list, depth, weight, decls);
+            weigh(index, depth, weight, decls);
+        }
+        ExprKind::MethodCall { recv, name_span, args, .. } => {
+            weigh(recv, depth, weight, decls);
+            for arg in args {
+                let ExprKind::Closure { params, body, .. } = &arg.kind else {
+                    weigh(arg, depth, weight, decls);
+                    continue;
+                };
+                // The closure becomes the body of a loop over the list.
+                let id = name_span.start;
+                hidden(id, LIST, depth + 1, weight, decls);
+                hidden(id, POS, depth + 1, weight, decls);
+                match params.as_slice() {
+                    // `fold`: the first parameter is the result so far.
+                    [acc, item] => {
+                        decls.push((id, acc.name.clone(), OUT));
+                        decls.push((item.span.start, item.name.clone(), VAR));
+                    }
+                    _ => {
+                        hidden(id, OUT, depth + 1, weight, decls);
+                        for p in params {
+                            decls.push((p.span.start, p.name.clone(), VAR));
+                        }
+                    }
+                }
+                weigh(body, depth + 1, weight, decls);
+            }
+        }
         ExprKind::Ident(name) => {
             *weight.entry(name.clone()).or_default() += 8usize.saturating_pow(depth.min(6));
         }
@@ -266,12 +412,12 @@ fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut 
     }
 }
 
-fn weigh_block(b: &Block, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Vec<(usize, String, bool)>) {
+fn weigh_block(b: &Block, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Decls) {
     for stmt in &b.stmts {
         match stmt {
             Stmt::Let { name, name_span, value, .. } => {
                 weigh(value, depth, weight, decls);
-                decls.push((name_span.start, name.clone(), false));
+                decls.push((name_span.start, name.clone(), VAR));
             }
             Stmt::Assign { target, value } => {
                 weigh(target, depth, weight, decls);
@@ -286,10 +432,15 @@ fn weigh_block(b: &Block, depth: u32, weight: &mut HashMap<String, usize>, decls
                 if let Some(end) = end {
                     weigh(end, depth, weight, decls);
                 }
-                decls.push((var_span.start, var.clone(), false));
-                decls.push((var_span.start, var.clone(), true));
-                // The loop itself reads the counter and the end every round.
-                *weight.entry(var.clone()).or_default() += 2 * 8usize.saturating_pow((depth + 1).min(6));
+                decls.push((var_span.start, var.clone(), VAR));
+                if end.is_some() {
+                    decls.push((var_span.start, var.clone(), LIMIT));
+                    // The loop itself reads the counter and the end every round.
+                    *weight.entry(var.clone()).or_default() += 2 * 8usize.saturating_pow((depth + 1).min(6));
+                } else {
+                    hidden(var_span.start, LIST, depth + 1, weight, decls);
+                    hidden(var_span.start, POS, depth + 1, weight, decls);
+                }
                 weigh_block(body, depth + 1, weight, decls);
             }
             Stmt::Assert { cond, .. } => weigh(cond, depth, weight, decls),
@@ -361,6 +512,48 @@ impl Native<'_> {
             Some(t) => Ok(t),
             None => unsupported("an expression nested this deeply", span),
         }
+    }
+
+    /// Emits `opcode` followed by the rip-relative address of writable memory at `offset`.
+    fn rip_bss(&mut self, opcode: &[u8], offset: usize) {
+        self.a.buf.extend_from_slice(opcode);
+        self.bss_fixups.push((self.a.buf.len(), offset));
+        self.a.d32(0);
+    }
+
+    /// Calls a function of `runtime.yui`.
+    fn call_rt(&mut self, name: &str) {
+        self.uses_heap = true;
+        let label = self.fns[&format!("%{name}")].label;
+        self.call_label(label);
+    }
+
+    /// The register holding the value at `loc`, loading it into `scratch` if it is in the frame.
+    fn reg(&mut self, loc: Loc, scratch: u8) -> u8 {
+        match loc {
+            Loc::Reg(r) => r,
+            Loc::Stack(off) => {
+                self.a.load(scratch, M(RSP, off));
+                scratch
+            }
+        }
+    }
+
+    /// `mov reg, [list + index * 8 + ELEMENTS]` (0x8B) or the store the other way (0x89).
+    fn element(&mut self, opcode: u8, reg: u8, list: u8, index: u8) {
+        self.a.b(0x48 | (reg >> 3) << 2 | (index >> 3) << 1 | (list >> 3));
+        self.a.b(opcode);
+        self.a.b(0x44 | (reg & 7) << 3);
+        self.a.b(0xC0 | (index & 7) << 3 | (list & 7));
+        self.a.b(ELEMENTS as u8);
+    }
+
+    /// Makes every temp but `except` available and returns the previous set,
+    /// to be put back afterwards. Only for an expression with a call in it:
+    /// whoever held a value in a temp has parked it by then, so the temps are
+    /// in fact unused, whatever the nesting.
+    fn fresh_temps(&mut self, except: u8) -> Vec<u8> {
+        std::mem::replace(&mut self.free, TEMPS.iter().copied().filter(|t| *t != except).collect())
     }
 
     fn push_spill(&mut self) -> M {
@@ -469,6 +662,69 @@ impl Native<'_> {
         self.call_import(EXIT_PROCESS);
     }
 
+    /// Memory from the operating system, for the intrinsics of `runtime.yui`.
+    fn heap_runtime(&mut self) {
+        let oom = self.a.label();
+        // The caller's side of the frame has room for the register arguments.
+        let home = |slot: i32| M(RSP, 48 + 8 * slot);
+
+        // alloc(rcx = bytes) -> rax
+        self.a.bind(self.rt_alloc);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.store(home(0), RCX);
+        self.call_import(GET_PROCESS_HEAP);
+        self.a.mov_rr(RCX, RAX);
+        self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        self.a.load(R8, home(0));
+        self.call_import(HEAP_ALLOC);
+        self.a.alu_rr(0x85, RAX, RAX);
+        self.a.jcc(CC_Z, oom);
+        if self.check_heap {
+            self.rip_bss(&[0x48, 0xFF, 0x05], LIVE_BLOCKS); // inc qword [live blocks]
+        }
+        self.a.alu_imm(0, RSP, 40);
+        self.a.b(0xC3);
+
+        // realloc(rcx = block, rdx = bytes) -> rax
+        self.a.bind(self.rt_realloc);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.store(home(0), RCX);
+        self.a.store(home(1), RDX);
+        self.call_import(GET_PROCESS_HEAP);
+        self.a.mov_rr(RCX, RAX);
+        self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        self.a.load(R8, home(0));
+        self.a.load(R9, home(1));
+        self.call_import(HEAP_REALLOC);
+        self.a.alu_rr(0x85, RAX, RAX);
+        self.a.jcc(CC_Z, oom);
+        self.a.alu_imm(0, RSP, 40);
+        self.a.b(0xC3);
+
+        // free(rcx = block)
+        self.a.bind(self.rt_free);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.store(home(0), RCX);
+        self.call_import(GET_PROCESS_HEAP);
+        self.a.mov_rr(RCX, RAX);
+        self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        self.a.load(R8, home(0));
+        self.call_import(HEAP_FREE);
+        if self.check_heap {
+            self.rip_bss(&[0x48, 0xFF, 0x0D], LIVE_BLOCKS); // dec qword [live blocks]
+        }
+        self.a.alu_imm(0, RSP, 40);
+        self.a.b(0xC3);
+
+        // Reached with the stack as inside the routines above.
+        self.a.bind(oom);
+        let text = b"error: out of memory\n";
+        let message = self.constant(text);
+        self.lea_label(RCX, message);
+        self.a.mov_imm64(RDX, text.len() as i64);
+        self.call_label(self.rt_fail);
+    }
+
     /// The text `yui run` prints for a runtime error.
     fn error_text(&self, d: &Diagnostic) -> String {
         format!("{}\n1 error(s)\n", render_human(d, self.sources))
@@ -502,15 +758,50 @@ impl Native<'_> {
                     self.lea_label(R8, record);
                     self.call_label(self.rt_overflow);
                 }
+                Stub::Push { label, back, variable, value } => {
+                    self.a.bind(label);
+                    self.a.mov_rr(RDX, value);
+                    self.load_loc(RCX, variable);
+                    self.call_rt("list_push");
+                    self.store_loc(variable, RAX);
+                    self.a.jmp(back);
+                }
+                Stub::Bounds { label, list, index, record } => {
+                    self.a.bind(label);
+                    // The index is in neither rcx nor rdx; the list may be in rcx.
+                    self.a.load(RDX, M(list, LENGTH));
+                    self.mov(RCX, index);
+                    self.lea_label(R8, record);
+                    self.call_label(self.rt_overflow);
+                }
             }
         }
     }
 
     /// Reserves code that reports an overflow of `a op b` and returns its label.
     fn overflow_stub(&mut self, op: BinOp, a: Opnd, b: Opnd, span: Span) -> usize {
-        // Render the message with markers where the operands go, then cut it there.
         let d = Diagnostic::new("E0503", format!("integer overflow in `\u{1} {} \u{2}`", op.symbol()), span);
-        let text = self.error_text(&d);
+        let record = self.record(&d);
+        let label = self.a.label();
+        self.stubs.push(Stub::Overflow { label, a, b, record });
+        label
+    }
+
+    /// Reserves code that reports `index` (a register) as out of bounds for
+    /// the list whose address is in the register `list`.
+    fn bounds_stub(&mut self, list: u8, index: u8, span: Span) -> usize {
+        let d = Diagnostic::new("E0505", "index \u{1} is out of bounds for a list of length \u{2}", span)
+            .hint("use `.get(i)` to receive an Option instead of failing");
+        let record = self.record(&d);
+        let label = self.a.label();
+        self.stubs.push(Stub::Bounds { label, list, index, record });
+        label
+    }
+
+    /// The text of an error whose message has two numbers in it, marked
+    /// `\u{1}` and `\u{2}`, cut at the marks for `rt_overflow`.
+    fn record(&mut self, d: &Diagnostic) -> usize {
+        let text = self.error_text(d);
         let (prefix, rest) = text.split_once('\u{1}').unwrap_or((&text, ""));
         let (middle, suffix) = rest.split_once('\u{2}').unwrap_or((rest, ""));
         let mut record = Vec::new();
@@ -520,23 +811,20 @@ impl Native<'_> {
         for piece in [prefix, middle, suffix] {
             record.extend(piece.as_bytes());
         }
-        let record = self.constant(&record);
-        let label = self.a.label();
-        self.stubs.push(Stub::Overflow { label, a, b, record });
-        label
+        self.constant(&record)
     }
 
     // ---- functions ----
 
-    fn function(&mut self, f: &FnDecl) -> R<()> {
+    /// Compiles `f`, which is registered in `fns` as `key`.
+    fn function(&mut self, f: &FnDecl, key: &str) -> R<()> {
         // Decide where every variable lives: the most used ones in registers.
         let mut weight = HashMap::new();
-        let mut decls: Vec<(usize, String, bool)> = f.params.iter().map(|p| (p.span.start, p.name.clone(), false)).collect();
+        let mut decls: Decls = f.params.iter().map(|p| (p.span.start, p.name.clone(), VAR)).collect();
         weigh_block(&f.body, 0, &mut weight, &mut decls);
         let mut order: Vec<usize> = (0..decls.len()).collect();
         order.sort_by_key(|i| std::cmp::Reverse(weight.get(&decls[*i].1).copied().unwrap_or(0)));
         self.decl_loc.clear();
-        self.limit_loc.clear();
         let mut used = Vec::new();
         let mut stack_slots = 0;
         for (rank, i) in order.into_iter().enumerate() {
@@ -551,12 +839,8 @@ impl Native<'_> {
                     Loc::Stack(32 + 8 * (stack_slots - 1))
                 }
             };
-            let (id, _, is_limit) = &decls[i];
-            if *is_limit {
-                self.limit_loc.insert(*id, loc);
-            } else {
-                self.decl_loc.insert(*id, loc);
-            }
+            let (id, _, kind) = &decls[i];
+            self.decl_loc.insert((*id, *kind), loc);
         }
         self.spill_base = 32 + 8 * stack_slots;
         self.spill_depth = 0;
@@ -564,7 +848,7 @@ impl Native<'_> {
         self.free = TEMPS.to_vec();
         self.loops.clear();
         self.epilogue = self.a.label();
-        let info = &self.fns[&f.name];
+        let info = &self.fns[key];
         let (label, ret) = (info.label, info.ret);
         self.ret = ret;
 
@@ -576,7 +860,7 @@ impl Native<'_> {
         let frame_at = [self.a.buf.len() - 4, 0];
         let mut scope = HashMap::new();
         for (i, p) in f.params.iter().enumerate() {
-            let loc = self.decl_loc[&p.span.start];
+            let loc = self.decl_loc[&(p.span.start, VAR)];
             self.store_loc(loc, ARG_REGS[i]);
             scope.insert(p.name.clone(), Local { ty: simple_type(&p.ty)?, loc });
         }
@@ -590,6 +874,8 @@ impl Native<'_> {
         self.free.push(t);
 
         self.a.bind(self.epilogue);
+        // The parameters are the function's own references.
+        self.release_scopes(0, (ret != Ty::Unit).then_some(RAX));
         self.a.alu_imm(0, RSP, 0);
         let frame_at = [frame_at[0], self.a.buf.len() - 4];
         for reg in used.iter().rev() {
@@ -617,18 +903,100 @@ impl Native<'_> {
         }
     }
 
+    /// Adds a variable to the innermost scope.
+    fn declare(&mut self, name: &str, local: Local) {
+        let scope = self.scopes.last_mut().expect("scope");
+        if let Some(old) = scope.insert(name.to_string(), local) {
+            if old.ty == Ty::List {
+                // Shadowed, but it still holds a list until the scope ends.
+                let hidden = format!("{name}%{}", scope.len());
+                scope.insert(hidden, old);
+            }
+        }
+    }
+
+    /// Gives up the lists held by the variables of the scopes from `from`
+    /// on. `keep` is a register whose value must survive.
+    fn release_scopes(&mut self, from: usize, keep: Option<u8>) {
+        let mut locs: Vec<Loc> =
+            self.scopes[from..].iter().flat_map(|s| s.values()).filter(|l| l.ty == Ty::List).map(|l| l.loc).collect();
+        if locs.is_empty() {
+            return;
+        }
+        // In a fixed order, so that the same program always gives the same executable.
+        locs.sort_by_key(|loc| match loc {
+            Loc::Reg(r) => *r as i32,
+            Loc::Stack(off) => 100 + off,
+        });
+        let slot = keep.map(|reg| {
+            let slot = self.push_spill();
+            self.a.store(slot, reg);
+            slot
+        });
+        for loc in locs {
+            self.load_loc(RCX, loc);
+            self.call_rt("list_release");
+        }
+        if let (Some(reg), Some(slot)) = (keep, slot) {
+            self.a.load(reg, slot);
+            self.spill_depth -= 1;
+        }
+    }
+
+    /// Gives up the list in rcx without losing the value in `keep`.
+    fn release_keeping(&mut self, keep: u8) {
+        let slot = self.push_spill();
+        self.a.store(slot, keep);
+        self.call_rt("list_release");
+        self.a.load(keep, slot);
+        self.spill_depth -= 1;
+    }
+
+    /// A value that is dropped must not be a list: nothing would release it.
+    /// (The type checker already rejects unused values.)
+    fn discard(&self, ty: Ty, span: Span) -> R<()> {
+        match ty {
+            Ty::List => unsupported("a list that is not used", span),
+            _ => Ok(()),
+        }
+    }
+
+    /// The variable `e` names, if it holds a list.
+    fn list_var(&self, e: &Expr) -> Option<Local> {
+        let ExprKind::Ident(name) = &e.kind else { return None };
+        let local = self.scopes.iter().rev().find_map(|s| s.get(name.as_str()))?;
+        (local.ty == Ty::List).then_some(*local)
+    }
+
+    /// Evaluates `e`, which must be a list, into `dst`; `dst` then owns a reference.
+    fn owned_list(&mut self, e: &Expr, dst: u8) -> R<()> {
+        match self.eval(e, dst)? {
+            Ty::List => Ok(()),
+            _ => unsupported("this operation on anything but a list of Ints", e.span),
+        }
+    }
+
+    fn expect_int(&self, ty: Ty, span: Span) -> R<()> {
+        match ty {
+            Ty::Int => Ok(()),
+            _ => unsupported("a list of anything but Ints", span),
+        }
+    }
+
     // ---- statements ----
 
     /// Compiles a block; its value, if any, goes to `dst`.
     fn block(&mut self, b: &Block, dst: u8) -> R<Ty> {
         self.scopes.push(HashMap::new());
+        let outer = self.fresh_temps(dst);
         let mut ty = Ty::Unit;
         let last = b.stmts.len().wrapping_sub(1);
         for (i, stmt) in b.stmts.iter().enumerate() {
             ty = match stmt {
                 Stmt::Expr(e) if i == last => self.eval(e, dst)?,
                 Stmt::Expr(e) => {
-                    self.eval(e, dst)?;
+                    let ty = self.eval(e, dst)?;
+                    self.discard(ty, e.span)?;
                     Ty::Unit
                 }
                 other => {
@@ -637,7 +1005,12 @@ impl Native<'_> {
                 }
             };
         }
+        if ty != Ty::Never {
+            let keep = (ty != Ty::Unit && TEMPS.contains(&dst)).then_some(dst);
+            self.release_scopes(self.scopes.len() - 1, keep);
+        }
         self.scopes.pop();
+        self.free = outer;
         Ok(ty)
     }
 
@@ -645,6 +1018,13 @@ impl Native<'_> {
     fn eval_into(&mut self, value: &Expr, loc: Loc, direct: bool) -> R<Ty> {
         if let (Loc::Reg(r), true) = (loc, direct) {
             return self.eval(value, r);
+        }
+        if has_call(value) {
+            let outer = self.fresh_temps(TEMPS[0]);
+            let ty = self.eval(value, TEMPS[0])?;
+            self.store_loc(loc, TEMPS[0]);
+            self.free = outer;
+            return Ok(ty);
         }
         let t = self.take_temp(value.span)?;
         let ty = self.eval(value, t)?;
@@ -656,14 +1036,24 @@ impl Native<'_> {
     fn stmt(&mut self, stmt: &Stmt) -> R<()> {
         match stmt {
             Stmt::Let { name, name_span, value, .. } => {
-                let loc = self.decl_loc[&name_span.start];
+                let loc = self.decl_loc[&(name_span.start, VAR)];
                 // The new variable is not visible in its own initializer.
                 let ty = self.eval_into(value, loc, true)?;
-                if !matches!(ty, Ty::Int | Ty::Bool) {
-                    return unsupported("a variable that is not an Int or a Bool", *name_span);
+                let known = match ty {
+                    Ty::Int | Ty::Bool => true,
+                    // An empty list says nothing about its items; ask the type checker.
+                    // (`_` is never read, so its items do not matter.)
+                    Ty::List => {
+                        name == "_" || self.types.var_types.get(&name_span.start).is_some_and(|t| t == "List<Int>")
+                    }
+                    _ => false,
+                };
+                if !known {
+                    return unsupported("a variable that is not an Int, a Bool or a List<Int>", *name_span);
                 }
-                if name != "_" {
-                    self.scopes.last_mut().expect("scope").insert(name.clone(), Local { ty, loc });
+                // `_` cannot be read, but a list in it is still released with the scope.
+                if name != "_" || ty == Ty::List {
+                    self.declare(name, Local { ty, loc });
                 }
             }
             Stmt::Assign { target, value } => {
@@ -671,6 +1061,9 @@ impl Native<'_> {
                     return unsupported("assigning to anything but a variable", target.span);
                 };
                 let local = self.lookup(name, target.span)?;
+                if local.ty == Ty::List {
+                    return self.assign_list(name, local, value);
+                }
                 // `x = x + 1` can be computed in place: x is read before it is written.
                 let updates_itself = match &value.kind {
                     ExprKind::Binary(_, l, r) => {
@@ -685,17 +1078,18 @@ impl Native<'_> {
                 let (top, exit) = (self.a.label(), self.a.label());
                 self.a.bind(top);
                 self.cond(cond, exit)?;
-                self.loops.push((exit, top));
+                self.loops.push((exit, top, self.scopes.len()));
                 let t = self.take_temp(cond.span)?;
-                self.block(body, t)?;
+                let ty = self.block(body, t)?;
+                self.discard(ty, body.span)?;
                 self.free.push(t);
                 self.loops.pop();
                 self.a.jmp(top);
                 self.a.bind(exit);
             }
             Stmt::For { var, var_span, iter, end: Some(end), body, .. } => {
-                let counter = self.decl_loc[&var_span.start];
-                let limit = self.limit_loc[&var_span.start];
+                let counter = self.decl_loc[&(var_span.start, VAR)];
+                let limit = self.decl_loc[&(var_span.start, LIMIT)];
                 self.eval_into(iter, counter, false)?;
                 self.eval_into(end, limit, false)?;
                 let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
@@ -707,9 +1101,10 @@ impl Native<'_> {
                 }
                 self.a.jcc(CC_GE, exit);
                 self.scopes.push(HashMap::from([(var.clone(), Local { ty: Ty::Int, loc: counter })]));
-                self.loops.push((exit, next));
+                self.loops.push((exit, next, self.scopes.len()));
                 let t = self.take_temp(*var_span)?;
-                self.block(body, t)?;
+                let ty = self.block(body, t)?;
+                self.discard(ty, body.span)?;
                 self.free.push(t);
                 self.loops.pop();
                 self.scopes.pop();
@@ -722,15 +1117,113 @@ impl Native<'_> {
                 self.a.jmp(top);
                 self.a.bind(exit);
             }
-            Stmt::For { var_span, .. } => return unsupported("`for` over a list", *var_span),
+            Stmt::For { var, var_span, iter, end: None, body, .. } => {
+                let list = self.decl_loc[&(var_span.start, LIST)];
+                let pos = self.decl_loc[&(var_span.start, POS)];
+                let item = self.decl_loc[&(var_span.start, VAR)];
+                // The loop holds its own reference: the list it walks stays as
+                // it is even if the body changes the variable it came from.
+                if self.eval_into(iter, list, true)? != Ty::List {
+                    return unsupported("`for` over anything but a list of Ints", iter.span);
+                }
+                self.set_loc(pos, 0);
+                let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
+                self.scopes.push(HashMap::from([
+                    ("%for".to_string(), Local { ty: Ty::List, loc: list }),
+                    (var.clone(), Local { ty: Ty::Int, loc: item }),
+                ]));
+                self.a.bind(top);
+                self.next_item(list, pos, item, exit);
+                self.loops.push((exit, next, self.scopes.len()));
+                let t = self.take_temp(*var_span)?;
+                let ty = self.block(body, t)?;
+                self.discard(ty, body.span)?;
+                self.free.push(t);
+                self.loops.pop();
+                self.a.bind(next);
+                self.step(pos);
+                self.a.jmp(top);
+                self.a.bind(exit);
+                self.scopes.pop();
+                self.load_loc(RCX, list);
+                self.call_rt("list_release");
+            }
             Stmt::Assert { span, .. } => return unsupported("`assert`", *span),
             Stmt::Expr(e) => {
                 let t = self.take_temp(e.span)?;
-                self.eval(e, t)?;
+                let ty = self.eval(e, t)?;
+                self.discard(ty, e.span)?;
                 self.free.push(t);
             }
         }
         Ok(())
+    }
+
+    /// `name = value` for a list variable: the list it held is given up.
+    fn assign_list(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
+        // `xs = xs.push(v)` hands the variable's own reference to `push`, which
+        // can then add the item in place instead of copying the list.
+        if let ExprKind::MethodCall { recv, name: method, args, .. } = &value.kind {
+            if method == "push" && args.len() == 1 && matches!(&recv.kind, ExprKind::Ident(n) if n == name) {
+                let t = self.take_temp(value.span)?;
+                let ty = self.eval(&args[0], t)?;
+                self.expect_int(ty, args[0].span)?;
+                // The usual case is written out here: the variable is the only
+                // owner and there is room. Everything else goes to `list_push`.
+                let (slow, back) = (self.a.label(), self.a.label());
+                self.stubs.push(Stub::Push { label: slow, back, variable: local.loc, value: t });
+                self.uses_heap = true;
+                let l = self.reg(local.loc, RCX);
+                self.a.cmp_imm(M(l, 0), 1);
+                self.a.jcc(CC_NE, slow);
+                self.a.load(RAX, M(l, LENGTH));
+                self.a.alu_m(0x3B, RAX, M(l, CAPACITY));
+                self.a.jcc(CC_GE, slow);
+                self.element(0x89, t, l, RAX);
+                self.a.inc_mem(M(l, LENGTH));
+                self.a.bind(back);
+                self.free.push(t);
+                return Ok(());
+            }
+        }
+        let t = self.take_temp(value.span)?;
+        self.owned_list(value, t)?;
+        self.load_loc(RCX, local.loc);
+        self.store_loc(local.loc, t);
+        self.free.push(t);
+        self.call_rt("list_release");
+        Ok(())
+    }
+
+    /// Start of a round of a loop over a list: leaves through `exit` at the
+    /// end of the list, otherwise puts the item at `pos` into `item`.
+    fn next_item(&mut self, list: Loc, pos: Loc, item: Loc, exit: usize) {
+        let l = self.reg(list, RCX);
+        let p = self.reg(pos, RAX);
+        self.a.alu_m(0x3B, p, M(l, LENGTH)); // cmp p, [l + LENGTH]
+        self.a.jcc(CC_GE, exit);
+        match item {
+            Loc::Reg(r) => self.element(0x8B, r, l, p),
+            Loc::Stack(off) => {
+                self.element(0x8B, RDX, l, p);
+                self.a.store(M(RSP, off), RDX);
+            }
+        }
+    }
+
+    /// Moves a position on by one. It is below a length, so this cannot overflow.
+    fn step(&mut self, pos: Loc) {
+        match pos {
+            Loc::Reg(r) => self.a.alu_imm(0, r, 1),
+            Loc::Stack(off) => self.a.inc_mem(M(RSP, off)),
+        }
+    }
+
+    fn set_loc(&mut self, loc: Loc, value: i32) {
+        match loc {
+            Loc::Reg(r) => self.a.mov_imm64(r, value as i64),
+            Loc::Stack(off) => self.a.store_imm(M(RSP, off), value),
+        }
     }
 
     // ---- expressions ----
@@ -793,8 +1286,58 @@ impl Native<'_> {
             ExprKind::Ident(name) => {
                 let local = self.lookup(name, e.span)?;
                 self.load_loc(dst, local.loc);
+                if local.ty == Ty::List {
+                    // One more owner.
+                    self.a.inc_mem(M(dst, 0));
+                }
                 Ok(local.ty)
             }
+            ExprKind::List(items) => {
+                self.a.mov_imm64(RCX, items.len() as i64);
+                self.call_rt("list_new");
+                let slot = self.push_spill();
+                self.a.store(slot, RAX);
+                for (i, item) in items.iter().enumerate() {
+                    let ty = self.eval(item, dst)?;
+                    self.expect_int(ty, item.span)?;
+                    self.a.load(RAX, slot);
+                    self.a.store(M(RAX, ELEMENTS + 8 * i as i32), dst);
+                }
+                self.a.load(dst, slot);
+                self.spill_depth -= 1;
+                self.a.store_imm(M(dst, LENGTH), items.len() as i32);
+                Ok(Ty::List)
+            }
+            ExprKind::Index(list, index) => {
+                if let Some(local) = self.list_var(list) {
+                    // Read in place: the variable keeps the list alive.
+                    if self.eval(index, dst)? != Ty::Int {
+                        return unsupported("an index that is not an Int", index.span);
+                    }
+                    let l = self.reg(local.loc, RCX);
+                    let stub = self.bounds_stub(l, dst, e.span);
+                    self.a.alu_m(0x3B, dst, M(l, LENGTH));
+                    // Unsigned, so that a negative index is out of bounds too.
+                    self.a.jcc(CC_AE, stub);
+                    self.element(0x8B, dst, l, dst);
+                    return Ok(Ty::Int);
+                }
+                self.owned_list(list, dst)?;
+                let slot = self.push_spill();
+                self.a.store(slot, dst);
+                if self.eval(index, dst)? != Ty::Int {
+                    return unsupported("an index that is not an Int", index.span);
+                }
+                self.a.load(RCX, slot);
+                self.spill_depth -= 1;
+                let stub = self.bounds_stub(RCX, dst, e.span);
+                self.a.alu_m(0x3B, dst, M(RCX, LENGTH));
+                self.a.jcc(CC_AE, stub);
+                self.element(0x8B, dst, RCX, dst);
+                self.release_keeping(dst);
+                Ok(Ty::Int)
+            }
+            ExprKind::MethodCall { recv, name, name_span, args } => self.method(recv, name, *name_span, args, dst),
             ExprKind::Unary(UnOp::Neg, x) => {
                 if self.eval(x, dst)? != Ty::Int {
                     return unsupported("negating anything but an Int", e.span);
@@ -832,6 +1375,7 @@ impl Native<'_> {
                 self.cond(cond, otherwise)?;
                 let then_ty = self.block(then, dst)?;
                 let Some(els) = els else {
+                    self.discard(then_ty, then.span)?;
                     self.a.bind(otherwise);
                     return Ok(Ty::Unit);
                 };
@@ -843,19 +1387,24 @@ impl Native<'_> {
             }
             ExprKind::Block(b) => self.block(b, dst),
             ExprKind::Return(value) => {
+                let mut keep = None;
                 if let Some(v) = value {
                     let ty = self.eval(v, dst)?;
                     if self.ret != Ty::Unit && ty != Ty::Never {
                         self.a.mov_rr(RAX, dst);
+                        keep = Some(RAX);
                     }
                 }
+                // The parameters (scope 0) are released at the common exit.
+                self.release_scopes(1, keep);
                 self.a.jmp(self.epilogue);
                 Ok(Ty::Never)
             }
             ExprKind::Break | ExprKind::Continue => {
-                let Some((exit, next)) = self.loops.last().copied() else {
+                let Some((exit, next, outside)) = self.loops.last().copied() else {
                     return unsupported("`break` outside a loop", e.span);
                 };
+                self.release_scopes(outside, None);
                 self.a.jmp(if matches!(e.kind, ExprKind::Break) { exit } else { next });
                 Ok(Ty::Never)
             }
@@ -874,7 +1423,8 @@ impl Native<'_> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
                 // Compute in rax so that both operands survive for the error message.
-                let stub = self.overflow_stub(op, a, b, span);
+                // The runtime computes addresses and sizes, which are known to fit.
+                let stub = if self.in_runtime { None } else { Some(self.overflow_stub(op, a, b, span)) };
                 self.load_opnd(RAX, a);
                 match b {
                     Opnd::Imm(n) => self.a.int_op_imm(op, n),
@@ -885,7 +1435,9 @@ impl Native<'_> {
                         _ => self.a.imul_rr(RAX, r),
                     },
                 }
-                self.a.jcc(CC_O, stub);
+                if let Some(stub) = stub {
+                    self.a.jcc(CC_O, stub);
+                }
             }
             _ => {
                 self.load_opnd(RAX, a);
@@ -950,18 +1502,21 @@ impl Native<'_> {
             ExprKind::Binary(op, l, r) if op.is_comparison() => {
                 // A variable in a register can be compared where it is.
                 let direct = match (self.simple(l), self.simple(r)) {
-                    (Some((Opnd::Reg(reg), _)), Some((b, _))) => Some((reg, b)),
+                    (Some((Opnd::Reg(reg), lt)), Some((b, rt))) => Some((reg, b, lt, rt)),
                     _ => None,
                 };
-                let (left, b, temp, spilled, owned) = match direct {
-                    Some((reg, b)) => (Opnd::Reg(reg), b, None, false, None),
+                let (left, b, temp, spilled, owned, lt, rt) = match direct {
+                    Some((reg, b, lt, rt)) => (Opnd::Reg(reg), b, None, false, None, lt, rt),
                     None => {
                         let t = self.take_temp(e.span)?;
-                        self.eval(l, t)?;
-                        let (a, b, _, temp, spilled) = self.operands(t, r)?;
-                        (a, b, temp, spilled, Some(t))
+                        let lt = self.eval(l, t)?;
+                        let (a, b, rt, temp, spilled) = self.operands(t, r)?;
+                        (a, b, temp, spilled, Some(t), lt, rt)
                     }
                 };
+                if lt == Ty::List || rt == Ty::List {
+                    return unsupported("comparing lists", e.span);
+                }
                 self.load_opnd(RAX, left);
                 match b {
                     Opnd::Imm(n) => self.a.alu_imm(7, RAX, n),
@@ -990,7 +1545,11 @@ impl Native<'_> {
         if name == "print" {
             return self.print(&args[0]);
         }
-        let Some(info) = self.fns.get(name) else {
+        if self.in_runtime && name.starts_with("__") {
+            return self.intrinsic(name, args, dst, span);
+        }
+        let key = if self.in_runtime { format!("%{name}") } else { name.to_string() };
+        let Some(info) = self.fns.get(&key) else {
             return unsupported(format!("the function `{name}`"), span);
         };
         if info.params.len() != args.len() {
@@ -1032,6 +1591,198 @@ impl Native<'_> {
         Ok(ret)
     }
 
+    /// Direct access to memory, for `runtime.yui` only.
+    fn intrinsic(&mut self, name: &str, args: &[Expr], dst: u8, span: Span) -> R<Ty> {
+        match (name, args) {
+            ("__load", [address]) => {
+                self.eval(address, dst)?;
+                self.a.load(dst, M(dst, 0));
+                Ok(Ty::Int)
+            }
+            ("__store", [address, value]) => {
+                self.eval(address, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, value)?;
+                self.load_opnd(RCX, a);
+                self.load_opnd(RAX, b);
+                self.a.store(M(RCX, 0), RAX);
+                self.release(temp, spilled);
+                Ok(Ty::Unit)
+            }
+            ("__alloc", [bytes]) => {
+                self.eval(bytes, dst)?;
+                self.a.mov_rr(RCX, dst);
+                self.call_label(self.rt_alloc);
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            ("__realloc", [block, bytes]) => {
+                self.eval(block, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, bytes)?;
+                self.load_opnd(RCX, a);
+                self.load_opnd(RDX, b);
+                self.release(temp, spilled);
+                self.call_label(self.rt_realloc);
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            ("__free", [block]) => {
+                self.eval(block, dst)?;
+                self.a.mov_rr(RCX, dst);
+                self.call_label(self.rt_free);
+                Ok(Ty::Unit)
+            }
+            _ => unsupported(format!("the intrinsic `{name}`"), span),
+        }
+    }
+
+    /// A method of a list.
+    fn method(&mut self, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        match (name, args) {
+            ("len", []) => {
+                if let Some(local) = self.list_var(recv) {
+                    let l = self.reg(local.loc, RCX);
+                    self.a.load(dst, M(l, LENGTH));
+                } else {
+                    self.owned_list(recv, dst)?;
+                    self.a.mov_rr(RCX, dst);
+                    self.a.load(dst, M(RCX, LENGTH));
+                    self.release_keeping(dst);
+                }
+                Ok(Ty::Int)
+            }
+            ("push", [item]) => {
+                self.owned_list(recv, dst)?;
+                let slot = self.push_spill();
+                self.a.store(slot, dst);
+                let ty = self.eval(item, dst)?;
+                self.expect_int(ty, item.span)?;
+                self.a.mov_rr(RDX, dst);
+                self.a.load(RCX, slot);
+                self.spill_depth -= 1;
+                self.call_rt("list_push");
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::List)
+            }
+            ("map" | "filter" | "any" | "all", [f]) => self.list_loop(recv, name, name_span, None, f, dst),
+            ("fold", [start, f]) => self.list_loop(recv, name, name_span, Some(start), f, dst),
+            _ => unsupported(format!("the method `{name}`"), name_span),
+        }
+    }
+
+    /// `recv.map(|x| ...)` and its relatives, as a loop with the closure's body inside.
+    fn list_loop(&mut self, recv: &Expr, name: &str, name_span: Span, start: Option<&Expr>, f: &Expr, dst: u8) -> R<Ty> {
+        let arity = 1 + start.is_some() as usize;
+        let (params, body) = match &f.kind {
+            ExprKind::Closure { params, body, .. } if params.len() == arity && !crate::bytecode::can_return(body) => {
+                (params, body)
+            }
+            _ => return unsupported("a function passed as a value", f.span),
+        };
+        let outer = self.fresh_temps(dst);
+        let id = name_span.start;
+        let (pos, out) = (self.decl_loc[&(id, POS)], self.decl_loc[&(id, OUT)]);
+        let item = self.decl_loc[&(params[arity - 1].span.start, VAR)];
+        // A list held by a variable is walked where it is: the closure cannot
+        // assign to that variable. Any other list is this loop's to release.
+        let (list, owned) = match self.list_var(recv) {
+            Some(local) => (local.loc, false),
+            None => {
+                let list = self.decl_loc[&(id, LIST)];
+                if self.eval_into(recv, list, true)? != Ty::List {
+                    return unsupported(format!("`{name}` on anything but a list of Ints"), recv.span);
+                }
+                (list, true)
+            }
+        };
+        let mut scope = HashMap::from([(params[arity - 1].name.clone(), Local { ty: Ty::Int, loc: item })]);
+        let result = match (name, start) {
+            ("fold", Some(start)) => {
+                let ty = self.eval_into(start, out, false)?;
+                if !matches!(ty, Ty::Int | Ty::Bool) {
+                    return unsupported("`fold` to anything but an Int or a Bool", start.span);
+                }
+                scope.insert(params[0].name.clone(), Local { ty, loc: out });
+                ty
+            }
+            ("map" | "filter", _) => {
+                // Room for every item, so that the loop never has to grow the result.
+                let l = self.reg(list, RAX);
+                self.a.load(RCX, M(l, LENGTH));
+                self.call_rt("list_new");
+                self.store_loc(out, RAX);
+                Ty::List
+            }
+            _ => {
+                self.set_loc(out, (name == "all") as i32);
+                Ty::Bool
+            }
+        };
+        self.set_loc(pos, 0);
+        let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.bind(top);
+        self.next_item(list, pos, item, exit);
+        self.scopes.push(scope);
+        match name {
+            "map" | "fold" => {
+                let t = self.take_temp(body.span)?;
+                let ty = self.eval(body, t)?;
+                if ty != (if name == "map" { Ty::Int } else { result }) {
+                    return unsupported("this closure", body.span);
+                }
+                if name == "map" {
+                    let o = self.reg(out, RCX);
+                    let p = self.reg(pos, RAX);
+                    self.element(0x89, t, o, p);
+                } else {
+                    self.store_loc(out, t);
+                }
+                self.free.push(t);
+            }
+            // The rest only branch on what the closure says.
+            "filter" => {
+                self.cond(body, next)?;
+                let o = self.reg(out, RCX);
+                self.a.load(RAX, M(o, LENGTH));
+                let x = self.reg(item, RDX);
+                self.element(0x89, x, o, RAX);
+                self.a.inc_mem(M(o, LENGTH));
+            }
+            "any" => {
+                // Stops at the first true.
+                self.cond(body, next)?;
+                self.set_loc(out, 1);
+                self.a.jmp(exit);
+            }
+            _ => {
+                // `all` stops at the first false.
+                let no = self.a.label();
+                self.cond(body, no)?;
+                self.a.jmp(next);
+                self.a.bind(no);
+                self.set_loc(out, 0);
+                self.a.jmp(exit);
+            }
+        }
+        self.scopes.pop();
+        self.a.bind(next);
+        self.step(pos);
+        self.a.jmp(top);
+        self.a.bind(exit);
+        if name == "map" {
+            let l = self.reg(list, RAX);
+            self.a.load(RAX, M(l, LENGTH));
+            let o = self.reg(out, RCX);
+            self.a.store(M(o, LENGTH), RAX);
+        }
+        if owned {
+            self.load_loc(RCX, list);
+            self.call_rt("list_release");
+        }
+        self.free = outer;
+        self.load_loc(dst, out);
+        Ok(result)
+    }
+
     /// `print("text {value} ...")`: writes each piece, then a line break.
     fn print(&mut self, arg: &Expr) -> R<Ty> {
         let ExprKind::Str(parts) = &arg.kind else {
@@ -1040,7 +1791,7 @@ impl Native<'_> {
         for part in parts {
             match part {
                 StrPart::Lit(text) if text.is_empty() => {}
-                StrPart::Lit(text) => self.write(text.as_bytes()),
+                StrPart::Lit(text) => self.write(text.as_bytes(), STDOUT),
                 StrPart::Expr(value) => {
                     let outer = std::mem::replace(&mut self.free, TEMPS[1..].to_vec());
                     let t = TEMPS[0];
@@ -1072,15 +1823,15 @@ impl Native<'_> {
                 }
             }
         }
-        self.write(b"\n");
+        self.write(b"\n", STDOUT);
         Ok(Ty::Unit)
     }
 
-    fn write(&mut self, bytes: &[u8]) {
+    fn write(&mut self, bytes: &[u8], to: i64) {
         let text = self.constant(bytes);
         self.lea_label(RCX, text);
         self.a.mov_imm64(RDX, bytes.len() as i64);
-        self.a.mov_imm64(R8, STDOUT);
+        self.a.mov_imm64(R8, to);
         self.call_label(self.rt_write);
     }
 }
@@ -1091,7 +1842,7 @@ fn mentions(e: &Expr, name: &str) -> bool {
         ExprKind::Ident(n) => n == name,
         ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit => false,
         ExprKind::Unary(_, x) => mentions(x, name),
-        ExprKind::Binary(_, l, r) => mentions(l, name) || mentions(r, name),
+        ExprKind::Binary(_, l, r) | ExprKind::Index(l, r) => mentions(l, name) || mentions(r, name),
         _ => true,
     }
 }
@@ -1105,7 +1856,9 @@ fn align(n: usize, to: usize) -> usize {
 /// Wraps machine code in a Windows executable (PE32+): headers, one section
 /// of code and constants, and one section with the import table.
 /// `iat_fixups` are the places in the code that call imported functions.
-fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)]) -> Vec<u8> {
+/// `bss_fixups` are the places that refer to writable memory; if there are
+/// any, a third section provides a page of it, zeroed by the loader.
+fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usize, usize)]) -> Vec<u8> {
     const FILE_ALIGN: usize = 0x200;
     const SECTION_ALIGN: usize = 0x1000;
     const IMAGE_BASE: u64 = 0x1_4000_0000;
@@ -1147,9 +1900,16 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)]) -> Vec<u8> {
         code[*at..*at + 4].copy_from_slice(&rel.to_le_bytes());
     }
 
+    let bss_rva = idata_rva + align(idata.len(), SECTION_ALIGN);
+    let bss_size = if bss_fixups.is_empty() { 0 } else { SECTION_ALIGN };
+    for (at, offset) in bss_fixups {
+        let rel = ((bss_rva + offset) as i64 - (text_rva + at + 4) as i64) as i32;
+        code[*at..*at + 4].copy_from_slice(&rel.to_le_bytes());
+    }
+
     let text_raw = align(code.len(), FILE_ALIGN);
     let idata_raw = align(idata.len(), FILE_ALIGN);
-    let image_size = idata_rva + align(idata.len(), SECTION_ALIGN);
+    let image_size = bss_rva + bss_size;
 
     let mut out = Vec::new();
     let u16le = |out: &mut Vec<u8>, v: u16| out.extend(v.to_le_bytes());
@@ -1163,7 +1923,7 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)]) -> Vec<u8> {
     out.extend(b"PE\0\0");
     // COFF header.
     u16le(&mut out, 0x8664); // x64
-    u16le(&mut out, 2); // sections
+    u16le(&mut out, 2 + (bss_size != 0) as u16); // sections
     u32le(&mut out, 0);
     u32le(&mut out, 0);
     u32le(&mut out, 0);
@@ -1219,6 +1979,9 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)]) -> Vec<u8> {
     };
     section(&mut out, b".text\0\0\0", code.len(), text_rva, text_raw, HEADERS, 0x6000_0020);
     section(&mut out, b".idata\0\0", idata.len(), idata_rva, idata_raw, HEADERS + text_raw, 0xC000_0040);
+    if bss_size != 0 {
+        section(&mut out, b".bss\0\0\0\0", bss_size, bss_rva, 0, 0, 0xC000_0080);
+    }
     out.resize(HEADERS, 0);
     out.extend(&code);
     out.resize(HEADERS + text_raw, 0);

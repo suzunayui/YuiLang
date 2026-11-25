@@ -1,0 +1,13 @@
+fn build(n: Int) -> List<Int> {
+  let mut out = []
+  for i in 0..n {
+    out = out.push(i * i)
+  }
+  out
+}
+
+fn main() uses io {
+  let n = 4
+  print("{build(n)[n - 1]}")
+  print("{build(n)[n - 5]}")
+}

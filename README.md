@@ -90,7 +90,7 @@ error: division by zero
 ```
 
 実験的な機能として、`--native` を付けると、インタプリタを含まない実行ファイルを機械語から直接作れます。
-いまは Windows x64 で、`Int` と `Bool` だけを使うプログラムが対象です（数 KB になります）。
+いまは Windows x64 で、`Int`・`Bool`・`List<Int>` だけを使うプログラムが対象です（数 KB になります）。
 設計と進み具合は [docs/native-backend.md](docs/native-backend.md) にあります。
 
 エラーは修正のヒント付きで表示されます。

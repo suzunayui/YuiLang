@@ -322,7 +322,17 @@ fn native_executables_match_yui_run() {
         let exe = out_dir.join(path.file_stem().unwrap()).with_extension("exe");
         // Both run from the program's directory, so error messages name the file the same way.
         let expected = Command::new(yui).current_dir(&dir).arg("run").arg(name).output().unwrap();
-        let built = Command::new(yui).current_dir(&dir).args(["build", "--native"]).arg(name).arg("-o").arg(&exe).output().unwrap();
+        // Built to count its heap blocks: one that is still allocated when `main`
+        // returns is reported on stderr, which then differs from `yui run`.
+        let built = Command::new(yui)
+            .current_dir(&dir)
+            .env("YUI_NATIVE_CHECK_HEAP", "1")
+            .args(["build", "--native"])
+            .arg(name)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
         assert!(built.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&built.stderr));
         let actual = Command::new(&exe).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout), "{}", path.display());

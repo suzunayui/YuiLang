@@ -29,6 +29,9 @@ pub struct TypeInfo {
     pub int_ops: std::collections::HashSet<(usize, usize)>,
     /// Functions that return `Int`, by name.
     pub int_fns: std::collections::HashSet<String>,
+    /// The type of every declared variable, written as in source (`List<Int>`),
+    /// by the start of the span it is declared at.
+    pub var_types: std::collections::HashMap<usize, String>,
     /// For each field access `a.b`, by span: the position of the field in its struct.
     pub field_index: std::collections::HashMap<(usize, usize), u32>,
 }

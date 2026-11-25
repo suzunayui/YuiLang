@@ -132,6 +132,7 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
         if c.apply(ty) == Type::Int {
             info.int_vars.insert(*at);
         }
+        info.var_types.insert(*at, c.show(ty));
     }
     for (at, ty) in &c.op_types {
         if c.apply(ty) == Type::Int {
