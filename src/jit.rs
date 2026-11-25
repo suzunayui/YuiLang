@@ -44,6 +44,8 @@ pub const FIRST_HEAP_TAG: u8 = 4;
 pub const TAG_LIST: u8 = 5;
 pub const TAG_FN: u8 = 9;
 pub const TAG_CLOSURE: u8 = 10;
+/// A list of Ints stored as plain 8-byte numbers. Its `Vec` is laid out like a `List`'s.
+pub const TAG_INTS: u8 = 11;
 /// A reference-counted block holds the strong count, the weak count and then the data.
 pub const RC_DATA: i32 = 16;
 /// Offsets inside `Stack`: the top and end of the value stack, and the top
@@ -436,6 +438,25 @@ impl Asm {
         self.b(0x48 | (reg >> 3) << 2 | (rm >> 3));
         self.b(opcode);
         self.b(0xC0 | (reg & 7) << 3 | (rm & 7));
+    }
+
+    /// `mov dst, [base + index * 8]` for the low eight registers.
+    fn load_scaled8(&mut self, dst: u8, base: u8, index: u8) {
+        self.buf.extend_from_slice(&[0x48, 0x8B, 0x04 | dst << 3, 0xC0 | index << 3 | base]);
+    }
+
+    /// `mov [base + index * 8], src` for the low eight registers.
+    fn store_scaled8(&mut self, base: u8, index: u8, src: u8) {
+        self.buf.extend_from_slice(&[0x48, 0x89, 0x04 | src << 3, 0xC0 | index << 3 | base]);
+    }
+
+    /// Jumps to `ok` for a list, falls through for a packed list of Ints, and
+    /// jumps to `slow` for anything else.
+    fn expect_list(&mut self, m: M, ok: usize, slow: usize) {
+        self.cmp_byte(m, TAG_LIST);
+        self.jcc(CC_E, ok);
+        self.cmp_byte(m, TAG_INTS);
+        self.jcc(CC_NE, slow);
     }
 
     /// `imul dst, src`
@@ -1437,8 +1458,9 @@ impl Gen<'_> {
                 let target = self.ops[target as usize];
                 let vec_len = RC_DATA + self.helpers.vec_len;
                 let (slow, resume) = self.stub(pc, Some(target));
-                self.a.cmp_byte(slot(s), TAG_LIST);
-                self.a.jcc(CC_NE, slow);
+                let (checked, packed) = (self.a.label(), self.a.label());
+                self.a.expect_list(slot(s), checked, slow);
+                self.a.bind(checked);
                 self.expect_int(slot(s + 1), slow);
                 // The previous item is overwritten, so it must not need dropping.
                 self.a.cmp_byte(slot(s + 2), FIRST_HEAP_TAG);
@@ -1447,17 +1469,29 @@ impl Gen<'_> {
                 self.a.load(RCX, slot(s + 1).at(8));
                 self.a.alu_m(0x3B, RCX, M(RDX, vec_len));
                 self.a.jcc(CC_AE, target);
+                self.a.cmp_byte(slot(s), TAG_INTS);
+                self.a.jcc(CC_E, packed);
                 self.list_item();
+                let vec_ptr = RC_DATA + self.helpers.vec_ptr;
                 let a = &mut self.a;
                 a.copy_value(M(RDX, 0), slot(s + 2), true);
+                a.inc_mem(slot(s + 1).at(8));
+                a.jmp(resume);
+                // A packed list: the item is a plain number.
+                a.bind(packed);
+                a.load(RDX, M(RDX, vec_ptr));
+                a.load_scaled8(RAX, RDX, RCX);
+                a.store_imm(slot(s + 2), TAG_INT as i32);
+                a.store(slot(s + 2).at(8), RAX);
                 a.inc_mem(slot(s + 1).at(8));
                 a.bind(resume);
             }
             Op::Index => {
                 let vec_len = RC_DATA + self.helpers.vec_len;
                 let (slow, resume) = self.stub(pc, None);
-                self.a.cmp_byte(top(2), TAG_LIST);
-                self.a.jcc(CC_NE, slow);
+                let (checked, packed) = (self.a.label(), self.a.label());
+                self.a.expect_list(top(2), checked, slow);
+                self.a.bind(checked);
                 self.expect_int(top(1), slow);
                 // The list on the stack is dropped, which must not free it.
                 self.a.load(RDX, top(2).at(8));
@@ -1467,9 +1501,19 @@ impl Gen<'_> {
                 self.a.alu_m(0x3B, RCX, M(RDX, vec_len));
                 self.a.jcc(CC_AE, slow);
                 self.a.dec_mem(M(RDX, 0));
+                self.a.cmp_byte(top(2), TAG_INTS);
+                self.a.jcc(CC_E, packed);
                 self.list_item();
+                let vec_ptr = RC_DATA + self.helpers.vec_ptr;
                 let a = &mut self.a;
                 a.copy_value(M(RDX, 0), top(2), true);
+                a.alu_imm(5, R13, V);
+                a.jmp(resume);
+                a.bind(packed);
+                a.load(RDX, M(RDX, vec_ptr));
+                a.load_scaled8(RAX, RDX, RCX);
+                a.store_imm(top(2), TAG_INT as i32);
+                a.store(top(2).at(8), RAX);
                 a.alu_imm(5, R13, V);
                 a.bind(resume);
             }
@@ -1482,8 +1526,12 @@ impl Gen<'_> {
                 );
                 let (slow, resume) = self.stub(pc, None);
                 let a = &mut self.a;
-                a.cmp_byte(slot(s), TAG_LIST);
+                let (checked, packed, pushed, not_first) = (a.label(), a.label(), a.label(), a.label());
+                a.expect_list(slot(s), checked, slow);
+                // Only an Int goes into a packed list as it is.
+                a.cmp_byte(top(1), TAG_INT);
                 a.jcc(CC_NE, slow);
+                a.bind(checked);
                 a.load(RDX, slot(s).at(8));
                 a.cmp_imm(M(RDX, 0), 1);
                 a.jcc(CC_NE, slow);
@@ -1492,10 +1540,25 @@ impl Gen<'_> {
                 a.load(RCX, M(RDX, vec_len));
                 a.alu_m(0x3B, RCX, M(RDX, vec_cap));
                 a.jcc(CC_AE, slow);
+                a.cmp_byte(slot(s), TAG_INTS);
+                a.jcc(CC_E, packed);
+                // The first Int pushed onto an empty list makes it a packed
+                // list; the interpreter does that.
+                a.alu_rr(0x85, RCX, RCX);
+                a.jcc(CC_NE, not_first);
+                a.cmp_byte(top(1), TAG_INT);
+                a.jcc(CC_E, slow);
+                a.bind(not_first);
                 a.mov_rr(RSI, RCX);
                 a.imul_imm(RSI, V);
                 a.alu_m(0x03, RSI, M(RDX, vec_ptr));
                 a.copy_value(top(1), M(RSI, 0), false);
+                a.jmp(pushed);
+                a.bind(packed);
+                a.load(RSI, M(RDX, vec_ptr));
+                a.load(RAX, top(1).at(8));
+                a.store_scaled8(RSI, RCX, RAX);
+                a.bind(pushed);
                 a.alu_imm(0, RCX, 1);
                 a.store(M(RDX, vec_len), RCX);
                 a.alu_imm(5, R13, V);

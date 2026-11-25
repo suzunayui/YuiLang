@@ -1,0 +1,7 @@
+// expect: E0505
+test "index past a list of integers" {
+  let mut xs = [1, 2, 3]
+  let i = 3
+  xs[i] = 0
+  assert xs == [1, 2, 3]
+}

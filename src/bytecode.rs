@@ -656,6 +656,14 @@ impl<'g> Compiler<'g> {
     /// `map`, `filter`, `fold`, `any` and `all` exist only on lists, so they
     /// are compiled as loops that call the function once per item. The
     /// machine then runs them like any other loop, without re-entering itself.
+    ///
+    /// When the function is a closure written in place, there is no call at
+    /// all: its body becomes the body of the loop, with its parameters naming
+    /// the loop's own slots. That is the same computation, because a closure
+    /// cannot assign to the variables it captures; they keep the values they
+    /// had when the closure would have been created. A body that can return
+    /// early (`return` or `?`) is still called, since that return must leave
+    /// the closure, not the surrounding function.
     fn list_loop(&mut self, recv: &Expr, name: &str, args: &[Expr], span: Span) -> bool {
         let arity = match name {
             "map" | "filter" | "any" | "all" => 1,
@@ -665,11 +673,20 @@ impl<'g> Compiler<'g> {
         if args.len() != arity {
             return false;
         }
+        let inline = match &args[arity - 1].kind {
+            ExprKind::Closure { params, body, .. } if params.len() == arity && !can_return(body) => {
+                Some((params, body))
+            }
+            _ => None,
+        };
+        // The item is the closure's last parameter; if that is an `Int`, so is the slot.
+        let item_int =
+            inline.is_some_and(|(params, _)| self.g.types.int_vars.contains(&params[arity - 1].span.start));
         self.push_scope();
         // `ForList` expects the list, the position and the item in adjacent slots.
         let list = self.alloc();
         let pos = self.alloc();
-        let item = self.alloc();
+        let item = self.alloc_kind(item_int);
         let func = self.alloc();
         // The result so far: the output list, the accumulator or the answer.
         let out = self.alloc();
@@ -680,8 +697,10 @@ impl<'g> Compiler<'g> {
             self.expr(&args[0]);
             self.emit(Op::Store(out), span);
         }
-        self.expr(&args[arity - 1]);
-        self.emit(Op::Store(func), span);
+        if inline.is_none() {
+            self.expr(&args[arity - 1]);
+            self.emit(Op::Store(func), span);
+        }
         let initial = match name {
             "map" => Some(Op::NewListFor(list)),
             "filter" => Some(Op::MakeList(0)),
@@ -698,13 +717,26 @@ impl<'g> Compiler<'g> {
 
         let top = self.here();
         let exit = self.emit(Op::ForList(list, NONE), span);
-        if name == "fold" {
-            // Taking the accumulator keeps it unshared, so the function may update it in place.
-            self.emit(Op::Take(out), span);
+        match inline {
+            Some((params, body)) => {
+                self.push_scope();
+                if name == "fold" {
+                    self.bind(&params[0].name, out);
+                }
+                self.bind(&params[arity - 1].name, item);
+                self.expr(body);
+                self.pop_scope();
+            }
+            None => {
+                if name == "fold" {
+                    // Taking the accumulator keeps it unshared, so the function may update it in place.
+                    self.emit(Op::Take(out), span);
+                }
+                self.emit(Op::Load(item), span);
+                self.emit(Op::Load(func), span);
+                self.emit(Op::CallValue(arity as u32), span);
+            }
         }
-        self.emit(Op::Load(item), span);
-        self.emit(Op::Load(func), span);
-        self.emit(Op::CallValue(arity as u32), span);
         match name {
             "map" => {
                 self.emit(Op::InPlace(out, NONE, InPlace::Push), span);
@@ -738,6 +770,10 @@ impl<'g> Compiler<'g> {
         self.patch_here(exit);
         // Release what the loop held, so that later updates need no copy.
         for slot in [list, item, func] {
+            // An `Int` slot holds nothing to release, and must only hold Ints.
+            if slot == item && item_int {
+                continue;
+            }
             self.emit(Op::Unit, span);
             self.emit(Op::Store(slot), span);
         }
@@ -1061,6 +1097,53 @@ impl<'g> Compiler<'g> {
             }
         }
     }
+}
+
+/// Whether evaluating `e` can leave the function it is in early, through
+/// `return` or `?`.
+fn can_return(e: &Expr) -> bool {
+    let any = |es: &[Expr]| es.iter().any(can_return);
+    match &e.kind {
+        ExprKind::Return(_) | ExprKind::Try(_) => true,
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Ident(_)
+        | ExprKind::FnRef(_)
+        | ExprKind::Break
+        | ExprKind::Continue => false,
+        ExprKind::Str(parts) => parts.iter().any(|p| matches!(p, StrPart::Expr(x) if can_return(x))),
+        ExprKind::List(items) => any(items),
+        ExprKind::MapLit(entries) => entries.iter().any(|(k, v)| can_return(k) || can_return(v)),
+        ExprKind::Unary(_, x) => can_return(x),
+        ExprKind::Binary(_, l, r) => can_return(l) || can_return(r),
+        ExprKind::Call { args, .. } => any(args),
+        ExprKind::MethodCall { recv, args, .. } => can_return(recv) || any(args),
+        ExprKind::Field(base, _, _) => can_return(base),
+        ExprKind::Index(base, index) => can_return(base) || can_return(index),
+        ExprKind::StructLit { fields, .. } => fields.iter().any(|(_, _, v)| can_return(v)),
+        ExprKind::Ctor { args, .. } => any(args),
+        ExprKind::If { cond, then, els } => {
+            can_return(cond) || block_can_return(then) || els.as_deref().is_some_and(can_return)
+        }
+        ExprKind::Match { scrutinee, arms } => can_return(scrutinee) || arms.iter().any(|a| can_return(&a.body)),
+        ExprKind::Block(b) => block_can_return(b),
+        ExprKind::Closure { body, .. } => can_return(body),
+    }
+}
+
+fn block_can_return(b: &Block) -> bool {
+    b.stmts.iter().any(|s| match s {
+        Stmt::Let { value, .. } => can_return(value),
+        Stmt::Assign { target, value } => can_return(target) || can_return(value),
+        Stmt::While { cond, body, .. } => can_return(cond) || block_can_return(body),
+        Stmt::For { iter, end, body, .. } => {
+            can_return(iter) || end.as_ref().is_some_and(can_return) || block_can_return(body)
+        }
+        Stmt::Assert { cond, .. } => can_return(cond),
+        Stmt::Expr(e) => can_return(e),
+    })
 }
 
 fn small_int(e: &Expr) -> Option<i32> {

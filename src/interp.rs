@@ -35,6 +35,23 @@ pub enum Value {
     Enum(Rc<EnumVal>) = 8,
     Fn(Rc<Func>) = 9,
     Closure(Rc<ClosureVal>) = 10,
+    /// A list holding nothing but Ints, stored as plain numbers: a third of
+    /// the memory of `List`. It is the same list as far as programs can tell;
+    /// it turns into a `List` when something else is put into it.
+    Ints(Rc<Vec<i64>>) = 11,
+}
+
+/// The items of a packed list as ordinary values.
+fn unpack(ints: &[i64]) -> Vec<Value> {
+    ints.iter().map(|n| Value::Int(*n)).collect()
+}
+
+/// `v`, with a packed list turned into an ordinary one.
+fn unpacked(v: Value) -> Value {
+    match v {
+        Value::Ints(ints) => Value::List(Rc::new(unpack(&ints))),
+        other => other,
+    }
 }
 
 /// Map keys are restricted to types with a simple total order.
@@ -81,6 +98,10 @@ impl PartialEq for Value {
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::Unit, Value::Unit) => true,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Ints(a), Value::Ints(b)) => a == b,
+            (Value::Ints(a), Value::List(b)) | (Value::List(b), Value::Ints(a)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| matches!(y, Value::Int(n) if n == x))
+            }
             (Value::Map(a), Value::Map(b)) => a == b,
             (Value::Struct(a), Value::Struct(b)) => a == b,
             (Value::Enum(a), Value::Enum(b)) => a == b,
@@ -133,6 +154,11 @@ impl Value {
     }
 
     fn list(items: Vec<Value>) -> Value {
+        // A list of nothing but Ints is stored as plain numbers.
+        if !items.is_empty() && items.iter().all(|v| matches!(v, Value::Int(_))) {
+            let ints = items.iter().map(|v| if let Value::Int(n) = v { *n } else { 0 }).collect();
+            return Value::Ints(Rc::new(ints));
+        }
         Value::List(Rc::new(items))
     }
 
@@ -187,6 +213,9 @@ impl Value {
             Value::Str(s) => format!("{:?}", &**s),
             Value::Unit => "()".to_string(),
             Value::List(items) => format!("[{}]", join(items)),
+            Value::Ints(items) => {
+                format!("[{}]", items.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", "))
+            }
             Value::Map(entries) => {
                 if entries.is_empty() {
                     return "Map {}".to_string();
@@ -372,6 +401,11 @@ fn field_mut<'v>(value: &'v mut Value, name: &str, span: Span) -> R<&'v mut Valu
 
 /// Mutable access to `value[index]` for an existing element.
 fn element_mut(value: &mut Value, index: Value, span: Span) -> R<&mut Value> {
+    // A packed list has no `Value` to point at.
+    if let Value::Ints(ints) = value {
+        let items = unpack(ints);
+        *value = Value::List(Rc::new(items));
+    }
     match (value, index) {
         (Value::List(items), Value::Int(i)) => {
             let len = items.len();
@@ -396,6 +430,14 @@ fn store_index(value: &mut Value, index: Value, v: Value, span: Span) -> R<()> {
     if let Value::Map(entries) = value {
         let key = to_key(&index, span)?;
         Rc::make_mut(entries).insert(key, v);
+        return Ok(());
+    }
+    if let (Value::Ints(ints), Value::Int(i), Value::Int(n)) = (&mut *value, &index, &v) {
+        let len = ints.len();
+        if *i < 0 || *i as usize >= len {
+            return Err(out_of_bounds(*i, len, span));
+        }
+        Rc::make_mut(ints)[*i as usize] = *n;
         return Ok(());
     }
     *element_mut(value, index, span)? = v;
@@ -1051,6 +1093,7 @@ impl<'a> Interp<'a> {
             Op::NewListFor(slot) => {
                 let room = match &self.stack[base + slot as usize] {
                     Value::List(items) => items.len(),
+                    Value::Ints(items) => items.len(),
                     _ => 0,
                 };
                 self.stack.push(Value::list(Vec::with_capacity(room)));
@@ -1098,6 +1141,12 @@ impl<'a> Interp<'a> {
                             return Err(out_of_bounds(i, items.len(), span!()));
                         }
                         items[i as usize].clone()
+                    }
+                    (Value::Ints(items), Value::Int(i)) => {
+                        if i < 0 || i as usize >= items.len() {
+                            return Err(out_of_bounds(i, items.len(), span!()));
+                        }
+                        Value::Int(items[i as usize])
                     }
                     (Value::Map(entries), index) => {
                         let key = to_key(&index, span!())?;
@@ -1170,6 +1219,27 @@ impl<'a> Interp<'a> {
                 let first = self.pop();
                 let path: &[PathElem] = if path == NONE { &[] } else { &func.paths[path as usize] };
                 let place = fields_mut(&mut self.stack[base + slot as usize], path, span)?;
+                if kind == InPlace::Push {
+                    if let Value::Int(n) = first {
+                        match place {
+                            Value::Ints(items) => {
+                                Rc::make_mut(items).push(n);
+                                return Ok(Flow::Next);
+                            }
+                            // The first Int pushed onto an empty list decides its representation.
+                            Value::List(items) if items.is_empty() => {
+                                let mut ints = Vec::with_capacity(items.capacity().max(4));
+                                ints.push(n);
+                                *place = Value::Ints(Rc::new(ints));
+                                return Ok(Flow::Next);
+                            }
+                            _ => {}
+                        }
+                    } else if let Value::Ints(ints) = place {
+                        let items = unpack(ints);
+                        *place = Value::List(Rc::new(items));
+                    }
+                }
                 match (place, kind) {
                     (Value::List(items), InPlace::Push) => Rc::make_mut(items).push(first),
                     (Value::Map(entries), InPlace::Set) => {
@@ -1216,6 +1286,7 @@ impl<'a> Interp<'a> {
                 let slot = base + slot as usize;
                 let item = match (&self.stack[slot], &self.stack[slot + 1]) {
                     (Value::List(items), Value::Int(i)) => items.get(*i as usize).cloned(),
+                    (Value::Ints(items), Value::Int(i)) => items.get(*i as usize).map(|n| Value::Int(*n)),
                     _ => return Err(internal(span!())),
                 };
                 match item {
@@ -1344,6 +1415,38 @@ impl<'a> Interp<'a> {
     }
 
     fn method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> R<Value> {
+        // The common methods work on a packed list directly.
+        if let Value::Ints(items) = &recv {
+            let int = |n: Option<&i64>| Value::option(n.map(|n| Value::Int(*n)));
+            match (name, args.as_slice()) {
+                ("len", []) => return Ok(Value::Int(items.len() as i64)),
+                ("is_empty", []) => return Ok(Value::Bool(items.is_empty())),
+                ("push", [Value::Int(n)]) => {
+                    let mut out = Vec::with_capacity(items.len() + 1);
+                    out.extend_from_slice(items);
+                    out.push(*n);
+                    return Ok(Value::Ints(Rc::new(out)));
+                }
+                ("get", [Value::Int(i)]) => return Ok(int(usize::try_from(*i).ok().and_then(|i| items.get(i)))),
+                ("first", []) => return Ok(int(items.first())),
+                ("last", []) => return Ok(int(items.last())),
+                ("contains", [Value::Int(n)]) => return Ok(Value::Bool(items.contains(n))),
+                ("reverse", []) => return Ok(Value::Ints(Rc::new(items.iter().rev().copied().collect()))),
+                ("sort", []) => {
+                    let mut out = items.to_vec();
+                    out.sort_unstable();
+                    return Ok(Value::Ints(Rc::new(out)));
+                }
+                ("slice", [start, end]) => {
+                    let (a, b) = slice_range(start, end, items.len(), span)?;
+                    return Ok(Value::Ints(Rc::new(items[a..b].to_vec())));
+                }
+                _ => {}
+            }
+        }
+        // Everything else works on ordinary lists.
+        let recv = unpacked(recv);
+        let args: Vec<Value> = args.into_iter().map(unpacked).collect();
         if name == "to_string" {
             return Ok(Value::str(recv.display()));
         }
@@ -1615,6 +1718,19 @@ mod native {
         Some((find(sample.as_ptr() as usize)?, find(sample.len())?, find(sample.capacity())?))
     }
 
+    /// The same measurement for `Vec<i64>`, which packed lists use.
+    fn int_vec_layout() -> Option<(i32, i32, i32)> {
+        if std::mem::size_of::<Vec<i64>>() != 24 {
+            return None;
+        }
+        let mut sample: Vec<i64> = Vec::with_capacity(7);
+        sample.extend([0, 0, 0]);
+        // Safety: a Vec is three words, as checked above.
+        let words: [usize; 3] = unsafe { std::mem::transmute_copy(&sample) };
+        let find = |wanted: usize| words.iter().position(|w| *w == wanted).map(|i| i as i32 * 8);
+        Some((find(sample.as_ptr() as usize)?, find(sample.len())?, find(sample.capacity())?))
+    }
+
     /// Generated code clones and drops heap values by adjusting the strong
     /// count their second word points at. Checks that on one value of each kind.
     fn heap_values_are_counted() -> bool {
@@ -1627,6 +1743,8 @@ mod native {
         let counts_of = |data: *const u8| data as usize - jit::RC_DATA as usize;
         let text: Rc<str> = Rc::from("x");
         let list = Rc::new(Vec::<Value>::new());
+        let ints = Rc::new(vec![7i64]);
+        let byte = |v: &Value, at: usize| unsafe { *(v as *const Value as *const u8).add(at) };
         let map = Rc::new(BTreeMap::<Key, Value>::new());
         let record = Rc::new(StructVal { name: text.clone(), fields: Vec::new() });
         let choice = Rc::new(EnumVal { enum_name: text.clone(), variant: text.clone(), args: Vec::new() });
@@ -1638,6 +1756,9 @@ mod native {
             && std::mem::offset_of!(ClosureVal, func) == 0
             && check(Value::Str(text.clone()), counts_of(Rc::as_ptr(&text) as *const u8), 4)
             && check(Value::List(list.clone()), counts_of(Rc::as_ptr(&list) as *const u8), 1)
+            && check(Value::Ints(ints.clone()), counts_of(Rc::as_ptr(&ints) as *const u8), 1)
+            && byte(&Value::Ints(ints.clone()), 0) == jit::TAG_INTS
+            && int_vec_layout() == vec_layout()
             && check(Value::Map(map.clone()), counts_of(Rc::as_ptr(&map) as *const u8), 1)
             && check(Value::Struct(record.clone()), counts_of(Rc::as_ptr(&record) as *const u8), 1)
             && check(Value::Enum(choice.clone()), counts_of(Rc::as_ptr(&choice) as *const u8), 1)

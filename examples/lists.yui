@@ -149,3 +149,115 @@ fn main() uses io {
   let shown = xs.filter(|x| x > 2).map(|x| "<{x}>")
   print(shown.join(" "))
 }
+
+fn append<T>(xs: List<T>, x: T) -> List<T> {
+  xs.push(x)
+}
+
+fn grow(n: Int) -> List<Int> {
+  let mut out = []
+  for i in 0..n {
+    out = out.push(i * i)
+  }
+  out
+}
+
+// 整数だけのリストは、処理系の中で数値を詰めた形で持たれる。見え方は普通のリストと変わらない
+test "lists of integers" {
+  let xs = [3, 0 - 1, 2]
+  assert xs.len() == 3
+  assert xs[1] == 0 - 1
+  assert xs.get(2) == Some(2)
+  assert xs.get(3) == None
+  assert xs.first() == Some(3)
+  assert xs.last() == Some(2)
+  assert xs.contains(2)
+  assert !xs.contains(7)
+  assert xs.sort() == [0 - 1, 2, 3]
+  assert xs.reverse() == [2, 0 - 1, 3]
+  assert xs.slice(1, 3) == [0 - 1, 2]
+  assert xs.concat([9, 8]) == [3, 0 - 1, 2, 9, 8]
+  assert "{xs}" == "[3, -1, 2]"
+  assert xs.to_string() == "[3, -1, 2]"
+  assert xs.map(|x| "{x}").join(",") == "3,-1,2"
+  assert "ab".codes() == [97, 98]
+}
+
+test "empty lists compare equal however they were made" {
+  let xs = [1, 2, 3]
+  let none: List<Int> = []
+  assert xs.slice(1, 1) == []
+  assert xs.slice(1, 1) == none
+  assert none == xs.filter(|x| x > 10)
+  assert xs.filter(|x| x > 10).len() == 0
+  assert xs.slice(0, 0).push(5) == [5]
+  assert xs.map(|x| x) == xs
+  assert grow(0) == []
+  assert grow(4) == [0, 1, 4, 9]
+  assert grow(1000).len() == 1000
+  assert grow(1000)[999] == 998001
+}
+
+test "updating a list of integers" {
+  let mut xs = [1, 2, 3]
+  let saved = xs
+  xs[0] = 9
+  xs = xs.push(4)
+  assert saved == [1, 2, 3]
+  assert xs == [9, 2, 3, 4]
+  let mut total = 0
+  for x in xs {
+    total = total + x
+  }
+  assert total == 18
+  let mut squares = grow(5)
+  for i in 0..squares.len() {
+    squares[i] = squares[i] + 1
+  }
+  assert squares == [1, 2, 5, 10, 17]
+}
+
+test "integers inside other lists" {
+  let rows = [[1, 2], [3], []]
+  assert rows.map(|r| r.len()) == [2, 1, 0]
+  assert rows[0][1] == 2
+  assert rows.fold(0, |acc, r| acc + r.fold(0, |a, x| a + x)) == 6
+  assert append([1, 2], 3) == [1, 2, 3]
+  assert append(["a"], "b") == ["a", "b"]
+  assert append(rows, [7]).len() == 4
+  let mut grid = [[0, 0], [0, 0]]
+  grid[1][0] = 5
+  assert grid == [[0, 0], [5, 0]]
+  let words = ["a", "bb"]
+  let lens = words.map(|w| w.len())
+  assert lens == [1, 2]
+  assert lens.push(3).sort().reverse() == [3, 2, 1]
+}
+
+// 途中で return する本体は、ループに展開されず関数として呼ばれる
+fn firsts(rows: List<List<Int>>) -> List<Int> {
+  rows.map(|r| {
+    if r.is_empty() { return 0 - 1 }
+    r[0]
+  })
+}
+
+fn doubled(words: List<String>) -> List<Option<Int>> {
+  words.map(|w| {
+    let n = w.to_int()?
+    Some(n * 2)
+  })
+}
+
+test "closures that return early or live in variables" {
+  assert firsts([[4, 5], [], [6]]) == [4, 0 - 1, 6]
+  assert doubled(["2", "x", "21"]) == [Some(4), None, Some(42)]
+  let double = |x: Int| x * 2
+  assert [1, 2].map(double) == [2, 4]
+  assert [1, 2, 3].filter(|x| double(x) > 2) == [2, 3]
+  let mut k = 10
+  let shifted = [1, 2].map(|x| x + k)
+  k = 20
+  assert shifted == [11, 12]
+  assert [1, 2].map(|x| x + k) == [21, 22]
+}
