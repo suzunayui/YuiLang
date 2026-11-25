@@ -1,0 +1,104 @@
+// 構造体のフィールドの読み書きと、文字列の比較。JIT はどちらも機械語で直接行う
+
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+struct Line {
+  from: Point,
+  to: Point,
+  label: String,
+}
+
+struct Wrapper<T> {
+  value: T,
+  count: Int,
+}
+
+// フィールドは宣言と違う順で書いてもよい
+fn make(n: Int) -> Point {
+  Point { y: n * 2, x: n }
+}
+
+fn length_squared(l: Line) -> Int {
+  let dx = l.to.x - l.from.x
+  let dy = l.to.y - l.from.y
+  dx * dx + dy * dy
+}
+
+fn sample() -> Line {
+  Line { from: Point { x: 1, y: 2 }, to: Point { x: 4, y: 6 }, label: "ab" }
+}
+
+test "reading fields" {
+  let p = make(3)
+  assert p.x == 3
+  assert p.y == 6
+  let l = sample()
+  assert length_squared(l) == 25
+  assert l.label == "ab"
+  assert l.to == Point { x: 4, y: 6 }
+  // 変数に入れていない値のフィールド
+  assert make(5).y == 10
+  assert sample().to.y == 6
+  assert [make(1), make(2)][1].x == 2
+  let w = Wrapper { value: "v", count: 2 }
+  assert w.value == "v"
+  assert w.count == 2
+  let nested = Wrapper { value: make(4), count: 1 }
+  assert nested.value.y == 8
+}
+
+test "updating fields" {
+  let mut p = make(1)
+  let saved = p
+  p.x = 10
+  p.y = p.y + 1
+  assert p == Point { x: 10, y: 3 }
+  assert saved == Point { x: 1, y: 2 }
+
+  let mut line = sample()
+  let before = line
+  line.to.x = 9
+  line.label = "z"
+  assert line.to.x == 9
+  assert line.from.x == 1
+  assert line.label == "z"
+  assert before.to.x == 4
+  assert before.label == "ab"
+
+  let mut points = [make(1), make(2)]
+  points[0].y = 7
+  assert points[0].y == 7
+  assert points[1].y == 4
+}
+
+test "comparing strings" {
+  let a = "hello"
+  let b = "hel"
+  let c = "{b}lo"
+  assert a == c
+  assert !(a != c)
+  assert a != b
+  assert b != a
+  assert a == a
+  assert "" == ""
+  assert "" != " "
+  assert "abc" != "abd"
+  assert "abc" != "abcd"
+  assert "あい" == "あい"
+  assert "あい" != "あう"
+  let words = ["x", "yy", "x"]
+  assert words[0] == words[2]
+  assert words[0] != words[1]
+  assert words.filter(|w| w == "x").len() == 2
+  assert sample().label == "ab"
+  assert sample().label != "abc"
+}
+
+fn main() uses io {
+  let l = sample()
+  print("{l.label}: {length_squared(l)}")
+  print("{make(21)}")
+}

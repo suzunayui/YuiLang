@@ -387,7 +387,16 @@ fn arith(op: BinOp, l: &Value, r: &Value, span: Span) -> R<Value> {
     }
 }
 
-fn field_mut<'v>(value: &'v mut Value, name: &str, span: Span) -> R<&'v mut Value> {
+fn field_mut<'v>(value: &'v mut Value, name: &str, at: u32, span: Span) -> R<&'v mut Value> {
+    // The usual case: the type checker recorded where the field is.
+    if at != NONE {
+        return match value {
+            Value::Struct(s) => {
+                Rc::make_mut(s).fields.get_mut(at as usize).map(|(_, v)| v).ok_or_else(|| internal(span))
+            }
+            _ => Err(internal(span)),
+        };
+    }
     match value {
         Value::Struct(s) => Rc::make_mut(s)
             .fields
@@ -449,7 +458,7 @@ fn fields_mut<'v>(root: &'v mut Value, path: &[PathElem], span: Span) -> R<&'v m
     let mut cur = root;
     for elem in path {
         cur = match elem {
-            PathElem::Field(name, span) => field_mut(cur, name, *span)?,
+            PathElem::Field(name, span, at) => field_mut(cur, name, *at, *span)?,
             PathElem::Index(_) => return Err(internal(span)),
         };
     }
@@ -1178,7 +1187,18 @@ impl<'a> Interp<'a> {
                 let Value::Str(name) = &func.consts[name as usize] else {
                     return Err(internal(span!()));
                 };
-                *field_mut(&mut self.stack[base + slot as usize], name, span!())? = v;
+                *field_mut(&mut self.stack[base + slot as usize], name, NONE, span!())? = v;
+            }
+            Op::StoreFieldAt(slot, at) => {
+                let v = self.pop();
+                *field_mut(&mut self.stack[base + slot as usize], "", at, span!())? = v;
+            }
+            Op::GetFieldAt(at) => {
+                let v = match self.pop() {
+                    Value::Struct(s) => s.fields.get(at as usize).map(|(_, v)| v.clone()),
+                    _ => None,
+                };
+                self.stack.push(v.ok_or_else(|| internal(span!()))?);
             }
             Op::Assign(slot, path) => {
                 let span = span!();
@@ -1197,7 +1217,7 @@ impl<'a> Interp<'a> {
                 let mut cur = &mut self.stack[base + slot as usize];
                 for elem in init {
                     cur = match elem {
-                        PathElem::Field(name, span) => field_mut(cur, name, *span)?,
+                        PathElem::Field(name, span, field) => field_mut(cur, name, *field, *span)?,
                         PathElem::Index(at) => {
                             let index = indexes.next().ok_or_else(|| internal(span))?;
                             element_mut(cur, index, *at)?
@@ -1205,7 +1225,7 @@ impl<'a> Interp<'a> {
                     };
                 }
                 match last {
-                    PathElem::Field(name, span) => *field_mut(cur, name, *span)? = v,
+                    PathElem::Field(name, span, field) => *field_mut(cur, name, *field, *span)? = v,
                     PathElem::Index(at) => {
                         let index = indexes.next().ok_or_else(|| internal(span))?;
                         store_index(cur, index, v, *at)?;
@@ -1683,7 +1703,42 @@ mod native {
             vec_cap,
             closure_func: std::mem::offset_of!(ClosureVal, func) as i32,
             closure_captured: std::mem::offset_of!(ClosureVal, captured) as i32,
+            struct_fields: std::mem::offset_of!(StructVal, fields) as i32,
+            field_size: std::mem::size_of::<(Rc<str>, Value)>() as i32,
+            field_value: field_value_offset() as i32,
         }
+    }
+
+    /// Where the value sits inside one `(name, value)` entry of a struct.
+    fn field_value_offset() -> usize {
+        let entry: (Rc<str>, Value) = (Rc::from(""), Value::Unit);
+        &entry.1 as *const Value as usize - &entry as *const (Rc<str>, Value) as usize
+    }
+
+    /// Generated code compares strings itself, and reads struct fields.
+    fn string_and_struct_layout_matches() -> bool {
+        let word = |v: &Value, at: usize| unsafe { *((v as *const Value as *const u8).add(at) as *const usize) };
+        let text: Rc<str> = Rc::from("abc");
+        let string = Value::Str(text.clone());
+        // A string is its counts pointer and its length; the bytes follow the counts.
+        let bytes_follow_counts = Rc::as_ptr(&text) as *const u8 as usize == word(&string, 8) + jit::RC_DATA as usize;
+        let mut fields: Vec<(Rc<str>, Value)> = Vec::with_capacity(7);
+        fields.extend([(text.clone(), Value::Unit), (text.clone(), Value::Unit), (text.clone(), Value::Unit)]);
+        // Safety: a Vec is three words.
+        let words: [usize; 3] = unsafe { std::mem::transmute_copy(&fields) };
+        let find = |wanted: usize| words.iter().position(|w| *w == wanted).map(|i| i as i32 * 8);
+        let fields_layout = (|| Some((find(fields.as_ptr() as usize)?, find(3)?, find(7)?)))();
+        byte_at(&string, 0) == jit::TAG_STR
+            && word(&string, 16) == 3
+            && bytes_follow_counts
+            && std::mem::size_of::<Vec<(Rc<str>, Value)>>() == 24
+            && fields_layout == vec_layout()
+            && byte_at(&Value::Struct(Rc::new(StructVal { name: text.clone(), fields: Vec::new() })), 0) == jit::TAG_STRUCT
+    }
+
+    fn byte_at(v: &Value, at: usize) -> u8 {
+        // Safety: reads one byte inside the value.
+        unsafe { *(v as *const Value as *const u8).add(at) }
     }
 
     /// Whether calls to `func` may reuse earlier results. That is sound for a
@@ -1784,6 +1839,7 @@ mod native {
             && byte(&Value::list(Vec::new()), 0) == jit::TAG_LIST
             && vec_layout().is_some()
             && heap_values_are_counted()
+            && string_and_struct_layout_matches()
             && std::mem::offset_of!(Stack, top) == jit::STACK_TOP_OFFSET as usize
             && std::mem::offset_of!(Stack, end) == jit::STACK_END_OFFSET as usize
             && std::mem::offset_of!(Stack, frames_top) == jit::FRAMES_TOP_OFFSET as usize

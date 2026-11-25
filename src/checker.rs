@@ -88,6 +88,8 @@ struct Checker {
     decl_types: Vec<(usize, Type)>,
     /// Operand type of every arithmetic and comparison expression, by span.
     op_types: Vec<((usize, usize), Type)>,
+    /// Position of the field read by every field access, by span.
+    field_uses: Vec<((usize, usize), u32)>,
 }
 
 /// Checks the program. The second result tells the code generator which
@@ -109,6 +111,7 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
         diags: Vec::new(),
         decl_types: Vec::new(),
         op_types: Vec::new(),
+        field_uses: Vec::new(),
     };
     let sigs = c.collect(program);
     let mut sigs = sigs.into_iter();
@@ -140,6 +143,7 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
             info.int_fns.insert(name.clone());
         }
     }
+    info.field_index = c.field_uses.iter().copied().collect();
     (c.diags, info)
 }
 
@@ -1066,8 +1070,11 @@ impl Checker {
                     Type::Struct(sname, targs) => {
                         let info = self.structs.get(&sname).cloned().unwrap_or_default();
                         let map: HashMap<String, Type> = info.params.iter().cloned().zip(targs).collect();
-                        match info.fields.iter().find(|(n, _)| n == name) {
-                            Some((_, ty)) => substitute(ty, &map),
+                        match info.fields.iter().position(|(n, _)| n == name) {
+                            Some(at) => {
+                                self.field_uses.push(((e.span.start, e.span.end), at as u32));
+                                substitute(&info.fields[at].1, &map)
+                            }
                             None => {
                                 let names: Vec<String> = info.fields.iter().map(|(n, _)| n.clone()).collect();
                                 let mut d = Diagnostic::new(

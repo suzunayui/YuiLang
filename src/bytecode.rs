@@ -71,6 +71,8 @@ pub enum Op {
     MakeClosure(u32, u32),
     FnRef(u32),
     GetField(u32),
+    /// Read the field at this position of the struct on top of the stack.
+    GetFieldAt(u32),
     Index,
     /// Join the top `n` values into a string.
     Concat(u32),
@@ -78,6 +80,8 @@ pub enum Op {
     StoreIndex(u32),
     /// `slot.field = value`.
     StoreField(u32, u32),
+    /// The same, with the position of the field instead of its name.
+    StoreFieldAt(u32, u32),
     /// Assignment through a longer path; index into `Func::paths`.
     Assign(u32, u32),
     /// `place = place.push(v)` and friends, updating the collection where it is stored.
@@ -124,7 +128,9 @@ impl InPlace {
 }
 
 pub enum PathElem {
-    Field(Rc<str>, Span),
+    /// Name, position for errors, and position of the field in its struct
+    /// (`NONE` when the type checker did not record one).
+    Field(Rc<str>, Span, u32),
     Index(Span),
 }
 
@@ -581,7 +587,10 @@ impl<'g> Compiler<'g> {
                         self.expr(index);
                         self.emit(Op::StoreIndex(slot), span);
                     }
-                    ([PathElem::Field(name, _)], []) => {
+                    ([PathElem::Field(_, _, at)], []) if *at != NONE => {
+                        self.emit(Op::StoreFieldAt(slot, *at), span);
+                    }
+                    ([PathElem::Field(name, _, _)], []) => {
                         let name = self.string(name);
                         self.emit(Op::StoreField(slot, name), span);
                     }
@@ -605,7 +614,9 @@ impl<'g> Compiler<'g> {
             ExprKind::Ident(name) => self.resolve(name),
             ExprKind::Field(base, name, _) => {
                 let slot = self.place(base, path, indexes)?;
-                path.push(PathElem::Field(Rc::from(name.as_str()), target.span));
+                let key = (target.span.start, target.span.end);
+                let at = self.g.types.field_index.get(&key).copied().unwrap_or(NONE);
+                path.push(PathElem::Field(Rc::from(name.as_str()), target.span, at));
                 Some(slot)
             }
             ExprKind::Index(base, index) => {
@@ -914,8 +925,14 @@ impl<'g> Compiler<'g> {
             }
             ExprKind::Field(base, name, _) => {
                 self.expr(base);
-                let name = self.string(name);
-                self.emit(Op::GetField(name), span);
+                // The type checker knows which field of which struct this is.
+                match self.g.types.field_index.get(&(span.start, span.end)).copied() {
+                    Some(at) => self.emit(Op::GetFieldAt(at), span),
+                    None => {
+                        let name = self.string(name);
+                        self.emit(Op::GetField(name), span)
+                    }
+                };
             }
             ExprKind::Index(base, index) => {
                 self.expr(base);

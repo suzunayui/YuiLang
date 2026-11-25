@@ -41,7 +41,9 @@ pub const TAG_UNIT: u8 = 3;
 /// Values with this discriminant or above own heap memory: their second word
 /// points at a reference-counted block.
 pub const FIRST_HEAP_TAG: u8 = 4;
+pub const TAG_STR: u8 = 4;
 pub const TAG_LIST: u8 = 5;
+pub const TAG_STRUCT: u8 = 7;
 pub const TAG_FN: u8 = 9;
 pub const TAG_CLOSURE: u8 = 10;
 /// A list of Ints stored as plain 8-byte numbers. Its `Vec` is laid out like a `List`'s.
@@ -107,6 +109,11 @@ pub struct Helpers {
     /// Offsets of the function and the captured values inside a closure.
     pub closure_func: i32,
     pub closure_captured: i32,
+    /// Offset of the field list inside a struct value, the size of one
+    /// entry of that list, and the offset of the field's value in an entry.
+    pub struct_fields: i32,
+    pub field_size: i32,
+    pub field_value: i32,
 }
 
 const V: i32 = VALUE_SIZE as i32;
@@ -172,6 +179,7 @@ fn slot_refs(op: Op) -> Vec<(u32, bool)> {
         | Op::NewListFor(s)
         | Op::StoreIndex(s)
         | Op::StoreField(s, _)
+        | Op::StoreFieldAt(s, _)
         | Op::Assign(s, _)
         | Op::InPlace(s, _, _)
         | Op::SaveSp(s)
@@ -755,6 +763,8 @@ enum StubKind {
     Op { pc: u32, target: Option<usize> },
     Call { index: u32, argc: u32, pc: u32 },
     CallValue { argc: u32, pc: u32 },
+    /// Run the op at `pc` and the one after it.
+    Pair { pc: u32 },
     Return,
     /// Write these values to memory, then finish the call in the interpreter.
     ReturnValue { items: Vec<VItem> },
@@ -774,6 +784,10 @@ struct Gen<'a> {
     free: Vec<u8>,
     /// The register each local slot lives in, if any.
     slot_reg: Vec<Option<u8>>,
+    /// For each op: some jump leads to it.
+    is_target: Vec<bool>,
+    /// The next op was generated together with the current one.
+    skip: bool,
     /// One label per op, plus one for the end of the code.
     ops: Vec<usize>,
     stubs: Vec<Stub>,
@@ -1414,6 +1428,26 @@ impl Gen<'_> {
         if matches!(op, Op::Return) && self.try_ret_value() {
             return;
         }
+        // `variable.field`: read the field straight out of the variable,
+        // without first copying the whole struct to the stack.
+        if let (Op::Load(s), Some(Op::GetFieldAt(at))) = (op, self.func.code.get(pc as usize + 1).copied()) {
+            if !self.int_slot(s) && !self.is_target[pc as usize + 1] {
+                self.flush();
+                let fields = RC_DATA + self.helpers.struct_fields + self.helpers.vec_ptr;
+                let value = at as i32 * self.helpers.field_size + self.helpers.field_value;
+                let (slow, resume) = self.stub_of(StubKind::Pair { pc });
+                let a = &mut self.a;
+                a.cmp_byte(slot(s), TAG_STRUCT);
+                a.jcc(CC_NE, slow);
+                a.load(RDX, slot(s).at(8));
+                a.load(RDX, M(RDX, fields));
+                a.copy_value(M(RDX, value), top(0), true);
+                a.alu_imm(0, R13, V);
+                a.bind(resume);
+                self.skip = true;
+                return;
+            }
+        }
         if !self.typed(pc, op) {
             self.flush();
             self.op(pc, op);
@@ -1613,16 +1647,89 @@ impl Gen<'_> {
                 a.alu_imm(5, R13, V);
                 a.bind(resume);
             }
+            Op::Const(index) => {
+                // The constant lives in the function for as long as the code does.
+                let address = &self.func.consts[index as usize] as *const _ as usize;
+                a.mov_imm64(RDX, address as i64);
+                a.copy_value(M(RDX, 0), top(0), true);
+                a.alu_imm(0, R13, V);
+            }
+            Op::GetFieldAt(at) => {
+                let fields = RC_DATA + self.helpers.struct_fields + self.helpers.vec_ptr;
+                let value = at as i32 * self.helpers.field_size + self.helpers.field_value;
+                let (slow, resume) = self.stub(pc, None);
+                let a = &mut self.a;
+                a.cmp_byte(top(1), TAG_STRUCT);
+                a.jcc(CC_NE, slow);
+                // The struct on the stack is dropped, which must not free it.
+                a.load(RDX, top(1).at(8));
+                a.cmp_imm(M(RDX, 0), 1);
+                a.jcc(CC_E, slow);
+                a.dec_mem(M(RDX, 0));
+                a.load(RDX, M(RDX, fields));
+                a.copy_value(M(RDX, value), top(1), true);
+                a.bind(resume);
+            }
             Op::Cmp(op) => {
                 let (slow, resume) = self.stub(pc, None);
-                self.expect_int(top(2), slow);
-                self.expect_int(top(1), slow);
+                let strings = self.a.label();
                 let a = &mut self.a;
+                a.cmp_byte(top(2), TAG_INT);
+                a.jcc(CC_NE, if matches!(op, BinOp::Eq | BinOp::Ne) { strings } else { slow });
+                a.cmp_byte(top(1), TAG_INT);
+                a.jcc(CC_NE, slow);
                 a.load(RAX, top(2).at(8));
                 a.alu_m(0x3B, RAX, top(1).at(8));
                 a.store_imm(top(2), TAG_BOOL as i32);
                 a.setcc(condition(op), top(2).at(1));
                 a.alu_imm(5, R13, V);
+                a.jmp(resume);
+
+                // `==` / `!=` on two strings: compare lengths, then bytes.
+                a.bind(strings);
+                if matches!(op, BinOp::Eq | BinOp::Ne) {
+                    let (compare, same, done) = (a.label(), a.label(), a.label());
+                    a.cmp_byte(top(2), TAG_STR);
+                    a.jcc(CC_NE, slow);
+                    a.cmp_byte(top(1), TAG_STR);
+                    a.jcc(CC_NE, slow);
+                    // Both strings are dropped, which must not free them.
+                    a.load(RSI, top(2).at(8));
+                    a.load(RDI, top(1).at(8));
+                    a.alu_rr(0x39, RSI, RDI);
+                    a.jcc(CC_E, slow);
+                    a.cmp_imm(M(RSI, 0), 1);
+                    a.jcc(CC_E, slow);
+                    a.cmp_imm(M(RDI, 0), 1);
+                    a.jcc(CC_E, slow);
+                    a.dec_mem(M(RSI, 0));
+                    a.dec_mem(M(RDI, 0));
+                    // dl = 1 when equal.
+                    a.mov_imm64(RDX, 0);
+                    a.load(RCX, top(2).at(16));
+                    a.alu_m(0x3B, RCX, top(1).at(16));
+                    a.jcc(CC_NE, done);
+                    a.mov_imm64(R8, 0);
+                    a.bind(compare);
+                    a.alu_rr(0x39, R8, RCX);
+                    a.jcc(CC_AE, same);
+                    a.buf.extend_from_slice(&[0x42, 0x0F, 0xB6, 0x44, 0x06, RC_DATA as u8]); // movzx eax, byte [rsi+r8+16]
+                    a.buf.extend_from_slice(&[0x42, 0x3A, 0x44, 0x07, RC_DATA as u8]); // cmp al, [rdi+r8+16]
+                    a.jcc(CC_NE, done);
+                    a.alu_imm(0, R8, 1);
+                    a.jmp(compare);
+                    a.bind(same);
+                    a.mov_imm64(RDX, 1);
+                    a.bind(done);
+                    if op == BinOp::Ne {
+                        a.buf.extend_from_slice(&[0x48, 0x83, 0xF2, 0x01]); // xor rdx, 1
+                    }
+                    // A Bool is its tag in the first byte and the flag in the second.
+                    a.buf.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x08]); // shl rdx, 8
+                    a.alu_imm(0, RDX, TAG_BOOL as i32);
+                    a.store(top(2), RDX);
+                    a.alu_imm(5, R13, V);
+                }
                 a.bind(resume);
             }
             Op::ArithSlotInt(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul), s, n) => {
@@ -1783,6 +1890,8 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
         vstack: Vec::new(),
         free: TEMPS.to_vec(),
         slot_reg,
+        is_target,
+        skip: false,
         ops,
         stubs: Vec::new(),
         entry,
@@ -1861,7 +1970,13 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
 
     for (pc, op) in func.code.iter().enumerate() {
         // Every way of reaching a jump target must agree on what is in memory.
-        if is_target[pc] && !(matches!(op, Op::Return) && g.try_ret_value()) {
+        if g.skip {
+            // Generated together with the previous op; no jump leads here.
+            g.skip = false;
+            g.a.bind(g.ops[pc]);
+            continue;
+        }
+        if g.is_target[pc] && !(matches!(op, Op::Return) && g.try_ret_value()) {
             g.flush();
         }
         g.a.bind(g.ops[pc]);
@@ -1906,6 +2021,11 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
             }
             StubKind::CallValue { argc, pc } => {
                 g.call_value_helper(argc, pc);
+                g.a.jmp(stub.resume);
+            }
+            StubKind::Pair { pc } => {
+                g.run_op(pc, None);
+                g.run_op(pc + 1, None);
                 g.a.jmp(stub.resume);
             }
             StubKind::Return => g.return_helper(),
