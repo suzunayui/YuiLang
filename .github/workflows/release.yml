@@ -34,11 +34,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bin: yui.exe
-            asset: yui-windows-x86_64.exe
+            asset: yui-windows-x64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             bin: yui
-            asset: yui-linux-x86_64
+            asset: yui-linux-x64
           - os: macos-latest
             target: aarch64-apple-darwin
             bin: yui
@@ -46,7 +46,7 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             bin: yui
-            asset: yui-macos-x86_64
+            asset: yui-macos-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
