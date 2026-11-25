@@ -1,0 +1,110 @@
+// ジェネリクス、クロージャ、関数型
+
+struct Pair<A, B> {
+  first: A,
+  second: B,
+}
+
+enum Tree<T> {
+  Leaf,
+  Node(Tree<T>, T, Tree<T>),
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+  Pair { first: p.second, second: p.first }
+}
+
+fn insert(tree: Tree<Int>, value: Int) -> Tree<Int> {
+  match tree {
+    Tree.Leaf => Tree.Node(Tree.Leaf, value, Tree.Leaf)
+    Tree.Node(left, v, right) => if value < v {
+      Tree.Node(insert(left, value), v, right)
+    } else {
+      Tree.Node(left, v, insert(right, value))
+    }
+  }
+}
+
+fn to_list<T>(tree: Tree<T>) -> List<T> {
+  match tree {
+    Tree.Leaf => []
+    Tree.Node(left, v, right) => to_list(left).push(v).concat(to_list(right))
+  }
+}
+
+fn depth<T>(tree: Tree<T>) -> Int {
+  match tree {
+    Tree.Leaf => 0
+    Tree.Node(left, _, right) => 1 + depth(left).max(depth(right))
+  }
+}
+
+// 関数を受け取る関数
+fn apply_twice<T>(f: fn(T) -> T, x: T) -> T {
+  f(f(x))
+}
+
+// 関数を返す関数。戻り値の関数型は括弧で囲む
+fn compose<A, B, C>(f: fn(A) -> B, g: fn(B) -> C) -> (fn(A) -> C) {
+  |x| g(f(x))
+}
+
+fn make_adder(n: Int) -> (fn(Int) -> Int) {
+  |x| x + n
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+// 副作用のある関数を受け取るときは、関数型にも uses を書く
+fn each<T>(xs: List<T>, f: fn(T) uses io) uses io {
+  for x in xs {
+    f(x)
+  }
+}
+
+test "generic struct" {
+  let p = swap(Pair { first: 1, second: "one" })
+  assert p.first == "one"
+  assert p.second == 1
+}
+
+test "generic enum" {
+  let tree = [5, 2, 8, 1].fold(Tree.Leaf, insert)
+  assert to_list(tree) == [1, 2, 5, 8]
+  assert depth(tree) == 3
+}
+
+test "closures" {
+  let add5 = make_adder(5)
+  assert add5(1) == 6
+  assert apply_twice(add5, 0) == 10
+  assert apply_twice(double, 3) == 12
+  assert apply_twice(|s| "{s}!", "hi") == "hi!!"
+  let inc_then_double = compose(|x| x + 1, double)
+  assert inc_then_double(4) == 10
+}
+
+test "captures are copies" {
+  let mut n = 1
+  let get = || n
+  n = 2
+  assert get() == 1
+  assert n == 2
+}
+
+test "list pipelines" {
+  let xs = [1, 2, 3, 4, 5, 6]
+  assert xs.filter(|x| x % 2 == 0) == [2, 4, 6]
+  assert xs.map(|x| x * x).fold(0, |acc, x| acc + x) == 91
+  assert xs.any(|x| x > 5)
+  assert xs.all(|x| x > 0)
+  assert xs.map(|x| "{x}").join("-") == "1-2-3-4-5-6"
+}
+
+fn main() uses io {
+  let tree = [5, 2, 8, 1, 9].fold(Tree.Leaf, insert)
+  print("sorted: {to_list(tree)}")
+  each(["a", "b"], |s| print("item {s}"))
+}

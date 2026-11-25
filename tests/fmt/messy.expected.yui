@@ -1,0 +1,64 @@
+// header comment
+import textutil
+
+struct Point {
+  x: Int,
+  y: Int,
+}  // a point
+
+enum Shape {
+  Circle(Float),
+  Rect(Float, Float),
+  Empty,
+}
+
+fn add(a: Int, b: Int) -> Int {
+  a + b
+}
+
+// doc for scale
+fn scale<T>(xs: List<T>, f: fn(T) -> T) -> List<T> {
+  xs.map(f)
+}
+
+fn clamp(x: Int, lo: Int, hi: Int) -> Int
+  requires lo <= hi
+  ensures result >= lo && result <= hi
+{
+  if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+fn long_call() -> List<Int> {
+  let values = [
+    1000000,
+    2000000,
+    3000000,
+    4000000,
+    5000000,
+    6000000,
+    7000000,
+    8000000,
+    9000000,
+    10000000,
+    11000000,
+  ]
+  let total = values.fold(0, |acc, x| {
+    // inside closure
+    acc + x
+  })
+  let p = Point { x: (1 + 2) * 3, y: -(4 - 5) }  // trailing
+
+  let q = p.x + p.y * 2 - (1 - (2 - 3))
+  match q {
+    0 => []  // zero
+    _ => values.push(total).push(q)
+  }
+}
+
+test "t" uses io {
+  let m = Map { "a": 1, "b": 2 }
+  if m.has("a") { print("yes") } else { print("no") }
+  // last comment in block
+}
+
+// trailing file comment

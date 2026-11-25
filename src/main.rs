@@ -1,17 +1,24 @@
 //! `yui` command line tool.
 
+use std::path::Path;
 use yuilang::ast::Item;
-use yuilang::diag::{json_str, render_human, render_json, Diagnostic};
+use yuilang::diag::{json_str, render_human, render_json, Diagnostic, SourceMap};
 use yuilang::interp::Interp;
 
 const USAGE: &str = "\
-YuiLang 0.1.0
+YuiLang 0.2.0
 
 Usage:
-  yui check   <file> [--json]   type-check a file
-  yui run     <file> [--json]   run `main`
-  yui test    <file> [--json]   run `test` blocks
-  yui outline <file>            print declarations without bodies
+  yui check   <file> [--json]         type-check a file and the modules it imports
+  yui run     <file> [--json] [-- args...]
+                                      run `main`; arguments after `--` are returned by args()
+  yui test    <file> [--json]         run the `test` blocks of a file
+  yui fmt     <file> [--check]        format a file in place (--check: only report)
+  yui outline <file>                  print declarations without bodies
+
+Options:
+  --root <dir>   directory that `import` paths are relative to
+                 (default: the directory of <file>)
 ";
 
 fn main() {
@@ -24,43 +31,74 @@ fn main() {
     std::process::exit(code);
 }
 
-fn diagnostics_json(diags: &[Diagnostic], file: &str, src: &str) -> String {
-    let items: Vec<String> = diags.iter().map(|d| render_json(d, file, src)).collect();
+fn diagnostics_json(diags: &[Diagnostic], sources: &SourceMap) -> String {
+    let items: Vec<String> = diags.iter().map(|d| render_json(d, sources)).collect();
     format!("{{\"ok\":{},\"diagnostics\":[{}]}}", diags.is_empty(), items.join(","))
 }
 
+struct Options {
+    cmd: String,
+    file: String,
+    json: bool,
+    check: bool,
+    root: Option<String>,
+    program_args: Vec<String>,
+}
+
+fn parse_args() -> Option<Options> {
+    let mut args = std::env::args().skip(1);
+    let mut positional = Vec::new();
+    let mut opts = Options {
+        cmd: String::new(),
+        file: String::new(),
+        json: false,
+        check: false,
+        root: None,
+        program_args: Vec::new(),
+    };
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => opts.json = true,
+            "--check" => opts.check = true,
+            "--root" => opts.root = Some(args.next()?),
+            "--" => {
+                opts.program_args = args.collect();
+                break;
+            }
+            a if a.starts_with("--") => {
+                eprintln!("unknown option `{a}`\n");
+                return None;
+            }
+            _ => positional.push(arg),
+        }
+    }
+    if positional.len() != 2 {
+        return None;
+    }
+    opts.file = positional.pop()?;
+    opts.cmd = positional.pop()?;
+    Some(opts)
+}
+
 fn real_main() -> i32 {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let json = args.iter().any(|a| a == "--json");
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let (cmd, file) = match positional.as_slice() {
-        [cmd, file] => (cmd.as_str(), file.as_str()),
-        _ => {
+    let Some(opts) = parse_args() else {
+        eprint!("{USAGE}");
+        return 2;
+    };
+    let json = opts.json;
+    match opts.cmd.as_str() {
+        "check" | "run" | "test" | "outline" => {}
+        "fmt" => return format_file(&opts),
+        other => {
+            eprintln!("unknown command `{other}`\n");
             eprint!("{USAGE}");
             return 2;
         }
-    };
-    if !matches!(cmd, "check" | "run" | "test" | "outline") {
-        eprintln!("unknown command `{cmd}`\n");
-        eprint!("{USAGE}");
-        return 2;
     }
 
-    let src = match std::fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot read `{file}`: {e}");
-            return 2;
-        }
-    };
-    // Normalize the path so diagnostics look the same on every platform.
-    let file = file.replace('\\', "/");
-    let file = file.as_str();
-
-    // Reports diagnostics found before the program runs.
-    let report = |diags: &[Diagnostic], json_to_stdout: bool| {
+    let report = |diags: &[Diagnostic], sources: &SourceMap, json_to_stdout: bool| {
         if json {
-            let text = diagnostics_json(diags, file, &src);
+            let text = diagnostics_json(diags, sources);
             if json_to_stdout {
                 println!("{text}");
             } else {
@@ -68,7 +106,7 @@ fn real_main() -> i32 {
             }
         } else {
             for d in diags {
-                eprintln!("{}", render_human(d, file, &src));
+                eprintln!("{}", render_human(d, sources));
             }
             if !diags.is_empty() {
                 eprintln!("{} error(s)", diags.len());
@@ -77,49 +115,55 @@ fn real_main() -> i32 {
     };
 
     // `run` keeps stdout for the program's own output.
-    let json_to_stdout = cmd != "run";
-    let program = match yuilang::load(&src) {
-        Ok(p) => p,
-        Err(diags) => {
-            report(&diags, json_to_stdout);
+    let json_to_stdout = opts.cmd != "run";
+    let root = opts.root.as_deref().map(Path::new);
+    let loaded = match yuilang::load_path(Path::new(&opts.file), root) {
+        Ok(l) => l,
+        Err((diags, sources)) => {
+            report(&diags, &sources, json_to_stdout);
             return 1;
         }
     };
+    let sources = &loaded.sources;
 
-    match cmd {
+    match opts.cmd.as_str() {
         "check" => {
             if json {
-                println!("{}", diagnostics_json(&[], file, &src));
+                println!("{}", diagnostics_json(&[], sources));
             } else {
-                println!("ok: {file}");
+                println!("ok: {}", opts.file.replace('\\', "/"));
             }
             0
         }
         "outline" => {
-            print!("{}", yuilang::outline(&program, &src));
+            print!("{}", yuilang::outline(&loaded));
             0
         }
         "run" => {
-            if let Err(d) = yuilang::check_main(&program) {
-                report(&[d], false);
+            if let Err(d) = yuilang::check_main(&loaded.program) {
+                report(&[d], sources, false);
                 return 1;
             }
-            let mut interp = Interp::new(&program, &src);
+            let mut interp = Interp::new(&loaded.program, &sources.text);
+            interp.args = opts.program_args.clone();
             match interp.run_main() {
                 Ok(()) => 0,
                 Err(d) => {
-                    report(&[d], false);
+                    report(&[d], sources, false);
                     1
                 }
             }
         }
         _ => {
-            let mut interp = Interp::new(&program, &src);
+            let mut interp = Interp::new(&loaded.program, &sources.text);
             let mut passed = 0;
             let mut failed = 0;
             let mut results = Vec::new();
-            for item in &program.items {
+            for item in &loaded.program.items {
                 let Item::Test(t) = item else { continue };
+                if !t.root {
+                    continue;
+                }
                 match interp.run_test(t) {
                     Ok(()) => {
                         passed += 1;
@@ -135,11 +179,11 @@ fn real_main() -> i32 {
                             results.push(format!(
                                 "{{\"name\":{},\"ok\":false,\"error\":{}}}",
                                 json_str(&t.name),
-                                render_json(&d, file, &src)
+                                render_json(&d, sources)
                             ));
                         } else {
                             println!("FAIL  {}", t.name);
-                            println!("{}", render_human(&d, file, &src));
+                            println!("{}", render_human(&d, sources));
                         }
                     }
                 }
@@ -158,6 +202,48 @@ fn real_main() -> i32 {
             } else {
                 1
             }
+        }
+    }
+}
+
+fn format_file(opts: &Options) -> i32 {
+    let file = opts.file.replace('\\', "/");
+    let src = match std::fs::read_to_string(&opts.file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read `{file}`: {e}");
+            return 2;
+        }
+    };
+    let formatted = match yuilang::fmt::format_source(&src) {
+        Ok(f) => f,
+        Err(d) => {
+            let sources = SourceMap::single(&file, &src);
+            if opts.json {
+                println!("{}", diagnostics_json(&[d], &sources));
+            } else {
+                eprintln!("{}", render_human(&d, &sources));
+            }
+            return 1;
+        }
+    };
+    let normalized = src.replace("\r\n", "\n");
+    if formatted == normalized {
+        println!("unchanged: {file}");
+        return 0;
+    }
+    if opts.check {
+        println!("would reformat: {file}");
+        return 1;
+    }
+    match std::fs::write(&opts.file, &formatted) {
+        Ok(()) => {
+            println!("formatted: {file}");
+            0
+        }
+        Err(e) => {
+            eprintln!("cannot write `{file}`: {e}");
+            2
         }
     }
 }

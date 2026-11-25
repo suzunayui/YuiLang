@@ -1,9 +1,7 @@
 // YuiLang の基本: 関数、Result、match、テスト、副作用の宣言
 
 fn divide(a: Int, b: Int) -> Result<Int, String> {
-  if b == 0 {
-    return Err("division by zero")
-  }
+  if b == 0 { return Err("division by zero") }
   Ok(a / b)
 }
 

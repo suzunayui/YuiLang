@@ -1,8 +1,9 @@
-//! Type checker: types, effects, mutability, unused values and match exhaustiveness.
+//! Type checker: types, generics, effects, mutability, unused values and
+//! match exhaustiveness.
 
 use crate::ast::*;
 use crate::diag::{Diagnostic, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Type {
@@ -18,31 +19,68 @@ pub enum Type {
     List(Box<Type>),
     Option(Box<Type>),
     Result(Box<Type>, Box<Type>),
-    Struct(String),
-    Enum(String),
+    Map(Box<Type>, Box<Type>),
+    Struct(String, Vec<Type>),
+    Enum(String, Vec<Type>),
+    /// Parameters, return type and effects (sorted).
+    Fn(Vec<Type>, Box<Type>, Vec<String>),
+    /// A type parameter of the declaration being checked.
+    Param(String),
     /// Inference variable.
     Var(usize),
 }
 
+/// Marker effect on the function parameters of built-in methods such as
+/// `map`: any effects are accepted and charged to the caller.
+const ANY_EFFECT: &str = "*";
+
 #[derive(Clone)]
 struct FnSig {
+    type_params: Vec<String>,
     params: Vec<Type>,
     ret: Type,
     effects: Vec<String>,
 }
 
-const RESERVED_TYPES: &[&str] =
-    &["Int", "Float", "Bool", "String", "Unit", "List", "Option", "Result", "Some", "None", "Ok", "Err"];
-const BUILTIN_FNS: &[&str] = &["print", "read_line", "panic"];
+#[derive(Clone, Default)]
+struct StructInfo {
+    params: Vec<String>,
+    fields: Vec<(String, Type)>,
+}
+
+#[derive(Clone, Default)]
+struct EnumInfo {
+    params: Vec<String>,
+    variants: Vec<(String, Vec<Type>)>,
+}
+
+/// Simplified pattern used by the exhaustiveness check.
+#[derive(Clone)]
+enum SPat {
+    Wild,
+    Con(String, Vec<SPat>),
+}
+
+struct Ctor {
+    key: String,
+    display: String,
+    fields: Vec<Type>,
+}
 
 struct Checker {
-    structs: HashMap<String, Vec<(String, Type)>>,
-    enums: HashMap<String, Vec<(String, Vec<Type>)>>,
+    structs: HashMap<String, StructInfo>,
+    enums: HashMap<String, EnumInfo>,
     fns: HashMap<String, FnSig>,
     subst: Vec<Option<Type>>,
+    /// name -> (type, mutable)
     scopes: Vec<HashMap<String, (Type, bool)>>,
+    tparams: Vec<String>,
     ret: Type,
     effects: Vec<String>,
+    /// Set while checking a closure body: effects used so far.
+    infer_effects: Option<Vec<String>>,
+    /// Scopes below this index belong to an enclosing function (captured by value).
+    closure_base: usize,
     in_contract: bool,
     loop_depth: usize,
     diags: Vec<Diagnostic>,
@@ -55,8 +93,11 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
         fns: HashMap::new(),
         subst: Vec::new(),
         scopes: Vec::new(),
+        tparams: Vec::new(),
         ret: Type::Unit,
         effects: Vec::new(),
+        infer_effects: None,
+        closure_base: 0,
         in_contract: false,
         loop_depth: 0,
         diags: Vec::new(),
@@ -75,6 +116,11 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
     }
     c.diags.sort_by_key(|d| d.span.start);
     c.diags
+}
+
+/// Last segment of a module-qualified name.
+fn short(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -107,6 +153,22 @@ fn tail_span(block: &Block) -> Span {
     }
 }
 
+fn substitute(t: &Type, map: &HashMap<String, Type>) -> Type {
+    let all = |ts: &[Type]| ts.iter().map(|t| substitute(t, map)).collect::<Vec<_>>();
+    let one = |t: &Type| Box::new(substitute(t, map));
+    match t {
+        Type::Param(name) => map.get(name).cloned().unwrap_or_else(|| t.clone()),
+        Type::List(a) => Type::List(one(a)),
+        Type::Option(a) => Type::Option(one(a)),
+        Type::Result(a, b) => Type::Result(one(a), one(b)),
+        Type::Map(a, b) => Type::Map(one(a), one(b)),
+        Type::Struct(n, args) => Type::Struct(n.clone(), all(args)),
+        Type::Enum(n, args) => Type::Enum(n.clone(), all(args)),
+        Type::Fn(params, ret, effects) => Type::Fn(all(params), one(ret), effects.clone()),
+        other => other.clone(),
+    }
+}
+
 impl Checker {
     fn error(&mut self, code: &'static str, msg: impl Into<String>, span: Span) {
         self.diags.push(Diagnostic::new(code, msg, span));
@@ -123,6 +185,11 @@ impl Checker {
         Type::Var(self.subst.len() - 1)
     }
 
+    /// Fresh inference variables for a list of type parameters.
+    fn instantiate(&mut self, params: &[String]) -> HashMap<String, Type> {
+        params.iter().map(|p| (p.clone(), self.fresh())).collect()
+    }
+
     /// Follows inference variables at the top level only.
     fn resolve(&self, t: &Type) -> Type {
         let mut t = t.clone();
@@ -136,15 +203,29 @@ impl Checker {
     }
 
     fn apply(&self, t: &Type) -> Type {
+        let all = |ts: &[Type]| ts.iter().map(|t| self.apply(t)).collect::<Vec<_>>();
+        let one = |t: &Type| Box::new(self.apply(t));
         match self.resolve(t) {
-            Type::List(a) => Type::List(Box::new(self.apply(&a))),
-            Type::Option(a) => Type::Option(Box::new(self.apply(&a))),
-            Type::Result(a, b) => Type::Result(Box::new(self.apply(&a)), Box::new(self.apply(&b))),
+            Type::List(a) => Type::List(one(&a)),
+            Type::Option(a) => Type::Option(one(&a)),
+            Type::Result(a, b) => Type::Result(one(&a), one(&b)),
+            Type::Map(a, b) => Type::Map(one(&a), one(&b)),
+            Type::Struct(n, args) => Type::Struct(n, all(&args)),
+            Type::Enum(n, args) => Type::Enum(n, all(&args)),
+            Type::Fn(params, ret, effects) => Type::Fn(all(&params), one(&ret), effects),
             other => other,
         }
     }
 
     fn show(&self, t: &Type) -> String {
+        let list = |ts: &[Type]| ts.iter().map(|t| self.show(t)).collect::<Vec<_>>().join(", ");
+        let named = |n: &str, args: &[Type]| {
+            if args.is_empty() {
+                n.to_string()
+            } else {
+                format!("{n}<{}>", list(args))
+            }
+        };
         match self.resolve(t) {
             Type::Int => "Int".to_string(),
             Type::Float => "Float".to_string(),
@@ -156,7 +237,21 @@ impl Checker {
             Type::List(a) => format!("List<{}>", self.show(&a)),
             Type::Option(a) => format!("Option<{}>", self.show(&a)),
             Type::Result(a, b) => format!("Result<{}, {}>", self.show(&a), self.show(&b)),
-            Type::Struct(n) | Type::Enum(n) => n,
+            Type::Map(a, b) => format!("Map<{}, {}>", self.show(&a), self.show(&b)),
+            Type::Struct(n, args) | Type::Enum(n, args) => named(&n, &args),
+            Type::Fn(params, ret, effects) => {
+                let mut out = format!("fn({})", list(&params));
+                if self.resolve(&ret) != Type::Unit {
+                    out.push_str(&format!(" -> {}", self.show(&ret)));
+                }
+                let effects: Vec<&str> =
+                    effects.iter().map(|e| e.as_str()).filter(|e| *e != ANY_EFFECT).collect();
+                if !effects.is_empty() {
+                    out.push_str(&format!(" uses {}", effects.join(", ")));
+                }
+                out
+            }
+            Type::Param(n) => n,
             Type::Var(_) => "_".to_string(),
         }
     }
@@ -165,9 +260,22 @@ impl Checker {
         match self.resolve(t) {
             Type::Var(w) => v == w,
             Type::List(a) | Type::Option(a) => self.occurs(v, &a),
-            Type::Result(a, b) => self.occurs(v, &a) || self.occurs(v, &b),
+            Type::Result(a, b) | Type::Map(a, b) => self.occurs(v, &a) || self.occurs(v, &b),
+            Type::Struct(_, args) | Type::Enum(_, args) => args.iter().any(|a| self.occurs(v, a)),
+            Type::Fn(params, ret, _) => params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret),
             _ => false,
         }
+    }
+
+    fn unify_all(&mut self, a: &[Type], b: &[Type]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut ok = true;
+        for (x, y) in a.iter().zip(b) {
+            ok &= self.unify(x, y);
+        }
+        ok
     }
 
     fn unify(&mut self, a: &Type, b: &Type) -> bool {
@@ -185,16 +293,31 @@ impl Checker {
                 }
             }
             (Type::List(x), Type::List(y)) | (Type::Option(x), Type::Option(y)) => self.unify(x, y),
-            (Type::Result(x1, x2), Type::Result(y1, y2)) => {
+            (Type::Result(x1, x2), Type::Result(y1, y2)) | (Type::Map(x1, x2), Type::Map(y1, y2)) => {
                 let first = self.unify(x1, y1);
                 let second = self.unify(x2, y2);
                 first && second
+            }
+            (Type::Struct(n1, a1), Type::Struct(n2, a2)) | (Type::Enum(n1, a1), Type::Enum(n2, a2)) => {
+                n1 == n2 && self.unify_all(a1, a2)
+            }
+            (Type::Fn(p1, r1, e1), Type::Fn(p2, r2, e2)) => {
+                let params = self.unify_all(p1, p2);
+                let ret = self.unify(r1, r2);
+                params && ret && e1 == e2
             }
             _ => a == b,
         }
     }
 
     fn expect(&mut self, actual: &Type, expected: &Type, span: Span) {
+        // A function with fewer effects can be used where more are allowed.
+        if let (Type::Fn(ap, ar, ae), Type::Fn(_, _, ee)) = (self.resolve(actual), self.resolve(expected)) {
+            if ae != ee && ae.iter().all(|e| ee.contains(e)) {
+                let widened = Type::Fn(ap, ar, ee);
+                return self.expect(&widened, expected, span);
+            }
+        }
         if !self.unify(actual, expected) {
             let msg = format!(
                 "type mismatch: expected `{}`, found `{}`",
@@ -210,6 +333,9 @@ impl Checker {
                 (Type::Result(_, _), _) if !matches!(a, Type::Result(_, _)) => Some("wrap the value in `Ok(...)` or `Err(...)`"),
                 (_, Type::Option(_)) => Some("handle the `None` case with `match`, `?` or `.unwrap_or(default)`"),
                 (_, Type::Result(_, _)) => Some("handle the `Err` case with `match`, `?` or `.unwrap_or(default)`"),
+                (Type::Fn(_, _, ee), Type::Fn(_, _, ae)) if ee != ae => {
+                    Some("the function uses effects that are not allowed here")
+                }
                 _ => None,
             };
             let mut d = Diagnostic::new("E0301", msg, span);
@@ -239,33 +365,81 @@ impl Checker {
         a.clone()
     }
 
+    fn check_map_key(&mut self, key: &Type, span: Span) {
+        match self.resolve(key) {
+            Type::Int | Type::Str | Type::Bool | Type::Var(_) | Type::Param(_) | Type::Error | Type::Never => {}
+            _ => {
+                let msg = format!("`{}` cannot be used as a Map key", self.show(key));
+                self.error_hint("E0315", msg, span, "Map keys must be Int, String or Bool");
+            }
+        }
+    }
+
+    fn check_effect_names(&mut self, effects: &[String], span: Span) -> Vec<String> {
+        let mut out = Vec::new();
+        for e in effects {
+            if !EFFECTS.contains(&e.as_str()) {
+                self.error_hint(
+                    "E0402",
+                    format!("unknown effect `{e}`"),
+                    span,
+                    format!("available effects: {}", EFFECTS.join(", ")),
+                );
+            } else if !out.contains(e) {
+                out.push(e.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
     fn resolve_type(&mut self, t: &TypeExpr) -> Type {
-        let name = t.name.as_str();
+        let (name, targs) = match &t.kind {
+            TypeKind::Fn(params, ret, effects) => {
+                let params = params.iter().map(|p| self.resolve_type(p)).collect();
+                let ret = match ret {
+                    Some(r) => self.resolve_type(r),
+                    None => Type::Unit,
+                };
+                let effects = self.check_effect_names(effects, t.span);
+                return Type::Fn(params, Box::new(ret), effects);
+            }
+            TypeKind::Named(name, args) => (name.as_str(), args),
+        };
+        if self.tparams.iter().any(|p| p == name) {
+            if !targs.is_empty() {
+                self.error("E0206", format!("type parameter `{name}` takes no type arguments"), t.span);
+            }
+            return Type::Param(name.to_string());
+        }
         let arity = match name {
             "Int" | "Float" | "Bool" | "String" | "Unit" => 0,
             "List" | "Option" => 1,
-            "Result" => 2,
-            _ if self.structs.contains_key(name) || self.enums.contains_key(name) => 0,
-            _ => {
-                let known = self.structs.keys().chain(self.enums.keys());
-                let suggestion = closest(name, known);
-                let mut d = Diagnostic::new("E0202", format!("unknown type `{name}`"), t.span);
-                if let Some(s) = suggestion {
-                    d = d.hint(format!("did you mean `{s}`?"));
+            "Result" | "Map" => 2,
+            _ => match (self.structs.get(name), self.enums.get(name)) {
+                (Some(s), _) => s.params.len(),
+                (_, Some(e)) => e.params.len(),
+                _ => {
+                    let known: Vec<String> =
+                        self.structs.keys().chain(self.enums.keys()).map(|k| short(k).to_string()).collect();
+                    let mut d = Diagnostic::new("E0202", format!("unknown type `{name}`"), t.span);
+                    if let Some(s) = closest(short(name), known.iter()) {
+                        d = d.hint(format!("did you mean `{s}`?"));
+                    }
+                    self.diags.push(d);
+                    return Type::Error;
                 }
-                self.diags.push(d);
-                return Type::Error;
-            }
+            },
         };
-        if t.args.len() != arity {
+        if targs.len() != arity {
             self.error(
                 "E0206",
-                format!("type `{name}` takes {arity} type argument(s), found {}", t.args.len()),
+                format!("type `{name}` takes {arity} type argument(s), found {}", targs.len()),
                 t.span,
             );
             return Type::Error;
         }
-        let mut args: Vec<Type> = t.args.iter().map(|a| self.resolve_type(a)).collect();
+        let mut args: Vec<Type> = targs.iter().map(|a| self.resolve_type(a)).collect();
         match name {
             "Int" => Type::Int,
             "Float" => Type::Float,
@@ -274,13 +448,18 @@ impl Checker {
             "Unit" => Type::Unit,
             "List" => Type::List(Box::new(args.remove(0))),
             "Option" => Type::Option(Box::new(args.remove(0))),
-            "Result" => {
-                let ok = args.remove(0);
-                let err = args.remove(0);
-                Type::Result(Box::new(ok), Box::new(err))
+            "Result" | "Map" => {
+                let first = args.remove(0);
+                let second = args.remove(0);
+                if name == "Map" {
+                    self.check_map_key(&first, targs[0].span);
+                    Type::Map(Box::new(first), Box::new(second))
+                } else {
+                    Type::Result(Box::new(first), Box::new(second))
+                }
             }
-            _ if self.structs.contains_key(name) => Type::Struct(name.to_string()),
-            _ => Type::Enum(name.to_string()),
+            _ if self.structs.contains_key(name) => Type::Struct(name.to_string(), args),
+            _ => Type::Enum(name.to_string(), args),
         }
     }
 
@@ -288,26 +467,32 @@ impl Checker {
 
     /// Registers all declarations. Returns one signature per `fn` item, in source order.
     fn collect(&mut self, program: &Program) -> Vec<FnSig> {
-        for item in &program.items {
-            let (name, span) = match item {
-                Item::Struct(s) => (&s.name, s.name_span),
-                Item::Enum(e) => (&e.name, e.name_span),
+        // Items whose name was already taken; their bodies are still checked.
+        let mut duplicates: HashSet<usize> = HashSet::new();
+        for (i, item) in program.items.iter().enumerate() {
+            let (name, span, params) = match item {
+                Item::Struct(s) => (&s.name, s.name_span, &s.type_params),
+                Item::Enum(e) => (&e.name, e.name_span, &e.type_params),
                 _ => continue,
             };
-            if RESERVED_TYPES.contains(&name.as_str()) {
-                self.error("E0201", format!("`{name}` is a built-in name and cannot be redefined"), span);
+            let reserved = BUILTIN_TYPES.contains(&short(name)) || ["Some", "None", "Ok", "Err"].contains(&short(name));
+            if reserved {
+                self.error("E0201", format!("`{}` is a built-in name and cannot be redefined", short(name)), span);
+                duplicates.insert(i);
             } else if self.structs.contains_key(name) || self.enums.contains_key(name) {
                 self.error("E0201", format!("type `{name}` is defined more than once"), span);
+                duplicates.insert(i);
             } else if matches!(item, Item::Struct(_)) {
-                self.structs.insert(name.clone(), Vec::new());
+                self.structs.insert(name.clone(), StructInfo { params: params.clone(), fields: Vec::new() });
             } else {
-                self.enums.insert(name.clone(), Vec::new());
+                self.enums.insert(name.clone(), EnumInfo { params: params.clone(), variants: Vec::new() });
             }
         }
 
-        for item in &program.items {
+        for (i, item) in program.items.iter().enumerate() {
             match item {
                 Item::Struct(s) => {
+                    self.tparams = s.type_params.clone();
                     let mut fields: Vec<(String, Type)> = Vec::new();
                     for f in &s.fields {
                         let ty = self.resolve_type(&f.ty);
@@ -317,13 +502,14 @@ impl Checker {
                             fields.push((f.name.clone(), ty));
                         }
                     }
-                    if let Some(slot) = self.structs.get_mut(&s.name) {
-                        if slot.is_empty() {
-                            *slot = fields;
+                    if !duplicates.contains(&i) {
+                        if let Some(info) = self.structs.get_mut(&s.name) {
+                            info.fields = fields;
                         }
                     }
                 }
                 Item::Enum(e) => {
+                    self.tparams = e.type_params.clone();
                     let mut variants: Vec<(String, Vec<Type>)> = Vec::new();
                     for v in &e.variants {
                         let tys: Vec<Type> = v.fields.iter().map(|t| self.resolve_type(t)).collect();
@@ -333,9 +519,9 @@ impl Checker {
                             variants.push((v.name.clone(), tys));
                         }
                     }
-                    if let Some(slot) = self.enums.get_mut(&e.name) {
-                        if slot.is_empty() {
-                            *slot = variants;
+                    if !duplicates.contains(&i) {
+                        if let Some(info) = self.enums.get_mut(&e.name) {
+                            info.variants = variants;
                         }
                     }
                 }
@@ -346,6 +532,7 @@ impl Checker {
         let mut sigs = Vec::new();
         for item in &program.items {
             let Item::Fn(f) = item else { continue };
+            self.tparams = f.type_params.clone();
             let mut seen: Vec<&str> = Vec::new();
             let mut params = Vec::new();
             for p in &f.params {
@@ -359,8 +546,10 @@ impl Checker {
                 Some(t) => self.resolve_type(t),
                 None => Type::Unit,
             };
-            let effects: Vec<String> = f.effects.iter().map(|(e, _)| e.clone()).collect();
-            let sig = FnSig { params, ret, effects };
+            let names: Vec<String> = f.effects.iter().map(|(e, _)| e.clone()).collect();
+            let span = f.effects.first().map_or(f.name_span, |(_, s)| *s);
+            let effects = self.check_effect_names(&names, span);
+            let sig = FnSig { type_params: f.type_params.clone(), params, ret, effects };
             if BUILTIN_FNS.contains(&f.name.as_str()) {
                 self.error(
                     "E0201",
@@ -374,13 +563,17 @@ impl Checker {
             }
             sigs.push(sig);
         }
+        self.tparams.clear();
         sigs
     }
 
     fn check_fn(&mut self, f: &FnDecl, sig: &FnSig) {
+        self.tparams = f.type_params.clone();
         self.scopes = vec![HashMap::new()];
         self.ret = sig.ret.clone();
         self.loop_depth = 0;
+        self.closure_base = 0;
+        self.infer_effects = None;
         for (p, ty) in f.params.iter().zip(&sig.params) {
             self.scopes[0].insert(p.name.clone(), (ty.clone(), false));
         }
@@ -408,7 +601,7 @@ impl Checker {
             if self.resolve(&body_ty) == Type::Unit {
                 let msg = format!(
                     "function `{}` must return `{}`, but its body ends without a value",
-                    f.name,
+                    short(&f.name),
                     self.show(&sig.ret)
                 );
                 self.error_hint(
@@ -424,17 +617,26 @@ impl Checker {
     }
 
     fn check_test(&mut self, t: &TestDecl) {
+        self.tparams.clear();
         self.scopes = vec![HashMap::new()];
         self.ret = Type::Unit;
         self.loop_depth = 0;
-        self.effects = t.effects.iter().map(|(e, _)| e.clone()).collect();
+        self.closure_base = 0;
+        self.infer_effects = None;
+        let names: Vec<String> = t.effects.iter().map(|(e, _)| e.clone()).collect();
+        self.effects = self.check_effect_names(&names, t.name_span);
         self.block(&t.body, false);
     }
 
     // ---- scopes ----
 
-    fn lookup(&self, name: &str) -> Option<(Type, bool)> {
-        self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
+    /// Returns (type, mutable, scope index).
+    fn lookup(&self, name: &str) -> Option<(Type, bool, usize)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, s)| s.get(name).map(|(t, m)| (t.clone(), *m, i)))
     }
 
     fn declare(&mut self, name: &str, ty: Type, mutable: bool, span: Span) {
@@ -455,7 +657,9 @@ impl Checker {
     }
 
     fn undefined_variable(&mut self, name: &str, span: Span) {
-        let names: Vec<String> = self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
+        let name = short(name);
+        let mut names: Vec<String> = self.scopes.iter().flat_map(|s| s.keys().cloned()).collect();
+        names.extend(self.fns.keys().map(|k| short(k).to_string()));
         let mut d = Diagnostic::new("E0203", format!("undefined variable `{name}`"), span);
         if let Some(s) = closest(name, names.iter()) {
             d = d.hint(format!("did you mean `{s}`?"));
@@ -500,15 +704,15 @@ impl Checker {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, name_span, mutable, ty, value } => {
-                let value_ty = self.expr(value, true);
+            Stmt::Let { name, name_span, mutable, ty, value, .. } => {
                 let declared = match ty {
                     Some(t) => {
                         let annotated = self.resolve_type(t);
+                        let value_ty = self.expr_expect(value, Some(&annotated));
                         self.expect(&value_ty, &annotated, value.span);
                         annotated
                     }
-                    None => value_ty,
+                    None => self.expr(value, true),
                 };
                 self.declare(name, declared, *mutable, *name_span);
             }
@@ -522,26 +726,33 @@ impl Checker {
                     }
                 }
                 if let ExprKind::Ident(name) = &root.kind {
-                    if let Some((_, false)) = self.lookup(name) {
-                        self.error_hint(
+                    match self.lookup(name) {
+                        Some((_, false, _)) => self.error_hint(
                             "E0306",
                             format!("cannot assign to `{name}` because it is not mutable"),
                             target.span,
                             format!("declare it with `let mut {name} = ...`"),
-                        );
+                        ),
+                        Some((_, true, idx)) if idx < self.closure_base => self.error_hint(
+                            "E0313",
+                            format!("a closure cannot assign to the captured variable `{name}`"),
+                            target.span,
+                            "closures capture variables by value; return the new value from the closure instead",
+                        ),
+                        _ => {}
                     }
                 }
-                let value_ty = self.expr(value, true);
+                let value_ty = self.expr_expect(value, Some(&target_ty));
                 self.expect(&value_ty, &target_ty, value.span);
             }
-            Stmt::While { cond, body } => {
+            Stmt::While { cond, body, .. } => {
                 let t = self.expr(cond, true);
                 self.expect(&t, &Type::Bool, cond.span);
                 self.loop_depth += 1;
                 self.block(body, false);
                 self.loop_depth -= 1;
             }
-            Stmt::For { var, var_span, iter, end, body } => {
+            Stmt::For { var, var_span, iter, end, body, .. } => {
                 let iter_ty = self.expr(iter, true);
                 let elem = match end {
                     Some(end) => {
@@ -555,12 +766,11 @@ impl Checker {
                         let list = Type::List(Box::new(elem.clone()));
                         if !self.unify(&iter_ty, &list) {
                             let msg = format!("cannot iterate over a value of type `{}`", self.show(&iter_ty));
-                            self.error_hint(
-                                "E0301",
-                                msg,
-                                iter.span,
-                                "`for` iterates over a List, or over a range written `start..end`",
-                            );
+                            let hint = match self.resolve(&iter_ty) {
+                                Type::Map(_, _) => "iterate over `map.keys()` or `map.values()`",
+                                _ => "`for` iterates over a List, or over a range written `start..end`",
+                            };
+                            self.error_hint("E0301", msg, iter.span, hint);
                         }
                         elem
                     }
@@ -584,6 +794,15 @@ impl Checker {
 
     fn require_effects(&mut self, callee: &str, needed: &[String], span: Span) {
         for eff in needed {
+            if eff == ANY_EFFECT {
+                continue;
+            }
+            if let Some(used) = &mut self.infer_effects {
+                if !used.contains(eff) {
+                    used.push(eff.clone());
+                }
+                continue;
+            }
             if !self.effects.contains(eff) {
                 let hint = if self.in_contract {
                     "`requires` and `ensures` clauses must be free of side effects".to_string()
@@ -592,11 +811,19 @@ impl Checker {
                 };
                 self.error_hint(
                     "E0401",
-                    format!("`{callee}` uses the `{eff}` effect, which is not declared here"),
+                    format!("{callee} uses the `{eff}` effect, which is not declared here"),
                     span,
                     hint,
                 );
             }
+        }
+    }
+
+    /// Checks an expression, using `expected` to infer closure parameter types.
+    fn expr_expect(&mut self, e: &Expr, expected: Option<&Type>) -> Type {
+        match &e.kind {
+            ExprKind::Closure { params, body, .. } => self.closure(params, body, expected),
+            _ => self.expr(e, true),
         }
     }
 
@@ -609,11 +836,112 @@ impl Checker {
             );
         }
         for (i, arg) in args.iter().enumerate() {
-            let t = self.expr(arg, true);
-            if let Some(p) = params.get(i) {
-                self.expect(&t, p, arg.span);
+            let Some(param) = params.get(i) else {
+                self.expr(arg, true);
+                continue;
+            };
+            let t = self.expr_expect(arg, Some(param));
+            // Function parameters of built-in methods accept any effects; the
+            // effects of the function passed in are charged to the caller.
+            if let Type::Fn(eparams, eret, eeffects) = self.resolve(param) {
+                if eeffects.iter().any(|e| e == ANY_EFFECT) {
+                    match self.resolve(&t) {
+                        Type::Fn(aparams, aret, aeffects) => {
+                            let ok = self.unify_all(&aparams, &eparams) & self.unify(&aret, &eret);
+                            if !ok {
+                                let msg = format!(
+                                    "type mismatch: expected `{}`, found `{}`",
+                                    self.show(param),
+                                    self.show(&t)
+                                );
+                                self.error("E0301", msg, arg.span);
+                            }
+                            self.require_effects("the function passed here", &aeffects, arg.span);
+                        }
+                        Type::Error | Type::Never => {}
+                        _ => {
+                            let msg = format!(
+                                "type mismatch: expected `{}`, found `{}`",
+                                self.show(param),
+                                self.show(&t)
+                            );
+                            self.error_hint("E0301", msg, arg.span, "pass a closure such as `|x| x + 1`");
+                        }
+                    }
+                    continue;
+                }
             }
+            self.expect(&t, param, arg.span);
         }
+    }
+
+    fn closure(&mut self, params: &[ClosureParam], body: &Expr, expected: Option<&Type>) -> Type {
+        let (exp_params, exp_ret) = match expected.map(|t| self.resolve(t)) {
+            Some(Type::Fn(ps, r, _)) if ps.len() == params.len() => (Some(ps), Some(*r)),
+            _ => (None, None),
+        };
+        let mut param_tys = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let hinted = exp_params.as_ref().map(|ps| ps[i].clone());
+            let ty = match (&p.ty, hinted) {
+                (Some(annotation), hinted) => {
+                    let ty = self.resolve_type(annotation);
+                    if let Some(h) = hinted {
+                        self.unify(&ty, &h);
+                    }
+                    ty
+                }
+                (None, Some(h)) => h,
+                (None, None) => self.fresh(),
+            };
+            param_tys.push(ty);
+        }
+
+        let saved_ret = std::mem::replace(&mut self.ret, Type::Unit);
+        self.ret = match exp_ret {
+            Some(r) => r,
+            None => self.fresh(),
+        };
+        let saved_infer = self.infer_effects.replace(Vec::new());
+        let saved_base = std::mem::replace(&mut self.closure_base, self.scopes.len());
+        let saved_loops = std::mem::replace(&mut self.loop_depth, 0);
+
+        self.scopes.push(HashMap::new());
+        for (p, ty) in params.iter().zip(&param_tys) {
+            self.declare(&p.name, ty.clone(), false, p.span);
+        }
+        let ret = self.ret.clone();
+        let want = self.resolve(&ret) != Type::Unit;
+        if want {
+            let body_ty = self.expr(body, true);
+            if !self.unify(&body_ty, &ret) {
+                let msg = format!(
+                    "type mismatch: this closure should return `{}`, but its body has type `{}`",
+                    self.show(&ret),
+                    self.show(&body_ty)
+                );
+                self.error("E0301", msg, body.span);
+            }
+        } else {
+            self.expr_stmt(body);
+        }
+        self.scopes.pop();
+
+        let mut effects = std::mem::replace(&mut self.infer_effects, saved_infer).unwrap_or_default();
+        effects.sort();
+        self.ret = saved_ret;
+        self.closure_base = saved_base;
+        self.loop_depth = saved_loops;
+        Type::Fn(param_tys, Box::new(ret), effects)
+    }
+
+    fn unknown_type_error(&mut self, span: Span) {
+        self.error_hint(
+            "E0311",
+            "the type of this value is not known yet",
+            span,
+            "add a type annotation, e.g. `let x: Int = ...` or a closure parameter `|x: Int|`",
+        );
     }
 
     /// `want` is false when the value of the expression is discarded.
@@ -622,6 +950,7 @@ impl Checker {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
             ExprKind::Bool(_) => Type::Bool,
+            ExprKind::Unit => Type::Unit,
             ExprKind::Str(parts) => {
                 for part in parts {
                     if let StrPart::Expr(inner) = part {
@@ -631,7 +960,27 @@ impl Checker {
                 Type::Str
             }
             ExprKind::Ident(name) => match self.lookup(name) {
-                Some((ty, _)) => ty,
+                Some((ty, _, _)) => ty,
+                None => {
+                    self.undefined_variable(name, e.span);
+                    Type::Error
+                }
+            },
+            ExprKind::FnRef(name) => match self.fns.get(name).cloned() {
+                Some(sig) => {
+                    let map = self.instantiate(&sig.type_params);
+                    let params = sig.params.iter().map(|p| substitute(p, &map)).collect();
+                    Type::Fn(params, Box::new(substitute(&sig.ret, &map)), sig.effects.clone())
+                }
+                None if BUILTIN_FNS.contains(&name.as_str()) => {
+                    self.error_hint(
+                        "E0317",
+                        format!("the built-in function `{name}` cannot be used as a value"),
+                        e.span,
+                        format!("wrap it in a closure, e.g. `|x| {name}(x)`"),
+                    );
+                    Type::Error
+                }
                 None => {
                     self.undefined_variable(name, e.span);
                     Type::Error
@@ -645,6 +994,18 @@ impl Checker {
                 }
                 Type::List(Box::new(elem))
             }
+            ExprKind::MapLit(entries) => {
+                let key = self.fresh();
+                let value = self.fresh();
+                for (k, v) in entries {
+                    let kt = self.expr(k, true);
+                    self.expect(&kt, &key, k.span);
+                    let vt = self.expr(v, true);
+                    self.expect(&vt, &value, v.span);
+                }
+                self.check_map_key(&key, e.span);
+                Type::Map(Box::new(key), Box::new(value))
+            }
             ExprKind::Unary(op, operand) => {
                 let t = self.expr(operand, true);
                 match op {
@@ -654,6 +1015,10 @@ impl Checker {
                     }
                     UnOp::Neg => match self.resolve(&t) {
                         Type::Int | Type::Float | Type::Error | Type::Never => t,
+                        Type::Var(_) => {
+                            self.unknown_type_error(operand.span);
+                            Type::Error
+                        }
                         _ => {
                             let msg = format!("cannot negate a value of type `{}`", self.show(&t));
                             self.error("E0302", msg, e.span);
@@ -663,7 +1028,7 @@ impl Checker {
                 }
             }
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, e.span),
-            ExprKind::Call { name, name_span, args } => self.call(name, *name_span, args, e.span),
+            ExprKind::Call { name, name_span, local, args } => self.call(name, *name_span, *local, args, e.span),
             ExprKind::MethodCall { recv, name, name_span, args } => {
                 let recv_ty = self.expr(recv, true);
                 self.method(&recv_ty, name, *name_span, args, e.span)
@@ -671,12 +1036,13 @@ impl Checker {
             ExprKind::Field(base, name, name_span) => {
                 let base_ty = self.expr(base, true);
                 match self.resolve(&base_ty) {
-                    Type::Struct(sname) => {
-                        let fields = self.structs.get(&sname).cloned().unwrap_or_default();
-                        match fields.iter().find(|(n, _)| n == name) {
-                            Some((_, ty)) => ty.clone(),
+                    Type::Struct(sname, targs) => {
+                        let info = self.structs.get(&sname).cloned().unwrap_or_default();
+                        let map: HashMap<String, Type> = info.params.iter().cloned().zip(targs).collect();
+                        match info.fields.iter().find(|(n, _)| n == name) {
+                            Some((_, ty)) => substitute(ty, &map),
                             None => {
-                                let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+                                let names: Vec<String> = info.fields.iter().map(|(n, _)| n.clone()).collect();
                                 let mut d = Diagnostic::new(
                                     "E0304",
                                     format!("struct `{sname}` has no field `{name}`"),
@@ -693,12 +1059,7 @@ impl Checker {
                     }
                     Type::Error | Type::Never => Type::Error,
                     Type::Var(_) => {
-                        self.error_hint(
-                            "E0311",
-                            "the type of this value is not known yet",
-                            base.span,
-                            "add a type annotation where the value is declared",
-                        );
+                        self.unknown_type_error(base.span);
                         Type::Error
                     }
                     _ => {
@@ -711,6 +1072,10 @@ impl Checker {
             ExprKind::Index(base, index) => {
                 let base_ty = self.expr(base, true);
                 let index_ty = self.expr(index, true);
+                if let Type::Map(key, value) = self.resolve(&base_ty) {
+                    self.expect(&index_ty, &key, index.span);
+                    return *value;
+                }
                 self.expect(&index_ty, &Type::Int, index.span);
                 let elem = self.fresh();
                 let list = Type::List(Box::new(elem.clone()));
@@ -722,9 +1087,10 @@ impl Checker {
                 elem
             }
             ExprKind::StructLit { name, fields } => {
-                let Some(decl) = self.structs.get(name).cloned() else {
+                let Some(info) = self.structs.get(name).cloned() else {
+                    let known: Vec<String> = self.structs.keys().map(|k| short(k).to_string()).collect();
                     let mut d = Diagnostic::new("E0202", format!("unknown struct `{name}`"), e.span);
-                    if let Some(s) = closest(name, self.structs.keys()) {
+                    if let Some(s) = closest(short(name), known.iter()) {
                         d = d.hint(format!("did you mean `{s}`?"));
                     }
                     self.diags.push(d);
@@ -733,18 +1099,24 @@ impl Checker {
                     }
                     return Type::Error;
                 };
+                let map = self.instantiate(&info.params);
                 let mut given: Vec<&str> = Vec::new();
                 for (fname, fspan, value) in fields {
-                    let t = self.expr(value, true);
                     if given.contains(&fname.as_str()) {
+                        self.expr(value, true);
                         self.error("E0201", format!("field `{fname}` is given more than once"), *fspan);
                         continue;
                     }
                     given.push(fname);
-                    match decl.iter().find(|(n, _)| n == fname) {
-                        Some((_, ty)) => self.expect(&t, ty, value.span),
+                    match info.fields.iter().find(|(n, _)| n == fname) {
+                        Some((_, ty)) => {
+                            let expected = substitute(ty, &map);
+                            let t = self.expr_expect(value, Some(&expected));
+                            self.expect(&t, &expected, value.span);
+                        }
                         None => {
-                            let names: Vec<String> = decl.iter().map(|(n, _)| n.clone()).collect();
+                            self.expr(value, true);
+                            let names: Vec<String> = info.fields.iter().map(|(n, _)| n.clone()).collect();
                             self.error_hint(
                                 "E0304",
                                 format!("struct `{name}` has no field `{fname}`"),
@@ -754,7 +1126,8 @@ impl Checker {
                         }
                     }
                 }
-                let missing: Vec<&str> = decl
+                let missing: Vec<&str> = info
+                    .fields
                     .iter()
                     .map(|(n, _)| n.as_str())
                     .filter(|n| !given.contains(n))
@@ -766,7 +1139,8 @@ impl Checker {
                         e.span,
                     );
                 }
-                Type::Struct(name.clone())
+                let targs = info.params.iter().map(|p| map[p].clone()).collect();
+                Type::Struct(name.clone(), targs)
             }
             ExprKind::Ctor { enum_name, variant, args } => self.ctor(enum_name, variant, args, e.span),
             ExprKind::If { cond, then, els } => {
@@ -806,15 +1180,7 @@ impl Checker {
                     }
                     self.scopes.pop();
                 }
-                let pats: Vec<&Pattern> = arms.iter().map(|a| &a.pat).collect();
-                if let Some(missing) = self.missing(&pats, &scrut_ty) {
-                    self.error_hint(
-                        "E0308",
-                        format!("match is not exhaustive: `{missing}` is not covered"),
-                        scrutinee.span,
-                        format!("add an arm for `{missing}`, or a catch-all arm `_ => ...`"),
-                    );
-                }
+                self.check_exhaustive(arms, &scrut_ty, scrutinee.span);
                 if want {
                     result.unwrap_or(Type::Never)
                 } else {
@@ -822,11 +1188,12 @@ impl Checker {
                 }
             }
             ExprKind::Block(b) => self.block(b, want),
+            ExprKind::Closure { params, body, .. } => self.closure(params, body, None),
             ExprKind::Return(value) => {
                 let ret = self.ret.clone();
                 match value {
                     Some(v) => {
-                        let t = self.expr(v, true);
+                        let t = self.expr_expect(v, Some(&ret));
                         self.expect(&t, &ret, v.span);
                     }
                     None => self.expect(&Type::Unit, &ret, e.span),
@@ -891,12 +1258,16 @@ impl Checker {
             }
             BinOp::Eq | BinOp::Ne => {
                 self.expect(&r, &l, rhs.span);
+                if let Type::Fn(..) = self.resolve(&l) {
+                    self.error("E0302", "functions cannot be compared", span);
+                }
                 Type::Bool
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 self.expect(&r, &l, rhs.span);
                 match self.resolve(&l) {
                     Type::Int | Type::Float | Type::Str | Type::Error | Type::Never => {}
+                    Type::Var(_) => self.unknown_type_error(lhs.span),
                     _ => {
                         let msg = format!(
                             "`{}` cannot compare values of type `{}`",
@@ -909,13 +1280,20 @@ impl Checker {
                 Type::Bool
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                let lt = self.resolve(&l);
-                match lt {
+                // An unknown left operand takes its type from the right one.
+                if let (Type::Var(_), Type::Int | Type::Float) = (self.resolve(&l), self.resolve(&r)) {
+                    self.unify(&l, &r);
+                }
+                match self.resolve(&l) {
                     Type::Int | Type::Float => {
                         self.expect(&r, &l, rhs.span);
                         l
                     }
                     Type::Error | Type::Never => Type::Error,
+                    Type::Var(_) => {
+                        self.unknown_type_error(lhs.span);
+                        Type::Error
+                    }
                     Type::Str if op == BinOp::Add => {
                         self.error_hint(
                             "E0302",
@@ -939,71 +1317,167 @@ impl Checker {
         }
     }
 
-    fn call(&mut self, name: &str, name_span: Span, args: &[Expr], span: Span) -> Type {
+    fn call(&mut self, name: &str, name_span: Span, local: bool, args: &[Expr], span: Span) -> Type {
+        let skip_args = |c: &mut Checker| {
+            for arg in args {
+                c.expr(arg, true);
+            }
+        };
+        if local {
+            let Some((ty, _, _)) = self.lookup(name) else {
+                self.undefined_variable(name, name_span);
+                skip_args(self);
+                return Type::Error;
+            };
+            return match self.resolve(&ty) {
+                Type::Fn(params, ret, effects) => {
+                    self.require_effects(&format!("`{name}`"), &effects, span);
+                    self.check_args(&format!("`{name}`"), &params, args, span);
+                    *ret
+                }
+                Type::Error | Type::Never => {
+                    skip_args(self);
+                    Type::Error
+                }
+                Type::Var(_) => {
+                    self.unknown_type_error(name_span);
+                    skip_args(self);
+                    Type::Error
+                }
+                _ => {
+                    let msg = format!("`{name}` has type `{}` and cannot be called", self.show(&ty));
+                    self.error("E0316", msg, name_span);
+                    skip_args(self);
+                    Type::Error
+                }
+            };
+        }
+
+        let string = || Type::Str;
+        let result = |ok: Type| Type::Result(Box::new(ok), Box::new(Type::Str));
         let builtin: Option<(Vec<Type>, Type, &[&str])> = match name {
-            "print" => Some((vec![Type::Str], Type::Unit, &["io"])),
-            "read_line" => Some((vec![], Type::Str, &["io"])),
-            "panic" => Some((vec![Type::Str], Type::Never, &[])),
+            "print" => Some((vec![string()], Type::Unit, &["io"])),
+            "read_line" => Some((vec![], string(), &["io"])),
+            "args" => Some((vec![], Type::List(Box::new(string())), &["io"])),
+            "panic" => Some((vec![string()], Type::Never, &[])),
+            "read_file" => Some((vec![string()], result(string()), &["fs"])),
+            "write_file" => Some((vec![string(), string()], result(Type::Unit), &["fs"])),
             _ => None,
         };
         let (params, ret, effects) = match builtin {
             Some((params, ret, effects)) => (params, ret, effects.iter().map(|s| s.to_string()).collect()),
-            None => match self.fns.get(name) {
-                Some(sig) => (sig.params.clone(), sig.ret.clone(), sig.effects.clone()),
+            None => match self.fns.get(name).cloned() {
+                Some(sig) => {
+                    let map = self.instantiate(&sig.type_params);
+                    let params: Vec<Type> = sig.params.iter().map(|p| substitute(p, &map)).collect();
+                    (params, substitute(&sig.ret, &map), sig.effects)
+                }
                 None => {
-                    let mut names: Vec<String> = self.fns.keys().cloned().collect();
+                    let mut names: Vec<String> = self.fns.keys().map(|k| short(k).to_string()).collect();
                     names.extend(BUILTIN_FNS.iter().map(|s| s.to_string()));
-                    let mut d = Diagnostic::new("E0203", format!("undefined function `{name}`"), name_span);
-                    if let Some(s) = closest(name, names.iter()) {
+                    let mut d =
+                        Diagnostic::new("E0203", format!("undefined function `{}`", short(name)), name_span);
+                    if let Some(s) = closest(short(name), names.iter()) {
                         d = d.hint(format!("did you mean `{s}`?"));
                     }
                     self.diags.push(d);
-                    for arg in args {
-                        self.expr(arg, true);
-                    }
+                    skip_args(self);
                     return Type::Error;
                 }
             },
         };
-        self.require_effects(name, &effects, span);
-        self.check_args(&format!("`{name}`"), &params, args, span);
+        self.require_effects(&format!("`{}`", short(name)), &effects, span);
+        self.check_args(&format!("`{}`", short(name)), &params, args, span);
         ret
     }
 
     fn method(&mut self, recv_ty: &Type, name: &str, name_span: Span, args: &[Expr], span: Span) -> Type {
         let recv = self.resolve(recv_ty);
-        let boxed = |t: &Type| Box::new(t.clone());
+        let skip_args = |c: &mut Checker| {
+            for arg in args {
+                c.expr(arg, true);
+            }
+        };
+        match &recv {
+            Type::Error | Type::Never => {
+                skip_args(self);
+                return Type::Error;
+            }
+            Type::Var(_) if name != "to_string" => {
+                self.unknown_type_error(span);
+                skip_args(self);
+                return Type::Error;
+            }
+            _ => {}
+        }
+
+        let u = self.fresh();
+        let list = |t: &Type| Type::List(Box::new(t.clone()));
+        let option = |t: &Type| Type::Option(Box::new(t.clone()));
+        let func = |params: Vec<Type>, ret: Type| Type::Fn(params, Box::new(ret), vec![ANY_EFFECT.to_string()]);
         let sig: Option<(Vec<Type>, Type)> = match (&recv, name) {
-            (Type::Error | Type::Never, _) => {
-                for arg in args {
-                    self.expr(arg, true);
-                }
-                return Type::Error;
-            }
             (_, "to_string") => Some((vec![], Type::Str)),
-            (Type::Var(_), _) => {
-                self.error_hint(
-                    "E0311",
-                    "the type of this value is not known yet",
-                    span,
-                    "add a type annotation where the value is declared",
-                );
-                for arg in args {
-                    self.expr(arg, true);
-                }
-                return Type::Error;
-            }
+
             (Type::Str, "len") => Some((vec![], Type::Int)),
-            (Type::Str, "contains") => Some((vec![Type::Str], Type::Bool)),
-            (Type::Str, "trim") => Some((vec![], Type::Str)),
-            (Type::Str, "to_int") => Some((vec![], Type::Option(Box::new(Type::Int)))),
-            (Type::Str, "to_float") => Some((vec![], Type::Option(Box::new(Type::Float)))),
+            (Type::Str, "is_empty") => Some((vec![], Type::Bool)),
+            (Type::Str, "contains" | "starts_with" | "ends_with") => Some((vec![Type::Str], Type::Bool)),
+            (Type::Str, "trim" | "to_upper" | "to_lower") => Some((vec![], Type::Str)),
+            (Type::Str, "replace") => Some((vec![Type::Str, Type::Str], Type::Str)),
+            (Type::Str, "split") => Some((vec![Type::Str], list(&Type::Str))),
+            (Type::Str, "chars") => Some((vec![], list(&Type::Str))),
+            (Type::Str, "slice") => Some((vec![Type::Int, Type::Int], Type::Str)),
+            (Type::Str, "to_int") => Some((vec![], option(&Type::Int))),
+            (Type::Str, "to_float") => Some((vec![], option(&Type::Float))),
+
             (Type::List(_), "len") => Some((vec![], Type::Int)),
-            (Type::List(t), "push") => Some((vec![(**t).clone()], Type::List(boxed(t)))),
-            (Type::List(t), "get") => Some((vec![Type::Int], Type::Option(boxed(t)))),
+            (Type::List(_), "is_empty") => Some((vec![], Type::Bool)),
+            (Type::List(t), "push") => Some((vec![(**t).clone()], list(t))),
+            (Type::List(t), "get") => Some((vec![Type::Int], option(t))),
             (Type::List(t), "contains") => Some((vec![(**t).clone()], Type::Bool)),
+            (Type::List(t), "first" | "last") => Some((vec![], option(t))),
+            (Type::List(t), "concat") => Some((vec![list(t)], list(t))),
+            (Type::List(t), "reverse") => Some((vec![], list(t))),
+            (Type::List(t), "slice") => Some((vec![Type::Int, Type::Int], list(t))),
+            (Type::List(t), "sort") => {
+                match self.resolve(t) {
+                    Type::Int | Type::Float | Type::Str | Type::Error | Type::Var(_) => {}
+                    _ => {
+                        let msg = format!("`sort` cannot order values of type `{}`", self.show(t));
+                        self.error_hint("E0302", msg, name_span, "sort works on lists of Int, Float or String");
+                    }
+                }
+                Some((vec![], list(t)))
+            }
+            (Type::List(t), "join") => {
+                if !self.unify(t, &Type::Str) {
+                    let msg = format!("`join` needs a List<String>, found `{}`", self.show(&recv));
+                    self.error_hint("E0302", msg, name_span, "convert the items first: `.map(|x| x.to_string())`");
+                }
+                Some((vec![Type::Str], Type::Str))
+            }
+            (Type::List(t), "map") => Some((vec![func(vec![(**t).clone()], u.clone())], list(&u))),
+            (Type::List(t), "filter") => Some((vec![func(vec![(**t).clone()], Type::Bool)], list(t))),
+            (Type::List(t), "any" | "all") => Some((vec![func(vec![(**t).clone()], Type::Bool)], Type::Bool)),
+            (Type::List(t), "fold") => {
+                Some((vec![u.clone(), func(vec![u.clone(), (**t).clone()], u.clone())], u.clone()))
+            }
+
+            (Type::Map(_, _), "len") => Some((vec![], Type::Int)),
+            (Type::Map(_, _), "is_empty") => Some((vec![], Type::Bool)),
+            (Type::Map(k, v), "get") => Some((vec![(**k).clone()], option(v))),
+            (Type::Map(k, _), "has") => Some((vec![(**k).clone()], Type::Bool)),
+            (Type::Map(k, v), "set") => Some((vec![(**k).clone(), (**v).clone()], recv.clone())),
+            (Type::Map(k, _), "remove") => Some((vec![(**k).clone()], recv.clone())),
+            (Type::Map(k, _), "keys") => Some((vec![], list(k))),
+            (Type::Map(_, v), "values") => Some((vec![], list(v))),
+
             (Type::Int, "to_float") => Some((vec![], Type::Float)),
+            (Type::Int, "abs") => Some((vec![], Type::Int)),
+            (Type::Int, "min" | "max") => Some((vec![Type::Int], Type::Int)),
             (Type::Float, "to_int") => Some((vec![], Type::Int)),
+            (Type::Float, "abs" | "sqrt" | "floor" | "ceil" | "round") => Some((vec![], Type::Float)),
+            (Type::Float, "min" | "max") => Some((vec![Type::Float], Type::Float)),
+
             (Type::Option(t), "unwrap_or") | (Type::Result(t, _), "unwrap_or") => {
                 Some((vec![(**t).clone()], (**t).clone()))
             }
@@ -1018,20 +1492,52 @@ impl Checker {
             }
             None => {
                 let available = match &recv {
-                    Type::Str => "len, contains, trim, to_int, to_float, to_string",
-                    Type::List(_) => "len, push, get, contains, to_string",
-                    Type::Int => "to_float, to_string",
-                    Type::Float => "to_int, to_string",
+                    Type::Str => {
+                        "len, is_empty, contains, starts_with, ends_with, trim, to_upper, to_lower, replace, split, chars, slice, to_int, to_float, to_string"
+                    }
+                    Type::List(_) => {
+                        "len, is_empty, push, get, contains, first, last, concat, reverse, slice, sort, join, map, filter, fold, any, all, to_string"
+                    }
+                    Type::Map(_, _) => "len, is_empty, get, has, set, remove, keys, values, to_string",
+                    Type::Int => "to_float, abs, min, max, to_string",
+                    Type::Float => "to_int, abs, sqrt, floor, ceil, round, min, max, to_string",
                     Type::Option(_) => "unwrap_or, is_some, is_none, to_string",
                     Type::Result(_, _) => "unwrap_or, is_ok, is_err, to_string",
                     _ => "to_string",
                 };
                 let msg = format!("type `{}` has no method `{name}`", self.show(&recv));
                 self.error_hint("E0304", msg, name_span, format!("available methods: {available}"));
-                for arg in args {
-                    self.expr(arg, true);
-                }
+                skip_args(self);
                 Type::Error
+            }
+        }
+    }
+
+    /// Looks up a user enum variant. Returns the enum type and the field types.
+    fn variant(&mut self, enum_name: &str, variant: &str, span: Span) -> Option<(Type, Vec<Type>)> {
+        let Some(info) = self.enums.get(enum_name).cloned() else {
+            let known: Vec<String> = self.enums.keys().map(|k| short(k).to_string()).collect();
+            let mut d = Diagnostic::new("E0202", format!("unknown enum `{enum_name}`"), span);
+            if let Some(s) = closest(short(enum_name), known.iter()) {
+                d = d.hint(format!("did you mean `{s}`?"));
+            }
+            self.diags.push(d);
+            return None;
+        };
+        let map = self.instantiate(&info.params);
+        let targs: Vec<Type> = info.params.iter().map(|p| map[p].clone()).collect();
+        let ty = Type::Enum(enum_name.to_string(), targs);
+        match info.variants.iter().find(|(n, _)| n == variant) {
+            Some((_, fields)) => Some((ty, fields.iter().map(|f| substitute(f, &map)).collect())),
+            None => {
+                let names: Vec<String> = info.variants.iter().map(|(n, _)| n.clone()).collect();
+                self.error_hint(
+                    "E0304",
+                    format!("enum `{enum_name}` has no variant `{variant}`"),
+                    span,
+                    format!("variants of `{enum_name}`: {}", names.join(", ")),
+                );
+                None
             }
         }
     }
@@ -1051,37 +1557,18 @@ impl Checker {
                 let t = self.expr(&args[0], true);
                 Type::Result(Box::new(self.fresh()), Box::new(t))
             }
-            _ => {
-                let Some(variants) = self.enums.get(enum_name).cloned() else {
-                    let mut d = Diagnostic::new("E0202", format!("unknown enum `{enum_name}`"), span);
-                    if let Some(s) = closest(enum_name, self.enums.keys()) {
-                        d = d.hint(format!("did you mean `{s}`?"));
-                    }
-                    self.diags.push(d);
+            _ => match self.variant(enum_name, variant, span) {
+                Some((ty, fields)) => {
+                    self.check_args(&format!("`{}.{variant}`", short(enum_name)), &fields, args, span);
+                    ty
+                }
+                None => {
                     for arg in args {
                         self.expr(arg, true);
                     }
-                    return Type::Error;
-                };
-                match variants.iter().find(|(n, _)| n == variant) {
-                    Some((_, params)) => {
-                        self.check_args(&format!("`{enum_name}.{variant}`"), params, args, span);
-                    }
-                    None => {
-                        let names: Vec<String> = variants.iter().map(|(n, _)| n.clone()).collect();
-                        self.error_hint(
-                            "E0304",
-                            format!("enum `{enum_name}` has no variant `{variant}`"),
-                            span,
-                            format!("variants of `{enum_name}`: {}", names.join(", ")),
-                        );
-                        for arg in args {
-                            self.expr(arg, true);
-                        }
-                    }
+                    Type::Error
                 }
-                Type::Enum(enum_name.to_string())
-            }
+            },
         }
     }
 
@@ -1109,23 +1596,10 @@ impl Checker {
                         let t = self.fresh();
                         (Type::Result(Box::new(self.fresh()), Box::new(t.clone())), vec![t])
                     }
-                    _ => {
-                        let Some(variants) = self.enums.get(enum_name).cloned() else {
-                            self.error("E0202", format!("unknown enum `{enum_name}`"), pat.span);
-                            return;
-                        };
-                        match variants.into_iter().find(|(n, _)| n == variant) {
-                            Some((_, params)) => (Type::Enum(enum_name.clone()), params),
-                            None => {
-                                self.error(
-                                    "E0304",
-                                    format!("enum `{enum_name}` has no variant `{variant}`"),
-                                    pat.span,
-                                );
-                                return;
-                            }
-                        }
-                    }
+                    _ => match self.variant(enum_name, variant, pat.span) {
+                        Some(found) => found,
+                        None => return,
+                    },
                 };
                 self.expect_pattern(&pat_ty, ty, pat.span);
                 if params.len() != args.len() {
@@ -1158,77 +1632,175 @@ impl Checker {
         }
     }
 
-    /// Returns a description of a value not covered by `pats`, or None when the
-    /// patterns are exhaustive. Conservative: it may reject an exhaustive match
-    /// that relies on combining several multi-field patterns, but it never
-    /// accepts a non-exhaustive one.
-    fn missing(&self, pats: &[&Pattern], ty: &Type) -> Option<String> {
-        if pats.iter().any(|p| p.is_irrefutable()) {
-            return None;
+    // ---- exhaustiveness (pattern matrix algorithm) ----
+
+    /// The complete set of constructors of a type, or None when it is open-ended.
+    fn ctors_of(&self, ty: &Type) -> Option<Vec<Ctor>> {
+        let ctor = |key: &str, display: String, fields: Vec<Type>| Ctor { key: key.to_string(), display, fields };
+        match self.resolve(ty) {
+            Type::Bool => Some(vec![ctor("true", "true".into(), vec![]), ctor("false", "false".into(), vec![])]),
+            Type::Option(t) => Some(vec![ctor("Some", "Some".into(), vec![*t]), ctor("None", "None".into(), vec![])]),
+            Type::Result(t, e) => {
+                Some(vec![ctor("Ok", "Ok".into(), vec![*t]), ctor("Err", "Err".into(), vec![*e])])
+            }
+            Type::Enum(name, targs) => {
+                let info = self.enums.get(&name)?;
+                let map: HashMap<String, Type> = info.params.iter().cloned().zip(targs).collect();
+                Some(
+                    info.variants
+                        .iter()
+                        .map(|(v, fields)| {
+                            let fields = fields.iter().map(|f| substitute(f, &map)).collect();
+                            ctor(v, format!("{}.{v}", short(&name)), fields)
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
         }
-        let sub = |variant: &str| -> Vec<&Pattern> {
-            pats.iter()
-                .filter_map(|p| match &p.kind {
-                    PatKind::Ctor { variant: v, args, .. } if v == variant => args.first(),
-                    _ => None,
-                })
-                .collect()
-        };
-        let has = |variant: &str| {
-            pats.iter().any(|p| matches!(&p.kind, PatKind::Ctor { variant: v, .. } if v == variant))
-        };
-        match self.apply(ty) {
-            Type::Bool => {
-                for value in [true, false] {
-                    if !pats.iter().any(|p| matches!(p.kind, PatKind::Bool(b) if b == value)) {
-                        return Some(value.to_string());
+    }
+
+    fn simplify(pat: &Pattern) -> SPat {
+        match &pat.kind {
+            PatKind::Wildcard | PatKind::Bind(_) => SPat::Wild,
+            PatKind::Int(n) => SPat::Con(format!("#{n}"), vec![]),
+            PatKind::Str(s) => SPat::Con(format!("\"{s}"), vec![]),
+            PatKind::Bool(b) => SPat::Con(b.to_string(), vec![]),
+            PatKind::Ctor { variant, args, .. } => {
+                SPat::Con(variant.clone(), args.iter().map(Checker::simplify).collect())
+            }
+        }
+    }
+
+    /// Rows that can match a value built with constructor `key`.
+    fn specialize(rows: &[Vec<SPat>], key: &str, arity: usize) -> Vec<Vec<SPat>> {
+        let mut out = Vec::new();
+        for row in rows {
+            let mut new_row = match &row[0] {
+                SPat::Wild => vec![SPat::Wild; arity],
+                SPat::Con(k, args) if k == key => {
+                    let mut args = args.clone();
+                    args.resize(arity, SPat::Wild);
+                    args
+                }
+                SPat::Con(..) => continue,
+            };
+            new_row.extend_from_slice(&row[1..]);
+            out.push(new_row);
+        }
+        out
+    }
+
+    fn default_rows(rows: &[Vec<SPat>]) -> Vec<Vec<SPat>> {
+        rows.iter().filter(|r| matches!(r[0], SPat::Wild)).map(|r| r[1..].to_vec()).collect()
+    }
+
+    fn heads(rows: &[Vec<SPat>]) -> HashSet<&str> {
+        rows.iter()
+            .filter_map(|r| match &r[0] {
+                SPat::Con(k, _) => Some(k.as_str()),
+                SPat::Wild => None,
+            })
+            .collect()
+    }
+
+    /// Whether `q` matches some value that none of `rows` matches.
+    fn useful(&self, rows: &[Vec<SPat>], q: &[SPat], tys: &[Type]) -> bool {
+        if q.is_empty() || tys.is_empty() {
+            return rows.is_empty();
+        }
+        let sig = self.ctors_of(&tys[0]);
+        match &q[0] {
+            SPat::Con(key, args) => {
+                let fields = sig
+                    .and_then(|s| s.into_iter().find(|c| &c.key == key))
+                    .map(|c| c.fields)
+                    .unwrap_or_default();
+                if fields.len() != args.len() {
+                    return true;
+                }
+                let rows = Checker::specialize(rows, key, args.len());
+                let q: Vec<SPat> = args.iter().chain(&q[1..]).cloned().collect();
+                let tys: Vec<Type> = fields.iter().chain(&tys[1..]).cloned().collect();
+                self.useful(&rows, &q, &tys)
+            }
+            SPat::Wild => {
+                let heads = Checker::heads(rows);
+                match sig {
+                    Some(sig) if sig.iter().all(|c| heads.contains(c.key.as_str())) => sig.iter().any(|c| {
+                        let rows = Checker::specialize(rows, &c.key, c.fields.len());
+                        let q: Vec<SPat> =
+                            std::iter::repeat(SPat::Wild).take(c.fields.len()).chain(q[1..].iter().cloned()).collect();
+                        let tys: Vec<Type> = c.fields.iter().chain(&tys[1..]).cloned().collect();
+                        self.useful(&rows, &q, &tys)
+                    }),
+                    _ => self.useful(&Checker::default_rows(rows), &q[1..], &tys[1..]),
+                }
+            }
+        }
+    }
+
+    /// An example of values (one per column) that no row matches, if any.
+    fn witness(&self, rows: &[Vec<SPat>], tys: &[Type]) -> Option<Vec<String>> {
+        if tys.is_empty() {
+            return if rows.is_empty() { Some(Vec::new()) } else { None };
+        }
+        let sig = self.ctors_of(&tys[0]);
+        let heads = Checker::heads(rows);
+        if let Some(sig) = &sig {
+            if sig.iter().all(|c| heads.contains(c.key.as_str())) {
+                for c in sig {
+                    let rows = Checker::specialize(rows, &c.key, c.fields.len());
+                    let tys: Vec<Type> = c.fields.iter().chain(&tys[1..]).cloned().collect();
+                    if let Some(w) = self.witness(&rows, &tys) {
+                        let (args, rest) = w.split_at(c.fields.len());
+                        let head = if args.is_empty() {
+                            c.display.clone()
+                        } else {
+                            format!("{}({})", c.display, args.join(", "))
+                        };
+                        return Some(std::iter::once(head).chain(rest.iter().cloned()).collect());
                     }
                 }
-                None
+                return None;
             }
-            Type::Option(inner) => {
-                if !has("None") {
-                    return Some("None".to_string());
-                }
-                self.missing(&sub("Some"), &inner).map(|m| format!("Some({m})"))
+        }
+        let rest = self.witness(&Checker::default_rows(rows), &tys[1..])?;
+        let head = match sig.and_then(|s| s.into_iter().find(|c| !heads.contains(c.key.as_str()))) {
+            Some(c) if c.fields.is_empty() => c.display,
+            Some(c) => format!("{}({})", c.display, vec!["_"; c.fields.len()].join(", ")),
+            None => "_".to_string(),
+        };
+        Some(std::iter::once(head).chain(rest).collect())
+    }
+
+    fn check_exhaustive(&mut self, arms: &[Arm], scrut_ty: &Type, span: Span) {
+        let ty = self.apply(scrut_ty);
+        if matches!(ty, Type::Error | Type::Never) {
+            return;
+        }
+        let tys = [ty];
+        let mut rows: Vec<Vec<SPat>> = Vec::new();
+        for arm in arms {
+            let row = vec![Checker::simplify(&arm.pat)];
+            if !self.useful(&rows, &row, &tys) {
+                self.error_hint(
+                    "E0314",
+                    "unreachable match arm: earlier arms already cover every value it matches",
+                    arm.pat.span,
+                    "remove this arm, or move it above the arm that covers it",
+                );
             }
-            Type::Result(ok, err) => {
-                if let Some(m) = self.missing(&sub("Ok"), &ok) {
-                    return Some(format!("Ok({m})"));
-                }
-                self.missing(&sub("Err"), &err).map(|m| format!("Err({m})"))
-            }
-            Type::Enum(name) => {
-                let variants = self.enums.get(&name)?;
-                for (variant, fields) in variants {
-                    match fields.len() {
-                        0 => {
-                            if !has(variant) {
-                                return Some(format!("{name}.{variant}"));
-                            }
-                        }
-                        1 => {
-                            if let Some(m) = self.missing(&sub(variant), &fields[0]) {
-                                return Some(format!("{name}.{variant}({m})"));
-                            }
-                        }
-                        n => {
-                            let covered = pats.iter().any(|p| match &p.kind {
-                                PatKind::Ctor { variant: v, args, .. } => {
-                                    v == variant && args.iter().all(|a| a.is_irrefutable())
-                                }
-                                _ => false,
-                            });
-                            if !covered {
-                                return Some(format!("{name}.{variant}({})", vec!["_"; n].join(", ")));
-                            }
-                        }
-                    }
-                }
-                None
-            }
-            Type::Error | Type::Never => None,
-            _ => Some("_".to_string()),
+            rows.push(row);
+        }
+        if let Some(w) = self.witness(&rows, &tys) {
+            let missing = w.first().cloned().unwrap_or_else(|| "_".to_string());
+            self.error_hint(
+                "E0308",
+                format!("match is not exhaustive: `{missing}` is not covered"),
+                span,
+                format!("add an arm for `{missing}`, or a catch-all arm `_ => ...`"),
+            );
         }
     }
 }

@@ -1,0 +1,38 @@
+// 図形の定義。モジュールの中では、自分の宣言を修飾なしで参照する
+import geometry.units
+
+struct Point {
+  x: Float,
+  y: Float,
+}
+
+enum Shape {
+  Circle(Float),
+  Rect(Float, Float),
+}
+
+fn area(s: Shape) -> Float {
+  match s {
+    Shape.Circle(r) => units.pi() * r * r
+    Shape.Rect(w, h) => w * h
+  }
+}
+
+fn name(s: Shape) -> String {
+  match s {
+    Shape.Circle(_) => "circle"
+    Shape.Rect(_, _) => "rect"
+  }
+}
+
+fn unit_square() -> Shape {
+  Shape.Rect(1.0, 1.0)
+}
+
+fn origin_distance(p: Point) -> Float {
+  p.x.abs() + p.y.abs()
+}
+
+test "area" {
+  assert area(unit_square()) == 1.0
+}

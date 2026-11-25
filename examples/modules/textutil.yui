@@ -1,0 +1,7 @@
+fn pad_left(s: String, width: Int) -> String {
+  let mut out = s
+  while out.len() < width {
+    out = " {out}"
+  }
+  out
+}

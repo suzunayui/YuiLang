@@ -2,15 +2,15 @@
 
 AI駆動開発で効率よく書けることを目指すプログラミング言語です。
 
-- AIが間違えにくい: 見慣れた構文、書き方は一通り、暗黙の挙動なし
-- 間違いをすぐ検出できる: 静的型、網羅必須の `match`、言語組み込みのテストと契約
-- 機械が読める: すべてのエラーにコード・位置・修正ヒントがあり、JSONで出力できる
+- **AIが間違えにくい**: 見慣れた構文、書き方は一通り、暗黙の挙動なし
+- **間違いをすぐ検出できる**: 静的型、網羅必須の `match`、言語組み込みのテストと契約、副作用の宣言
+- **機械が読める**: すべてのエラーにコード・位置・修正ヒントがあり、JSONで出力できる
+- **ファイル1個で環境が完成する**: `yui` は単体の実行ファイル。ランタイムのインストールも展開作業も不要で、
+  型チェック・実行・テスト・整形がこの1個に入っている
 
 ```
 fn divide(a: Int, b: Int) -> Result<Int, String> {
-  if b == 0 {
-    return Err("division by zero")
-  }
+  if b == 0 { return Err("division by zero") }
   Ok(a / b)
 }
 
@@ -20,37 +20,41 @@ test "divide" {
 }
 
 fn main() uses io {
-  match divide(10, 2) {
-    Ok(v) => print("result: {v}")
-    Err(e) => print("error: {e}")
+  let results = [10, 0, 4].map(|b| divide(100, b))
+  for r in results {
+    match r {
+      Ok(v) => print("result: {v}")
+      Err(e) => print("error: {e}")
+    }
   }
 }
 ```
 
 言語仕様は [SPEC.md](SPEC.md)、サンプルは [examples](examples) にあります。
 
-## 現在の状態
+## インストール
 
-v0.1。型チェッカ付きのツリーウォーク型インタプリタです。処理系は Rust 製で、外部クレートへの依存はありません。
-1ファイルのプログラムだけを扱えます（モジュール、ジェネリクス、クロージャは未実装）。
+[Releases](https://github.com/suzunayui/YuiLang/releases) から自分のOS用のファイルを1個ダウンロードするだけです。
 
-## ビルド
+| OS | ファイル |
+| --- | --- |
+| Windows (x86_64) | `yui-windows-x86_64.exe` |
+| Linux (x86_64) | `yui-linux-x86_64` |
+| macOS (Apple Silicon) | `yui-macos-arm64` |
+| macOS (Intel) | `yui-macos-x86_64` |
 
-[Rust](https://www.rust-lang.org/) が必要です。
-
-```
-cargo build --release
-```
-
-`target/release/yui`（Windows では `yui.exe`）ができます。
+好きな場所に置いて `yui`（Windows は `yui.exe`）という名前にすれば使えます。
+Linux と macOS では `chmod +x yui` で実行権限を付けてください。
+ほかに必要なものはありません（Windows 版は VC++ ランタイム不要、Linux 版は静的リンク）。
 
 ## 使い方
 
 ```
-yui check   <file> [--json]   型チェックのみ
-yui run     <file> [--json]   main を実行
-yui test    <file> [--json]   test ブロックを実行
-yui outline <file>            宣言のシグネチャだけを表示
+yui check   <file> [--json]              型チェック（import したモジュールも含む）
+yui run     <file> [--json] [-- 引数...]  main を実行
+yui test    <file> [--json]              test ブロックを実行
+yui fmt     <file> [--check]             整形して上書き
+yui outline <file>                       宣言のシグネチャだけを表示
 ```
 
 ```
@@ -58,9 +62,13 @@ $ yui run examples/hello.yui
 result: 5
 error: division by zero
 
-$ yui test examples/hello.yui
-ok    divide
-1 passed, 0 failed
+$ yui test examples/generics.yui
+ok    generic struct
+ok    generic enum
+ok    closures
+ok    captures are copies
+ok    list pipelines
+5 passed, 0 failed
 ```
 
 エラーは修正のヒント付きで表示されます。
@@ -76,14 +84,39 @@ error[E0305]: unused value of type `List<Int>`
 
 `--json` を付けると同じ内容がJSONになります。
 
-## 処理系のテスト
+## 言語の機能
+
+- 静的型と型推論、ジェネリクス（`struct Pair<A, B>`、`fn map<T, U>(...)`）
+- `struct` / `enum` とパターンマッチ（網羅性と到達不能な腕を検査）
+- クロージャと関数型（`|x| x + 1`、`fn(Int) -> Int`）
+- `Option` / `Result` と `?` 演算子（null と例外はない）
+- 副作用の宣言（`uses io`、`uses fs`）
+- 契約（`requires` / `ensures`）と言語組み込みの `test` / `assert`
+- モジュール（`import geometry.shapes` → `shapes.area(...)`）
+- `List` / `Map` / `String` の標準メソッド
+- 値セマンティクス（参照の共有が起きない）
+
+## ソースからビルド
+
+[Rust](https://www.rust-lang.org/) が必要です。外部クレートへの依存はありません。
 
 ```
+cargo build --release
 cargo test
 ```
 
-`examples/` のプログラムがすべて通ることと、`tests/errors/` の各ファイルが
-1行目に書かれたエラーコードで失敗することを確認します。
+`target/release/yui`（Windows では `yui.exe`）ができます。
+`cargo test` は、`examples/` のプログラムがすべて通ること、`tests/errors/` の各ファイルが
+1行目に書かれたエラーコードで失敗すること、整形結果が安定していることを確認します。
+
+## リリースの作り方
+
+`v0.2.0` のようなタグを push すると、GitHub Actions が各OS用の単体バイナリをビルドして Release に添付します。
+
+```
+git tag v0.2.0
+git push origin v0.2.0
+```
 
 ## ライセンス
 

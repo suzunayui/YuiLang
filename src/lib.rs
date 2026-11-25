@@ -3,20 +3,91 @@
 pub mod ast;
 pub mod checker;
 pub mod diag;
+pub mod fmt;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
 
-use diag::Diagnostic;
+use diag::{Diagnostic, SourceMap, Span};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
-/// Parses and type-checks a source file.
-pub fn load(src: &str) -> Result<ast::Program, Vec<Diagnostic>> {
-    let program = parser::parse_program(src).map_err(|d| vec![d])?;
+/// A type-checked program together with the sources it was loaded from.
+pub struct Loaded {
+    pub program: ast::Program,
+    pub sources: SourceMap,
+}
+
+pub type LoadError = (Vec<Diagnostic>, SourceMap);
+
+/// Loads the entry file and every module it imports, then type-checks them.
+/// Imports are resolved relative to `root` (default: the entry file's directory).
+pub fn load_path(path: &Path, root: Option<&Path>) -> Result<Loaded, LoadError> {
+    let name = path.to_string_lossy().to_string();
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            let d = Diagnostic::new("E0208", format!("cannot read `{name}`: {e}"), Span::new(0, 0));
+            return Err((vec![d], SourceMap::single(&name, "")));
+        }
+    };
+    let root = match root {
+        Some(r) => r.to_path_buf(),
+        None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    load(&name, &src, &root, Some(path))
+}
+
+/// Loads a program from a string. Imports are resolved relative to the current directory.
+pub fn load_str(src: &str) -> Result<Loaded, LoadError> {
+    load("main.yui", src, Path::new("."), None)
+}
+
+fn load(name: &str, src: &str, root: &Path, entry: Option<&Path>) -> Result<Loaded, LoadError> {
+    let mut sources = SourceMap::default();
+    let base = sources.add(name, src);
+    let mut program = match parser::parse_file(src, base, "", true) {
+        Ok(p) => p,
+        Err(d) => return Err((vec![d], sources)),
+    };
+
+    let entry = entry.and_then(|p| p.canonicalize().ok());
+    let mut loaded: HashSet<String> = HashSet::new();
+    let mut queue: Vec<(String, Span)> = program.imports.iter().map(|i| (i.path.clone(), i.span)).collect();
+    while let Some((module, span)) = queue.pop() {
+        if !loaded.insert(module.clone()) {
+            continue;
+        }
+        let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("yui");
+        let file = root.join(&relative);
+        let display = file.to_string_lossy().to_string();
+        if entry.is_some() && file.canonicalize().ok() == entry {
+            let d = Diagnostic::new("E0208", format!("module `{module}` is the entry file and cannot be imported"), span);
+            return Err((vec![d], sources));
+        }
+        let text = match std::fs::read_to_string(&file) {
+            Ok(t) => t,
+            Err(_) => {
+                let d = Diagnostic::new("E0208", format!("cannot find module `{module}`"), span)
+                    .hint(format!("expected the file `{}`", display.replace('\\', "/")));
+                return Err((vec![d], sources));
+            }
+        };
+        let base = sources.add(&display, &text);
+        match parser::parse_file(&text, base, &module, true) {
+            Ok(parsed) => {
+                queue.extend(parsed.imports.iter().map(|i| (i.path.clone(), i.span)));
+                program.items.extend(parsed.items);
+            }
+            Err(d) => return Err((vec![d], sources)),
+        }
+    }
+
     let diags = checker::check(&program);
     if diags.is_empty() {
-        Ok(program)
+        Ok(Loaded { program, sources })
     } else {
-        Err(diags)
+        Err((diags, sources))
     }
 }
 
@@ -25,7 +96,7 @@ pub fn check_main(program: &ast::Program) -> Result<(), Diagnostic> {
     for item in &program.items {
         if let ast::Item::Fn(f) = item {
             if f.name == "main" {
-                if !f.params.is_empty() || f.ret.is_some() {
+                if !f.params.is_empty() || f.ret.is_some() || !f.type_params.is_empty() {
                     return Err(Diagnostic::new(
                         "E0207",
                         "`main` must take no parameters and return nothing",
@@ -37,14 +108,24 @@ pub fn check_main(program: &ast::Program) -> Result<(), Diagnostic> {
             }
         }
     }
-    Err(Diagnostic::new("E0207", "no `main` function found", diag::Span::new(0, 0))
+    Err(Diagnostic::new("E0207", "no `main` function found", Span::new(0, 0))
         .hint("add `fn main() uses io { ... }`"))
 }
 
-/// One-line-per-declaration summary of a program: signatures without bodies.
-pub fn outline(program: &ast::Program, src: &str) -> String {
+/// One-line-per-declaration summary of the entry file: signatures without bodies.
+pub fn outline(loaded: &Loaded) -> String {
     use ast::Item;
-    let effects = |effects: &[(String, diag::Span)]| {
+    let sources = &loaded.sources;
+    let src = &sources.text;
+    let entry_end = sources.files.first().map_or(0, |f| f.end);
+    let generics = |params: &[String]| {
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", params.join(", "))
+        }
+    };
+    let effects = |effects: &[(String, Span)]| {
         if effects.is_empty() {
             String::new()
         } else {
@@ -53,15 +134,26 @@ pub fn outline(program: &ast::Program, src: &str) -> String {
         }
     };
     let mut out = String::new();
-    for item in &program.items {
+    for import in &loaded.program.imports {
+        let (_, line, _) = sources.locate(import.span.start);
+        out.push_str(&format!("{line}: import {}\n", import.path));
+    }
+    for item in &loaded.program.items {
+        if item.span().start > entry_end {
+            continue;
+        }
+        let (_, line, _) = sources.locate(item.span().start);
         match item {
             Item::Struct(s) => {
-                let (line, _) = diag::line_col(src, s.name_span.start);
                 let fields: Vec<String> = s.fields.iter().map(|f| format!("{}: {}", f.name, f.ty)).collect();
-                out.push_str(&format!("{line}: struct {} {{ {} }}\n", s.name, fields.join(", ")));
+                out.push_str(&format!(
+                    "{line}: struct {}{} {{ {} }}\n",
+                    s.name,
+                    generics(&s.type_params),
+                    fields.join(", ")
+                ));
             }
             Item::Enum(e) => {
-                let (line, _) = diag::line_col(src, e.name_span.start);
                 let variants: Vec<String> = e
                     .variants
                     .iter()
@@ -74,18 +166,24 @@ pub fn outline(program: &ast::Program, src: &str) -> String {
                         }
                     })
                     .collect();
-                out.push_str(&format!("{line}: enum {} {{ {} }}\n", e.name, variants.join(", ")));
+                out.push_str(&format!(
+                    "{line}: enum {}{} {{ {} }}\n",
+                    e.name,
+                    generics(&e.type_params),
+                    variants.join(", ")
+                ));
             }
             Item::Fn(f) => {
-                let (line, _) = diag::line_col(src, f.name_span.start);
                 let params: Vec<String> = f.params.iter().map(|p| format!("{}: {}", p.name, p.ty)).collect();
                 let ret = match &f.ret {
+                    Some(t) if matches!(t.kind, ast::TypeKind::Fn(..)) => format!(" -> ({t})"),
                     Some(t) => format!(" -> {t}"),
                     None => String::new(),
                 };
                 out.push_str(&format!(
-                    "{line}: fn {}({}){ret}{}\n",
+                    "{line}: fn {}{}({}){ret}{}\n",
                     f.name,
+                    generics(&f.type_params),
                     params.join(", "),
                     effects(&f.effects)
                 ));
@@ -97,7 +195,6 @@ pub fn outline(program: &ast::Program, src: &str) -> String {
                 }
             }
             Item::Test(t) => {
-                let (line, _) = diag::line_col(src, t.name_span.start);
                 out.push_str(&format!("{line}: test {:?}{}\n", t.name, effects(&t.effects)));
             }
         }

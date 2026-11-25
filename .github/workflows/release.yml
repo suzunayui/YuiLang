@@ -1,0 +1,62 @@
+# Builds single-file `yui` binaries and attaches them to a GitHub Release
+# whenever a tag such as `v0.2.0` is pushed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release if it does not exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$GITHUB_REF_NAME" || gh release create "$GITHUB_REF_NAME" --generate-notes
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: yui.exe
+            asset: yui-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: yui
+            asset: yui-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: yui
+            asset: yui-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: yui
+            asset: yui-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Upload the binary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+          gh release upload "$GITHUB_REF_NAME" "${{ matrix.asset }}" --clobber

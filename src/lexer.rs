@@ -30,6 +30,7 @@ pub enum Tok {
     Struct,
     Enum,
     Test,
+    Import,
     Assert,
     Uses,
     Requires,
@@ -64,6 +65,7 @@ pub enum Tok {
     OrOr,
     Bang,
     Question,
+    Pipe,
     Eof,
 }
 
@@ -96,6 +98,7 @@ impl Tok {
             Tok::Struct => "struct",
             Tok::Enum => "enum",
             Tok::Test => "test",
+            Tok::Import => "import",
             Tok::Assert => "assert",
             Tok::Uses => "uses",
             Tok::Requires => "requires",
@@ -130,6 +133,7 @@ impl Tok {
             Tok::OrOr => "||",
             Tok::Bang => "!",
             Tok::Question => "?",
+            Tok::Pipe => "|",
             _ => "?",
         }
     }
@@ -159,6 +163,7 @@ fn keyword(s: &str) -> Option<Tok> {
         "struct" => Tok::Struct,
         "enum" => Tok::Enum,
         "test" => Tok::Test,
+        "import" => Tok::Import,
         "assert" => Tok::Assert,
         "uses" => Tok::Uses,
         "requires" => Tok::Requires,
@@ -172,7 +177,13 @@ fn keyword(s: &str) -> Option<Tok> {
 /// Lex `src`. `base` is added to every span so that interpolated code inside a
 /// string literal reports positions in the enclosing file.
 pub fn lex(src: &str, base: usize) -> Result<Vec<Token>, Diagnostic> {
+    lex_full(src, base).map(|(toks, _)| toks)
+}
+
+/// Like `lex`, but also returns the span of every `//` comment.
+pub fn lex_full(src: &str, base: usize) -> Result<(Vec<Token>, Vec<Span>), Diagnostic> {
     let b = src.as_bytes();
+    let mut comments = Vec::new();
     let mut i = 0;
     let mut toks = Vec::new();
     let mut nl = true;
@@ -189,9 +200,11 @@ pub fn lex(src: &str, base: usize) -> Result<Vec<Token>, Diagnostic> {
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
+            let start = i;
+            while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                 i += 1;
             }
+            comments.push(Span::new(base + start, base + i));
             continue;
         }
 
@@ -270,6 +283,7 @@ pub fn lex(src: &str, base: usize) -> Result<Vec<Token>, Diagnostic> {
                         b'%' => Tok::Percent,
                         b'!' => Tok::Bang,
                         b'?' => Tok::Question,
+                        b'|' => Tok::Pipe,
                         _ => {
                             let ch = src[i..].chars().next().unwrap();
                             let span = Span::new(base + i, base + i + ch.len_utf8());
@@ -298,7 +312,7 @@ pub fn lex(src: &str, base: usize) -> Result<Vec<Token>, Diagnostic> {
     }
 
     toks.push(Token { tok: Tok::Eof, span: Span::new(base + b.len(), base + b.len()), nl_before: nl });
-    Ok(toks)
+    Ok((toks, comments))
 }
 
 /// Lex a string literal starting at the opening quote. Returns its parts and

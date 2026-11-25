@@ -1,0 +1,9 @@
+// expect: E0313
+fn f() -> Int {
+  let mut total = 0
+  let add = |x: Int| {
+    total = total + x
+  }
+  add(1)
+  total
+}

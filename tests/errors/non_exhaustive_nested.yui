@@ -1,0 +1,8 @@
+// expect: E0308
+enum Flags { Pair(Bool, Bool) }
+fn f(x: Flags) -> Int {
+  match x {
+    Flags.Pair(true, _) => 1
+    Flags.Pair(false, true) => 2
+  }
+}

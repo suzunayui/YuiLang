@@ -1,0 +1,7 @@
+// expect: E0301
+fn id<T>(x: T) -> T {
+  x
+}
+fn f() -> Int {
+  id("a")
+}

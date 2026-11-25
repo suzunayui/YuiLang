@@ -56,9 +56,7 @@ fn fib(n: Int) -> Int
 
 fn first_even(xs: List<Int>) -> Option<Int> {
   for x in xs {
-    if x % 2 == 0 {
-      return Some(x)
-    }
+    if x % 2 == 0 { return Some(x) }
   }
   None
 }
@@ -135,4 +133,22 @@ fn main() uses io {
   print("squares: {squares(5)}")
   print("fib(20) = {fib(20)}")
   print("point: {move_right(Point { x: 0, y: 0 }, 3)}")
+}
+
+enum Flags {
+  Pair(Bool, Bool),
+}
+
+// 複数フィールドの場合分けも、網羅していれば通る
+fn code(f: Flags) -> Int {
+  match f {
+    Flags.Pair(true, true) => 3
+    Flags.Pair(true, false) => 2
+    Flags.Pair(false, _) => 1
+  }
+}
+
+test "nested patterns" {
+  assert code(Flags.Pair(true, false)) == 2
+  assert code(Flags.Pair(false, true)) == 1
 }

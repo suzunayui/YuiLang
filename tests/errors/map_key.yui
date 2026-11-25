@@ -1,0 +1,5 @@
+// expect: E0315
+fn f() -> Int {
+  let m: Map<Float, Int> = Map {}
+  m.len()
+}

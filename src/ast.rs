@@ -1,10 +1,28 @@
 //! Abstract syntax tree.
+//!
+//! When a program is loaded for checking and running, the parser rewrites every
+//! reference to a top-level declaration into its canonical, module-qualified
+//! name (`geometry.shapes.area`), so later stages never deal with imports.
 
 use crate::diag::Span;
 use std::rc::Rc;
 
+pub const BUILTIN_FNS: &[&str] = &["print", "read_line", "panic", "read_file", "write_file", "args"];
+pub const BUILTIN_TYPES: &[&str] =
+    &["Int", "Float", "Bool", "String", "Unit", "List", "Option", "Result", "Map"];
+pub const EFFECTS: &[&str] = &["io", "fs"];
+
 pub struct Program {
+    pub imports: Vec<Import>,
     pub items: Vec<Item>,
+}
+
+pub struct Import {
+    /// Dotted module path, e.g. `geometry.shapes`.
+    pub path: String,
+    /// Last segment of the path; the name used to refer to the module.
+    pub alias: String,
+    pub span: Span,
 }
 
 pub enum Item {
@@ -12,6 +30,17 @@ pub enum Item {
     Struct(StructDecl),
     Enum(EnumDecl),
     Test(Rc<TestDecl>),
+}
+
+impl Item {
+    pub fn span(&self) -> Span {
+        match self {
+            Item::Fn(f) => f.span,
+            Item::Struct(s) => s.span,
+            Item::Enum(e) => e.span,
+            Item::Test(t) => t.span,
+        }
+    }
 }
 
 pub struct Param {
@@ -23,6 +52,8 @@ pub struct Param {
 pub struct FnDecl {
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
+    pub type_params: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub effects: Vec<(String, Span)>,
@@ -34,12 +65,16 @@ pub struct FnDecl {
 pub struct StructDecl {
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
+    pub type_params: Vec<String>,
     pub fields: Vec<Param>,
 }
 
 pub struct EnumDecl {
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
+    pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
 }
 
@@ -52,30 +87,51 @@ pub struct Variant {
 pub struct TestDecl {
     pub name: String,
     pub name_span: Span,
+    pub span: Span,
     pub effects: Vec<(String, Span)>,
     pub body: Block,
+    /// True for tests in the entry file; only these are run.
+    pub root: bool,
 }
 
 pub struct TypeExpr {
-    pub name: String,
-    pub args: Vec<TypeExpr>,
+    pub kind: TypeKind,
     pub span: Span,
+}
+
+pub enum TypeKind {
+    Named(String, Vec<TypeExpr>),
+    /// `fn(params) -> ret uses effects`
+    Fn(Vec<TypeExpr>, Option<Box<TypeExpr>>, Vec<String>),
 }
 
 impl std::fmt::Display for TypeExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.name)?;
-        if !self.args.is_empty() {
-            write!(f, "<")?;
-            for (i, a) in self.args.iter().enumerate() {
-                if i > 0 {
-                    write!(f, ", ")?;
+        let list = |items: &[TypeExpr]| items.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ");
+        match &self.kind {
+            TypeKind::Named(name, args) => {
+                write!(f, "{name}")?;
+                if !args.is_empty() {
+                    write!(f, "<{}>", list(args))?;
                 }
-                write!(f, "{a}")?;
+                Ok(())
             }
-            write!(f, ">")?;
+            TypeKind::Fn(params, ret, effects) => {
+                write!(f, "fn({})", list(params))?;
+                if let Some(ret) = ret {
+                    // A function type in return position needs parentheses so that
+                    // a following `uses` clause is not attached to it.
+                    match ret.kind {
+                        TypeKind::Fn(..) => write!(f, " -> ({ret})")?,
+                        _ => write!(f, " -> {ret}")?,
+                    }
+                }
+                if !effects.is_empty() {
+                    write!(f, " uses {}", effects.join(", "))?;
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -85,13 +141,25 @@ pub struct Block {
 }
 
 pub enum Stmt {
-    Let { name: String, name_span: Span, mutable: bool, ty: Option<TypeExpr>, value: Expr },
+    Let { name: String, name_span: Span, mutable: bool, ty: Option<TypeExpr>, value: Expr, span: Span },
     Assign { target: Expr, value: Expr },
-    While { cond: Expr, body: Block },
+    While { cond: Expr, body: Block, span: Span },
     /// `for var in iter { .. }` or, when `end` is set, `for var in iter..end { .. }`.
-    For { var: String, var_span: Span, iter: Expr, end: Option<Expr>, body: Block },
+    For { var: String, var_span: Span, iter: Expr, end: Option<Expr>, body: Block, span: Span },
     Assert { cond: Expr, span: Span },
     Expr(Expr),
+}
+
+impl Stmt {
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Let { span, .. } | Stmt::While { span, .. } | Stmt::For { span, .. } | Stmt::Assert { span, .. } => {
+                *span
+            }
+            Stmt::Assign { target, value } => target.span.to(value.span),
+            Stmt::Expr(e) => e.span,
+        }
+    }
 }
 
 pub struct Expr {
@@ -151,16 +219,28 @@ impl BinOp {
     }
 }
 
+pub struct ClosureParam {
+    pub name: String,
+    pub span: Span,
+    pub ty: Option<TypeExpr>,
+}
+
 pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Unit,
     Str(Vec<StrPart>),
+    /// A local variable.
     Ident(String),
+    /// A top-level function used as a value (also any name that is not a local).
+    FnRef(String),
     List(Vec<Expr>),
+    MapLit(Vec<(Expr, Expr)>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
-    Call { name: String, name_span: Span, args: Vec<Expr> },
+    /// `local` is true when `name` is a local variable holding a function value.
+    Call { name: String, name_span: Span, local: bool, args: Vec<Expr> },
     MethodCall { recv: Box<Expr>, name: String, name_span: Span, args: Vec<Expr> },
     Field(Box<Expr>, String, Span),
     Index(Box<Expr>, Box<Expr>),
@@ -171,6 +251,8 @@ pub enum ExprKind {
     If { cond: Box<Expr>, then: Block, els: Option<Box<Expr>> },
     Match { scrutinee: Box<Expr>, arms: Vec<Arm> },
     Block(Block),
+    /// `captures` lists the enclosing local variables the body refers to.
+    Closure { params: Vec<ClosureParam>, captures: Vec<String>, body: Rc<Expr> },
     Return(Option<Box<Expr>>),
     Break,
     Continue,
@@ -194,10 +276,4 @@ pub enum PatKind {
     Str(String),
     Bool(bool),
     Ctor { enum_name: String, variant: String, args: Vec<Pattern> },
-}
-
-impl Pattern {
-    pub fn is_irrefutable(&self) -> bool {
-        matches!(self.kind, PatKind::Wildcard | PatKind::Bind(_))
-    }
 }

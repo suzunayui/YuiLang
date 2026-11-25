@@ -1,0 +1,5 @@
+// expect: E0507
+test "missing" {
+  let m = Map { "a": 1 }
+  assert m["b"] == 2
+}

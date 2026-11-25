@@ -36,29 +36,73 @@ impl Diagnostic {
     }
 }
 
-/// 1-based (line, column) of a byte offset. Columns count characters.
-pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
-    let offset = offset.min(src.len());
-    let mut line = 1;
-    let mut col = 1;
-    for (i, ch) in src.char_indices() {
-        if i >= offset {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
+pub struct SourceFile {
+    pub name: String,
+    pub start: usize,
+    pub end: usize,
 }
 
-pub fn render_human(d: &Diagnostic, file: &str, src: &str) -> String {
-    let (line, col) = line_col(src, d.span.start);
-    let (end_line, end_col) = line_col(src, d.span.end);
-    let text = src.lines().nth(line - 1).unwrap_or("");
+/// All loaded source files, concatenated into one buffer so that a `Span`
+/// identifies both the file and the position inside it.
+#[derive(Default)]
+pub struct SourceMap {
+    pub text: String,
+    pub files: Vec<SourceFile>,
+}
+
+impl SourceMap {
+    pub fn single(name: &str, src: &str) -> SourceMap {
+        let mut map = SourceMap::default();
+        map.add(name, src);
+        map
+    }
+
+    /// Adds a file and returns the offset of its first byte.
+    pub fn add(&mut self, name: &str, src: &str) -> usize {
+        let start = self.text.len();
+        self.text.push_str(src);
+        let end = self.text.len();
+        self.text.push('\n');
+        self.files.push(SourceFile { name: name.replace('\\', "/"), start, end });
+        start
+    }
+
+    fn file_of(&self, offset: usize) -> Option<&SourceFile> {
+        self.files.iter().rev().find(|f| f.start <= offset).or(self.files.first())
+    }
+
+    /// File name and 1-based (line, column) of an offset. Columns count characters.
+    pub fn locate(&self, offset: usize) -> (&str, usize, usize) {
+        let Some(file) = self.file_of(offset) else { return ("<unknown>", 1, 1) };
+        let offset = offset.clamp(file.start, file.end);
+        let mut line = 1;
+        let mut col = 1;
+        for ch in self.text[file.start..offset].chars() {
+            if ch == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (&file.name, line, col)
+    }
+
+    fn line_text(&self, offset: usize) -> &str {
+        let Some(file) = self.file_of(offset) else { return "" };
+        let offset = offset.clamp(file.start, file.end);
+        let text = &self.text[file.start..file.end];
+        let local = offset - file.start;
+        let begin = text[..local].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[local..].find('\n').map_or(text.len(), |i| local + i);
+        text[begin..end].trim_end_matches('\r')
+    }
+}
+
+pub fn render_human(d: &Diagnostic, sources: &SourceMap) -> String {
+    let (file, line, col) = sources.locate(d.span.start);
+    let (_, end_line, end_col) = sources.locate(d.span.end);
+    let text = sources.line_text(d.span.start);
     let width = if end_line == line && end_col > col { end_col - col } else { 1 };
     let num = line.to_string();
     let pad = " ".repeat(num.len());
@@ -74,9 +118,9 @@ pub fn render_human(d: &Diagnostic, file: &str, src: &str) -> String {
     out
 }
 
-pub fn render_json(d: &Diagnostic, file: &str, src: &str) -> String {
-    let (line, col) = line_col(src, d.span.start);
-    let (end_line, end_col) = line_col(src, d.span.end);
+pub fn render_json(d: &Diagnostic, sources: &SourceMap) -> String {
+    let (file, line, col) = sources.locate(d.span.start);
+    let (_, end_line, end_col) = sources.locate(d.span.end);
     let hint = match &d.hint {
         Some(h) => json_str(h),
         None => "null".to_string(),

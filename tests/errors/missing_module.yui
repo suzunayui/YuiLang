@@ -1,0 +1,4 @@
+// expect: E0208
+import nothere
+fn f() {
+}

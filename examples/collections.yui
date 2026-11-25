@@ -1,0 +1,87 @@
+// Map、文字列、リストの標準メソッド
+
+fn word_counts(text: String) -> Map<String, Int> {
+  let mut counts: Map<String, Int> = Map {}
+  for word in text.to_lower().split(" ") {
+    if word.is_empty() { continue }
+    counts[word] = counts.get(word).unwrap_or(0) + 1
+  }
+  counts
+}
+
+fn initials(name: String) -> String {
+  name.split(" ").filter(|w| !w.is_empty()).map(|w| w.slice(0, 1).to_upper()).join("")
+}
+
+struct Stats {
+  min: Float,
+  max: Float,
+  mean: Float,
+}
+
+fn stats(xs: List<Float>) -> Option<Stats> {
+  let first = xs.first()?
+  let total = xs.fold(0.0, |acc, x| acc + x)
+  Some(Stats {
+    min: xs.fold(first, |a, b| a.min(b)),
+    max: xs.fold(first, |a, b| a.max(b)),
+    mean: total / xs.len().to_float(),
+  })
+}
+
+test "word counts" {
+  let counts = word_counts("the quick fox jumps over the lazy dog the end")
+  assert counts["the"] == 3
+  assert counts.get("cat") == None
+  assert counts.has("fox")
+  assert counts.len() == 8
+  // キーは常に昇順で取り出される
+  assert counts.keys().first() == Some("dog")
+}
+
+test "map values are copies" {
+  let a = Map { "x": 1 }
+  let b = a.set("y", 2)
+  assert a.len() == 1
+  assert b == Map { "x": 1, "y": 2 }
+  assert b.remove("x").keys() == ["y"]
+  assert "{b}" == "Map \{ \"x\": 1, \"y\": 2 \}"
+}
+
+test "strings" {
+  assert initials("yui lang project") == "YLP"
+  assert "a,b,c".split(",") == ["a", "b", "c"]
+  assert "hello".chars().reverse().join("") == "olleh"
+  assert "hello world".replace("world", "yui") == "hello yui"
+  assert "YuiLang".starts_with("Yui") && "YuiLang".ends_with("Lang")
+  assert "42".to_int() == Some(42)
+  assert "4x".to_int() == None
+}
+
+test "lists" {
+  let xs = [3, 1, 2]
+  assert xs.sort() == [1, 2, 3]
+  assert xs.reverse() == [2, 1, 3]
+  assert xs.slice(1, 3) == [1, 2]
+  assert xs.concat([9]).last() == Some(9)
+  assert xs == [3, 1, 2]
+}
+
+test "stats" {
+  match stats([2.0, 4.0, 9.0]) {
+    Some(s) => {
+      assert s.min == 2.0
+      assert s.max == 9.0
+      assert s.mean == 5.0
+    }
+    None => panic("expected stats")
+  }
+  assert stats([]).is_none()
+}
+
+fn main() uses io {
+  let counts = word_counts("to be or not to be")
+  for word in counts.keys() {
+    print("{word}: {counts[word]}")
+  }
+}

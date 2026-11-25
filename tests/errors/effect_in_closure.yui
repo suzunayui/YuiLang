@@ -1,0 +1,7 @@
+// expect: E0401
+fn f(xs: List<Int>) -> List<Int> {
+  xs.map(|x| {
+    print("{x}")
+    x
+  })
+}

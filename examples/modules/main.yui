@@ -1,0 +1,26 @@
+// 複数ファイルのプログラム。import のパスは、このファイルのあるフォルダが基準になる
+import geometry.shapes
+import textutil
+
+fn describe(s: shapes.Shape) -> String {
+  "{textutil.pad_left(shapes.name(s), 8)} area = {shapes.area(s)}"
+}
+
+test "modules" {
+  let r = shapes.Shape.Rect(2.0, 3.0)
+  assert shapes.area(r) == 6.0
+  assert shapes.name(r) == "rect"
+  assert textutil.pad_left("ab", 4) == "  ab"
+  assert shapes.unit_square() == shapes.Shape.Rect(1.0, 1.0)
+  let p = shapes.Point { x: 1.0, y: -2.0 }
+  assert shapes.origin_distance(p) == 3.0
+}
+
+fn main() uses io {
+  let all = [shapes.Shape.Rect(2.0, 3.0), shapes.Shape.Circle(1.0)]
+  for s in all {
+    print(describe(s))
+    print("{s}")
+  }
+  print("{all.map(shapes.area)}")
+}

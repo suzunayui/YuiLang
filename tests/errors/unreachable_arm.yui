@@ -1,0 +1,8 @@
+// expect: E0314
+fn f(x: Option<Int>) -> Int {
+  match x {
+    Some(n) => n
+    None => 0
+    Some(1) => 1
+  }
+}

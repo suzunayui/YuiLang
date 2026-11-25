@@ -1,0 +1,3 @@
+// expect: E0402
+fn f() uses network {
+}
