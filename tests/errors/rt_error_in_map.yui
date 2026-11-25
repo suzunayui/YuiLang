@@ -1,0 +1,5 @@
+// expect: E0504
+test "error inside a closure" {
+  let xs = [2, 1, 0]
+  assert xs.map(|x| 10 / x) == [5, 10]
+}

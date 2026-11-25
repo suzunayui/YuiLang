@@ -16,7 +16,7 @@
 //! convention on every operating system, so one code generator serves them all.
 
 use crate::ast::BinOp;
-use crate::bytecode::{Func, Op, NONE};
+use crate::bytecode::{Func, InPlace, Op, NONE};
 
 /// Size of a `Value` in bytes.
 pub const VALUE_SIZE: usize = 24;
@@ -24,8 +24,14 @@ pub const VALUE_SIZE: usize = 24;
 pub const TAG_INT: u8 = 0;
 pub const TAG_BOOL: u8 = 2;
 pub const TAG_UNIT: u8 = 3;
-/// Values with this discriminant or above own heap memory.
+/// Values with this discriminant or above own heap memory: their second word
+/// points at a reference-counted block.
 pub const FIRST_HEAP_TAG: u8 = 4;
+pub const TAG_LIST: u8 = 5;
+pub const TAG_FN: u8 = 9;
+pub const TAG_CLOSURE: u8 = 10;
+/// A reference-counted block holds the strong count, the weak count and then the data.
+pub const RC_DATA: i32 = 16;
 /// Offsets inside `Stack`: the top and end of the value stack, and the top
 /// and limit of the frame stack.
 pub const STACK_TOP_OFFSET: i32 = 8;
@@ -41,7 +47,7 @@ pub const FRAME_SPAN: i32 = 24;
 
 /// A call or a return is generated inline only for functions with at most
 /// this many local slots to set up or check.
-const MAX_INLINE_LOCALS: usize = 8;
+const MAX_INLINE_LOCALS: usize = 16;
 
 /// What the generated code needs to know about a function it calls.
 pub struct Callee {
@@ -71,6 +77,13 @@ pub struct Helpers {
     pub call_value: usize,
     /// `fn(stack)`: finish the current call, leaving its result on the stack.
     pub ret: usize,
+    /// Offsets of the pointer, length and capacity inside a `Vec<Value>`.
+    pub vec_ptr: i32,
+    pub vec_len: i32,
+    pub vec_cap: i32,
+    /// Offsets of the function and the captured values inside a closure.
+    pub closure_func: i32,
+    pub closure_captured: i32,
 }
 
 const V: i32 = VALUE_SIZE as i32;
@@ -81,11 +94,14 @@ const RDX: u8 = 2;
 const RBX: u8 = 3;
 const RSI: u8 = 6;
 const RDI: u8 = 7;
+const R8: u8 = 8;
+const R9: u8 = 9;
 const R12: u8 = 12;
 const R13: u8 = 13;
 
 // Condition codes.
 const CC_O: u8 = 0x0;
+const CC_B: u8 = 0x2;
 const CC_AE: u8 = 0x3;
 const CC_E: u8 = 0x4;
 const CC_NE: u8 = 0x5;
@@ -293,6 +309,44 @@ impl Asm {
         self.d32(imm);
     }
 
+    /// `add` (0x01), `cmp` (0x39) or `test` (0x85) `rm, reg`.
+    fn alu_rr(&mut self, opcode: u8, rm: u8, reg: u8) {
+        self.b(0x48 | (reg >> 3) << 2 | (rm >> 3));
+        self.b(opcode);
+        self.b(0xC0 | (reg & 7) << 3 | (rm & 7));
+    }
+
+    /// `inc qword [m]`
+    fn inc_mem(&mut self, m: M) {
+        self.rex_m(true, 0, m);
+        self.b(0xFF);
+        self.modrm_m(0, m);
+    }
+
+    /// `dec qword [m]`
+    fn dec_mem(&mut self, m: M) {
+        self.rex_m(true, 1, m);
+        self.b(0xFF);
+        self.modrm_m(1, m);
+    }
+
+    /// Copies the value at `src` to `dst`, using rax. With `share`, a heap
+    /// value gains an owner: the copy is a clone. Without it, the value moves.
+    fn copy_value(&mut self, src: M, dst: M, share: bool) {
+        for offset in [0, 8, 16] {
+            self.load(RAX, src.at(offset));
+            self.store(dst.at(offset), RAX);
+        }
+        if share {
+            let done = self.label();
+            self.cmp_byte(dst, FIRST_HEAP_TAG);
+            self.jcc(CC_B, done);
+            self.load(RAX, dst.at(8));
+            self.inc_mem(M(RAX, 0));
+            self.bind(done);
+        }
+    }
+
     /// `mov qword [m], value`, using `scratch` when the value needs 64 bits.
     fn store_value(&mut self, m: M, value: usize, scratch: u8) {
         match i32::try_from(value) {
@@ -376,6 +430,7 @@ enum StubKind {
     /// Run the op at `pc`.
     Op { pc: u32, target: Option<usize> },
     Call { index: u32, argc: u32, pc: u32 },
+    CallValue { argc: u32, pc: u32 },
     Return,
 }
 
@@ -436,6 +491,122 @@ impl Gen<'_> {
         a.mov_imm32(RCX, pc);
         a.call(self.helpers.call);
         self.enter_callee();
+    }
+
+    /// Asks the interpreter to start a call to the function value on top of
+    /// the stack, then enters the callee.
+    fn call_value_helper(&mut self, argc: u32, pc: u32) {
+        let a = &mut self.a;
+        a.sync();
+        a.mov_rr(RDI, RBX);
+        a.mov_imm32(RSI, argc);
+        a.mov_imm32(RDX, pc);
+        a.call(self.helpers.call_value);
+        self.enter_callee();
+    }
+
+    /// A call to the function value on top of the stack, without leaving
+    /// machine code when the callee is already compiled and both stacks have
+    /// room. A closure's captured values become the locals after the arguments.
+    fn call_value(&mut self, argc: u32, pc: u32) {
+        let span = self.func.spans[pc as usize];
+        let (slow, resume) = self.stub_of(StubKind::CallValue { argc, pc });
+        let fail = self.fail;
+        let closure = RC_DATA + self.helpers.closure_func;
+        let captured = RC_DATA + self.helpers.closure_captured;
+        let (vec_ptr, vec_len) = (self.helpers.vec_ptr, self.helpers.vec_len);
+        let func_native = std::mem::offset_of!(Func, native) as i32;
+        let func_need = std::mem::offset_of!(Func, need) as i32;
+        let func_nlocals = std::mem::offset_of!(Func, nlocals) as i32;
+        let a = &mut self.a;
+        let (is_fn, common) = (a.label(), a.label());
+        let (copy, copied, fill, filled) = (a.label(), a.label(), a.label(), a.label());
+
+        // rax = the callee's reference counts, rsi = its `Func`,
+        // r8 / r9 = address and number of the captured values.
+        // The callee value is dropped below, which must not free it.
+        a.load(RAX, top(1).at(8));
+        a.cmp_byte(top(1), TAG_FN);
+        a.jcc(CC_E, is_fn);
+        a.cmp_byte(top(1), TAG_CLOSURE);
+        a.jcc(CC_NE, slow);
+        a.cmp_imm(M(RAX, 0), 1);
+        a.jcc(CC_E, slow);
+        a.load(RSI, M(RAX, closure));
+        a.load(R8, M(RAX, captured + vec_ptr));
+        a.load(R9, M(RAX, captured + vec_len));
+        a.jmp(common);
+        a.bind(is_fn);
+        a.cmp_imm(M(RAX, 0), 1);
+        a.jcc(CC_E, slow);
+        a.mov_rr(RSI, RAX);
+        a.mov_imm64(R9, 0);
+        a.bind(common);
+        a.alu_imm(0, RSI, RC_DATA);
+
+        // rdi = the callee's machine code, rcx = the new frame.
+        a.load(RDI, M(RSI, func_native));
+        a.alu_rr(0x85, RDI, RDI);
+        a.jcc(CC_E, slow);
+        a.load(RCX, M(RBX, FRAMES_TOP_OFFSET));
+        a.alu_m(0x3B, RCX, M(RBX, FRAMES_LIMIT_OFFSET));
+        a.jcc(CC_AE, slow);
+        a.load(RDX, M(RSI, func_need));
+        a.imul_imm(RDX, V);
+        a.alu_rr(0x01, RDX, R13);
+        a.alu_m(0x3B, RDX, M(RBX, STACK_END_OFFSET));
+        a.jcc(CC_A, slow);
+
+        // From here on the call happens. Drop the callee value; rdx = first local.
+        a.dec_mem(M(RAX, 0));
+        a.alu_imm(5, R13, V);
+        a.lea(RDX, top(argc as i32));
+        a.store(M(RCX, FRAME_BASE), RDX);
+        a.bind(copy);
+        a.alu_rr(0x85, R9, R9);
+        a.jcc(CC_E, copied);
+        a.copy_value(M(R8, 0), top(0), true);
+        a.alu_imm(0, R8, V);
+        a.alu_imm(0, R13, V);
+        a.alu_imm(5, R9, 1);
+        a.jmp(copy);
+        a.bind(copied);
+        // The remaining locals start out as `()`.
+        a.load(RAX, M(RSI, func_nlocals));
+        a.imul_imm(RAX, V);
+        a.alu_rr(0x01, RAX, RDX);
+        a.bind(fill);
+        a.alu_rr(0x39, R13, RAX);
+        a.jcc(CC_AE, filled);
+        a.store_imm(top(0), TAG_UNIT as i32);
+        a.alu_imm(0, R13, V);
+        a.jmp(fill);
+        a.bind(filled);
+
+        a.store(M(RCX, FRAME_FUNC), RSI);
+        a.store_imm(M(RCX, FRAME_PC), 0);
+        a.store_value(M(RCX, FRAME_SPAN), span.start, RDX);
+        a.store_value(M(RCX, FRAME_SPAN + 8), span.end, RDX);
+        a.alu_imm(0, RCX, FRAME_SIZE);
+        a.store(M(RBX, FRAMES_TOP_OFFSET), RCX);
+
+        a.sync();
+        a.mov_rr(RAX, RDI);
+        a.mov_rr(RDI, RBX);
+        a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        a.jcc(CC_NE, fail);
+        a.reload();
+        a.bind(resume);
+    }
+
+    /// Leaves rdx pointing at item rcx of the list whose reference counts
+    /// rdx points at. The caller has checked that the item exists.
+    fn list_item(&mut self) {
+        let a = &mut self.a;
+        a.load(RDX, M(RDX, RC_DATA + self.helpers.vec_ptr));
+        a.imul_imm(RCX, V);
+        a.alu_rr(0x01, RDX, RCX);
     }
 
     /// Asks the interpreter to finish the current call, then leaves.
@@ -583,15 +754,81 @@ impl Gen<'_> {
                 a.alu_imm(0, R13, V);
             }
             Op::Load(s) => {
+                a.copy_value(slot(s), top(0), true);
+                a.alu_imm(0, R13, V);
+            }
+            Op::Take(s) => {
+                a.copy_value(slot(s), top(0), false);
+                a.store_imm(slot(s), TAG_UNIT as i32);
+                a.alu_imm(0, R13, V);
+            }
+            Op::ForList(s, target) => {
+                // List in `s`, position in `s + 1`, item goes to `s + 2`.
+                let target = self.ops[target as usize];
+                let vec_len = RC_DATA + self.helpers.vec_len;
+                let (slow, resume) = self.stub(pc, Some(target));
+                self.a.cmp_byte(slot(s), TAG_LIST);
+                self.a.jcc(CC_NE, slow);
+                self.expect_int(slot(s + 1), slow);
+                // The previous item is overwritten, so it must not need dropping.
+                self.a.cmp_byte(slot(s + 2), FIRST_HEAP_TAG);
+                self.a.jcc(CC_AE, slow);
+                self.a.load(RDX, slot(s).at(8));
+                self.a.load(RCX, slot(s + 1).at(8));
+                self.a.alu_m(0x3B, RCX, M(RDX, vec_len));
+                self.a.jcc(CC_AE, target);
+                self.list_item();
+                let a = &mut self.a;
+                a.copy_value(M(RDX, 0), slot(s + 2), true);
+                a.inc_mem(slot(s + 1).at(8));
+                a.bind(resume);
+            }
+            Op::Index => {
+                let vec_len = RC_DATA + self.helpers.vec_len;
+                let (slow, resume) = self.stub(pc, None);
+                self.a.cmp_byte(top(2), TAG_LIST);
+                self.a.jcc(CC_NE, slow);
+                self.expect_int(top(1), slow);
+                // The list on the stack is dropped, which must not free it.
+                self.a.load(RDX, top(2).at(8));
+                self.a.cmp_imm(M(RDX, 0), 1);
+                self.a.jcc(CC_E, slow);
+                self.a.load(RCX, top(1).at(8));
+                self.a.alu_m(0x3B, RCX, M(RDX, vec_len));
+                self.a.jcc(CC_AE, slow);
+                self.a.dec_mem(M(RDX, 0));
+                self.list_item();
+                let a = &mut self.a;
+                a.copy_value(M(RDX, 0), top(2), true);
+                a.alu_imm(5, R13, V);
+                a.bind(resume);
+            }
+            Op::InPlace(s, path, InPlace::Push) if path == NONE => {
+                // Append in place when the list has one owner and spare room.
+                let (vec_ptr, vec_len, vec_cap) = (
+                    RC_DATA + self.helpers.vec_ptr,
+                    RC_DATA + self.helpers.vec_len,
+                    RC_DATA + self.helpers.vec_cap,
+                );
                 let (slow, resume) = self.stub(pc, None);
                 let a = &mut self.a;
-                a.cmp_byte(slot(s), FIRST_HEAP_TAG);
+                a.cmp_byte(slot(s), TAG_LIST);
+                a.jcc(CC_NE, slow);
+                a.load(RDX, slot(s).at(8));
+                a.cmp_imm(M(RDX, 0), 1);
+                a.jcc(CC_NE, slow);
+                a.cmp_imm(M(RDX, 8), 1);
+                a.jcc(CC_NE, slow);
+                a.load(RCX, M(RDX, vec_len));
+                a.alu_m(0x3B, RCX, M(RDX, vec_cap));
                 a.jcc(CC_AE, slow);
-                a.load(RAX, slot(s));
-                a.store(top(0), RAX);
-                a.load(RAX, slot(s).at(8));
-                a.store(top(0).at(8), RAX);
-                a.alu_imm(0, R13, V);
+                a.mov_rr(RSI, RCX);
+                a.imul_imm(RSI, V);
+                a.alu_m(0x03, RSI, M(RDX, vec_ptr));
+                a.copy_value(top(1), M(RSI, 0), false);
+                a.alu_imm(0, RCX, 1);
+                a.store(M(RDX, vec_len), RCX);
+                a.alu_imm(5, R13, V);
                 a.bind(resume);
             }
             Op::Store(s) => {
@@ -777,16 +1014,9 @@ impl Gen<'_> {
                 a.bind(resume);
             }
             Op::Call(index, argc) => self.call(index, argc, pc),
-            Op::CallValue(argc) => {
-                a.sync();
-                a.mov_rr(RDI, RBX);
-                a.mov_imm32(RSI, argc);
-                a.mov_imm32(RDX, pc);
-                a.call(self.helpers.call_value);
-                self.enter_callee();
-            }
+            Op::CallValue(argc) => self.call_value(argc, pc),
             Op::Return => self.ret(),
-            Op::AndJump(target) | Op::OrJump(target) | Op::ForList(_, target) => {
+            Op::AndJump(target) | Op::OrJump(target) => {
                 let target = self.ops[target as usize];
                 self.run_op(pc, Some(target));
             }
@@ -844,6 +1074,10 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
             }
             StubKind::Call { index, argc, pc } => {
                 g.call_helper(index, argc, pc);
+                g.a.jmp(stub.resume);
+            }
+            StubKind::CallValue { argc, pc } => {
+                g.call_value_helper(argc, pc);
                 g.a.jmp(stub.resume);
             }
             StubKind::Return => g.return_helper(),

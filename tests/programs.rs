@@ -182,3 +182,15 @@ fn file_io_uses_fs_effect() {
     };
     assert!(codes.contains(&"E0401"), "{codes:?}");
 }
+/// A layout check that fails would silently turn the JIT off; make that visible.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn jit_is_used_on_x86_64() {
+    if std::env::var_os("YUI_JIT").is_some_and(|v| v == "0") {
+        return;
+    }
+    let src = "fn main() {\n}\n";
+    let loaded = yuilang::load_str(src).map_err(|(d, _)| d).expect("program loads");
+    let interp = Interp::new(&loaded.program, &loaded.sources.text);
+    assert!(interp.jit, "machine code generation is unavailable");
+}

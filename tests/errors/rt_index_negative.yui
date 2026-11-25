@@ -1,0 +1,6 @@
+// expect: E0505
+test "negative index" {
+  let xs = [1, 2, 3]
+  let i = 0 - 1
+  assert xs[i] == 3
+}

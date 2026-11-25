@@ -1,0 +1,9 @@
+// expect: E0502
+fn positive(n: Int) -> Int
+  requires n > 0
+{
+  n
+}
+test "contract inside fold" {
+  assert [3, 2, 0].fold(0, |acc, x| acc + positive(x)) == 5
+}

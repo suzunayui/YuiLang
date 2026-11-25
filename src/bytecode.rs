@@ -24,6 +24,8 @@ pub enum Op {
     Load(u32),
     /// Pop into a local slot.
     Store(u32),
+    /// Push the value of a local slot and leave `()` in the slot.
+    Take(u32),
     Pop,
     Unary(UnOp),
     Arith(BinOp),
@@ -57,6 +59,8 @@ pub enum Op {
     /// there instead of returning (the function has postconditions to check).
     Try(u32),
     MakeList(u32),
+    /// Push an empty list with room for as many items as the list in a slot.
+    NewListFor(u32),
     /// Number of key/value pairs.
     MakeMap(u32),
     /// Index into `Func::structs`.
@@ -147,6 +151,9 @@ pub struct Func {
     pub paths: Vec<Vec<PathElem>>,
     /// Address of the machine code generated for this function, or 0.
     pub native: Cell<usize>,
+    /// Free value-stack cells the function needs before it may be entered.
+    /// Set together with `native`.
+    pub need: Cell<usize>,
 }
 
 /// Everything shared between the functions of one program.
@@ -611,6 +618,99 @@ impl<'g> Compiler<'g> {
         true
     }
 
+    /// `map`, `filter`, `fold`, `any` and `all` exist only on lists, so they
+    /// are compiled as loops that call the function once per item. The
+    /// machine then runs them like any other loop, without re-entering itself.
+    fn list_loop(&mut self, recv: &Expr, name: &str, args: &[Expr], span: Span) -> bool {
+        let arity = match name {
+            "map" | "filter" | "any" | "all" => 1,
+            "fold" => 2,
+            _ => return false,
+        };
+        if args.len() != arity {
+            return false;
+        }
+        self.push_scope();
+        // `ForList` expects the list, the position and the item in adjacent slots.
+        let list = self.alloc();
+        let pos = self.alloc();
+        let item = self.alloc();
+        let func = self.alloc();
+        // The result so far: the output list, the accumulator or the answer.
+        let out = self.alloc();
+
+        self.expr(recv);
+        self.emit(Op::Store(list), span);
+        if name == "fold" {
+            self.expr(&args[0]);
+            self.emit(Op::Store(out), span);
+        }
+        self.expr(&args[arity - 1]);
+        self.emit(Op::Store(func), span);
+        let initial = match name {
+            "map" => Some(Op::NewListFor(list)),
+            "filter" => Some(Op::MakeList(0)),
+            "any" => Some(Op::Bool(false)),
+            "all" => Some(Op::Bool(true)),
+            _ => None,
+        };
+        if let Some(op) = initial {
+            self.emit(op, span);
+            self.emit(Op::Store(out), span);
+        }
+        self.emit(Op::Int(0), span);
+        self.emit(Op::Store(pos), span);
+
+        let top = self.here();
+        let exit = self.emit(Op::ForList(list, NONE), span);
+        if name == "fold" {
+            // Taking the accumulator keeps it unshared, so the function may update it in place.
+            self.emit(Op::Take(out), span);
+        }
+        self.emit(Op::Load(item), span);
+        self.emit(Op::Load(func), span);
+        self.emit(Op::CallValue(arity as u32), span);
+        match name {
+            "map" => {
+                self.emit(Op::InPlace(out, NONE, InPlace::Push), span);
+                self.emit(Op::Jump(top), span);
+            }
+            "filter" => {
+                self.emit(Op::JumpIfFalse(top), span);
+                self.emit(Op::Load(item), span);
+                self.emit(Op::InPlace(out, NONE, InPlace::Push), span);
+                self.emit(Op::Jump(top), span);
+            }
+            "fold" => {
+                self.emit(Op::Store(out), span);
+                self.emit(Op::Jump(top), span);
+            }
+            "any" => {
+                // The first `true` decides the answer.
+                self.emit(Op::JumpIfFalse(top), span);
+                self.emit(Op::Bool(true), span);
+                self.emit(Op::Store(out), span);
+            }
+            _ => {
+                // The first `false` decides the answer.
+                let stop = self.emit(Op::JumpIfFalse(NONE), span);
+                self.emit(Op::Jump(top), span);
+                self.patch_here(stop);
+                self.emit(Op::Bool(false), span);
+                self.emit(Op::Store(out), span);
+            }
+        }
+        self.patch_here(exit);
+        // Release what the loop held, so that later updates need no copy.
+        for slot in [list, item, func] {
+            self.emit(Op::Unit, span);
+            self.emit(Op::Store(slot), span);
+        }
+        self.emit(Op::Take(out), span);
+        self.pop_scope();
+        true
+    }
+
     // ---- expressions ----
 
     fn args(&mut self, args: &[Expr]) {
@@ -731,6 +831,9 @@ impl<'g> Compiler<'g> {
                 }
             }
             ExprKind::MethodCall { recv, name, args, .. } => {
+                if self.list_loop(recv, name, args, span) {
+                    return;
+                }
                 self.expr(recv);
                 self.args(args);
                 let name = self.string(name);

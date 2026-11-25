@@ -58,6 +58,8 @@ pub struct EnumVal {
     pub args: Vec<Value>,
 }
 
+/// `#[repr(C)]` because generated code reads both fields.
+#[repr(C)]
 pub struct ClosureVal {
     func: Rc<Func>,
     /// Copies of the captured variables, in the order the function expects them.
@@ -777,9 +779,10 @@ impl<'a> Interp<'a> {
     }
 
     /// Calls a function value from native code and waits for its result.
-    fn call_value(&mut self, f: &Value, args: Vec<Value>, span: Span) -> R<Value> {
+    /// The arguments are passed as an array so that no call allocates.
+    fn call_value<const N: usize>(&mut self, f: &Value, args: [Value; N], span: Span) -> R<Value> {
         let depth = self.depth();
-        let argc = args.len();
+        let argc = N;
         self.stack.extend(args);
         self.push_value_frame(f, argc, span)?;
         if self.jit {
@@ -1036,6 +1039,17 @@ impl<'a> Interp<'a> {
             Op::MakeList(n) => {
                 let items = self.stack.split_off(self.stack.len() - n as usize);
                 self.stack.push(Value::list(items));
+            }
+            Op::Take(slot) => {
+                let v = std::mem::replace(&mut self.stack[base + slot as usize], Value::Unit);
+                self.stack.push(v);
+            }
+            Op::NewListFor(slot) => {
+                let room = match &self.stack[base + slot as usize] {
+                    Value::List(items) => items.len(),
+                    _ => 0,
+                };
+                self.stack.push(Value::list(Vec::with_capacity(room)));
             }
             Op::MakeMap(n) => {
                 let mut map = BTreeMap::new();
@@ -1395,14 +1409,14 @@ impl<'a> Interp<'a> {
             (Value::List(items), "map", [f]) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.iter() {
-                    out.push(self.call_value(f, vec![item.clone()], span)?);
+                    out.push(self.call_value(f, [item.clone()], span)?);
                 }
                 Ok(Value::list(out))
             }
             (Value::List(items), "filter", [f]) => {
                 let mut out = Vec::new();
                 for item in items.iter() {
-                    if truthy(self.call_value(f, vec![item.clone()], span)?) {
+                    if truthy(self.call_value(f, [item.clone()], span)?) {
                         out.push(item.clone());
                     }
                 }
@@ -1410,7 +1424,7 @@ impl<'a> Interp<'a> {
             }
             (Value::List(items), "any", [f]) => {
                 for item in items.iter() {
-                    if truthy(self.call_value(f, vec![item.clone()], span)?) {
+                    if truthy(self.call_value(f, [item.clone()], span)?) {
                         return Ok(Value::Bool(true));
                     }
                 }
@@ -1418,7 +1432,7 @@ impl<'a> Interp<'a> {
             }
             (Value::List(items), "all", [f]) => {
                 for item in items.iter() {
-                    if !truthy(self.call_value(f, vec![item.clone()], span)?) {
+                    if !truthy(self.call_value(f, [item.clone()], span)?) {
                         return Ok(Value::Bool(false));
                     }
                 }
@@ -1427,7 +1441,7 @@ impl<'a> Interp<'a> {
             (Value::List(items), "fold", [init, f]) => {
                 let mut acc = init.clone();
                 for item in items.iter() {
-                    acc = self.call_value(f, vec![acc, item.clone()], span)?;
+                    acc = self.call_value(f, [acc, item.clone()], span)?;
                 }
                 Ok(acc)
             }
@@ -1531,12 +1545,62 @@ mod native {
     }
 
     fn helpers() -> jit::Helpers {
+        let (vec_ptr, vec_len, vec_cap) = vec_layout().unwrap_or((0, 8, 16));
         jit::Helpers {
             op: op as *const () as usize,
             call: call as *const () as usize,
             call_value: call_value as *const () as usize,
             ret: ret as *const () as usize,
+            vec_ptr,
+            vec_len,
+            vec_cap,
+            closure_func: std::mem::offset_of!(ClosureVal, func) as i32,
+            closure_captured: std::mem::offset_of!(ClosureVal, captured) as i32,
         }
+    }
+
+    /// Offsets of the pointer, length and capacity inside a `Vec<Value>`.
+    /// Rust does not promise an order, so it is measured on a sample.
+    fn vec_layout() -> Option<(i32, i32, i32)> {
+        if std::mem::size_of::<Vec<Value>>() != 24 {
+            return None;
+        }
+        let mut sample: Vec<Value> = Vec::with_capacity(7);
+        sample.extend([Value::Unit, Value::Unit, Value::Unit]);
+        // Safety: a Vec is three words, as checked above.
+        let words: [usize; 3] = unsafe { std::mem::transmute_copy(&sample) };
+        let find = |wanted: usize| words.iter().position(|w| *w == wanted).map(|i| i as i32 * 8);
+        Some((find(sample.as_ptr() as usize)?, find(sample.len())?, find(sample.capacity())?))
+    }
+
+    /// Generated code clones and drops heap values by adjusting the strong
+    /// count their second word points at. Checks that on one value of each kind.
+    fn heap_values_are_counted() -> bool {
+        let word = |v: &Value| unsafe { *((v as *const Value as *const u8).add(8) as *const usize) };
+        // `counts` is where the value's reference counts should be.
+        let check = |v: Value, counts: usize, strong: usize| {
+            // Safety: `counts` is the start of a live reference-counted block.
+            word(&v) == counts && unsafe { *(counts as *const usize) } == strong + 1
+        };
+        let counts_of = |data: *const u8| data as usize - jit::RC_DATA as usize;
+        let text: Rc<str> = Rc::from("x");
+        let list = Rc::new(Vec::<Value>::new());
+        let map = Rc::new(BTreeMap::<Key, Value>::new());
+        let record = Rc::new(StructVal { name: text.clone(), fields: Vec::new() });
+        let choice = Rc::new(EnumVal { enum_name: text.clone(), variant: text.clone(), args: Vec::new() });
+        let func = Rc::new(Func::default());
+        let closure = Rc::new(ClosureVal { func: func.clone(), captured: Vec::new() });
+        // Safety: reads the `func` field of a live closure.
+        let closure_func = unsafe { *(Rc::as_ptr(&closure) as *const usize) };
+        closure_func == counts_of(Rc::as_ptr(&func) as *const u8)
+            && std::mem::offset_of!(ClosureVal, func) == 0
+            && check(Value::Str(text.clone()), counts_of(Rc::as_ptr(&text) as *const u8), 4)
+            && check(Value::List(list.clone()), counts_of(Rc::as_ptr(&list) as *const u8), 1)
+            && check(Value::Map(map.clone()), counts_of(Rc::as_ptr(&map) as *const u8), 1)
+            && check(Value::Struct(record.clone()), counts_of(Rc::as_ptr(&record) as *const u8), 1)
+            && check(Value::Enum(choice.clone()), counts_of(Rc::as_ptr(&choice) as *const u8), 1)
+            && check(Value::Fn(func.clone()), counts_of(Rc::as_ptr(&func) as *const u8), 2)
+            && check(Value::Closure(closure.clone()), counts_of(Rc::as_ptr(&closure) as *const u8), 1)
     }
 
     /// Generated code relies on how `Value` and `Stack` are laid out.
@@ -1554,6 +1618,9 @@ mod native {
             && byte(&Value::Unit, 0) == jit::TAG_UNIT
             && byte(&Value::Float(0.0), 0) < jit::FIRST_HEAP_TAG
             && byte(&Value::str(""), 0) == jit::FIRST_HEAP_TAG
+            && byte(&Value::list(Vec::new()), 0) == jit::TAG_LIST
+            && vec_layout().is_some()
+            && heap_values_are_counted()
             && std::mem::offset_of!(Stack, top) == jit::STACK_TOP_OFFSET as usize
             && std::mem::offset_of!(Stack, end) == jit::STACK_END_OFFSET as usize
             && std::mem::offset_of!(Stack, frames_top) == jit::FRAMES_TOP_OFFSET as usize
@@ -1581,6 +1648,7 @@ mod native {
                 return Ok(address);
             }
             let span = frame.call_span();
+            func.need.set(func.nlocals + func.code.len() + 64);
             let funcs = &self.g.funcs;
             let callee = |index: u32| {
                 funcs.get(index as usize).map(|f| jit::Callee {

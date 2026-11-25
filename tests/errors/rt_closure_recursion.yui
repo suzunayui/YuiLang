@@ -1,0 +1,8 @@
+// expect: E0506
+fn forever(n: Int) -> Int {
+  let again = |x: Int| forever(x + 1)
+  again(n)
+}
+test "recursion through a closure" {
+  assert forever(0) == 0
+}

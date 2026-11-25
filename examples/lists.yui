@@ -1,0 +1,151 @@
+// リスト処理のいろいろな形。JIT の速い経路と、そこから外れる場合の両方を通す
+
+struct Item {
+  name: String,
+  price: Int,
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn total_price(items: List<Item>) -> Int {
+  items.fold(0, |acc, item| acc + item.price)
+}
+
+fn range(n: Int) -> List<Int> {
+  let mut out = []
+  for i in 0..n {
+    out = out.push(i)
+  }
+  out
+}
+
+// クロージャの中からさらにリスト処理を呼ぶ
+fn table(n: Int) -> List<List<Int>> {
+  range(n).map(|row| range(n).map(|col| row * col))
+}
+
+fn sum_nested(rows: List<List<Int>>) -> Int {
+  let mut total = 0
+  for row in rows {
+    for x in row {
+      total = total + x
+    }
+  }
+  total
+}
+
+fn count_calls(n: Int) -> Int {
+  if n == 0 { 0 } else { [n].map(|x| count_calls(x - 1) + 1)[0] }
+}
+
+test "map filter fold" {
+  let xs = range(10)
+  assert xs.map(|x| x * x) == [0, 1, 4, 9, 16, 25, 36, 49, 64, 81]
+  assert xs.map(double) == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+  assert xs.filter(|x| x % 3 == 0) == [0, 3, 6, 9]
+  assert xs.fold(0, |acc, x| acc + x) == 45
+  assert xs.map(|x| x + 1).filter(|x| x % 2 == 0).fold(1, |acc, x| acc * x) == 3840
+  // 元のリストは変わらない
+  assert xs == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+}
+
+test "any and all" {
+  let xs = [1, 3, 5, 8, 9]
+  assert xs.any(|x| x % 2 == 0)
+  assert !xs.any(|x| x > 100)
+  assert xs.all(|x| x > 0)
+  assert !xs.all(|x| x % 2 == 1)
+}
+
+test "empty lists" {
+  let none: List<Int> = []
+  assert none.map(|x| x + 1) == []
+  assert none.filter(|x| x > 0) == []
+  assert none.fold(7, |acc, x| acc + x) == 7
+  assert !none.any(|x| x > 0)
+  assert none.all(|x| x > 0)
+}
+
+test "captured values" {
+  let base = 100
+  let label = "n"
+  let extra = [1, 2]
+  let xs = [1, 2, 3]
+  assert xs.map(|x| x + base) == [101, 102, 103]
+  assert xs.map(|x| "{label}{x}") == ["n1", "n2", "n3"]
+  assert xs.map(|x| extra.push(x).len()) == [3, 3, 3]
+  // キャプチャした値はコピーなので、外の変数は変わらない
+  assert extra == [1, 2]
+  assert label == "n"
+}
+
+test "lists of strings and structs" {
+  let words = ["apple", "fig", "banana", "kiwi"]
+  assert words.filter(|w| w.len() > 3) == ["apple", "banana", "kiwi"]
+  assert words.map(|w| w.len()) == [5, 3, 6, 4]
+  assert words.fold("", |acc, w| "{acc}{w.slice(0, 1)}") == "afbk"
+  assert words.any(|w| w == "fig")
+
+  let items = [Item { name: "pen", price: 120 }, Item { name: "ink", price: 800 }]
+  assert total_price(items) == 920
+  assert items.map(|i| i.name) == ["pen", "ink"]
+  assert items.filter(|i| i.price > 500).len() == 1
+}
+
+test "fold builds a list" {
+  let xs = [3, 1, 2]
+  let doubled = xs.fold([], |acc, x| acc.push(x).push(x))
+  assert doubled == [3, 3, 1, 1, 2, 2]
+  let reversed = xs.fold([], |acc, x| [x].concat(acc))
+  assert reversed == [2, 1, 3]
+}
+
+test "nested" {
+  assert table(3) == [[0, 0, 0], [0, 1, 2], [0, 2, 4]]
+  assert sum_nested(table(4)) == 36
+  assert count_calls(200) == 200
+}
+
+test "indexing" {
+  let xs = range(5)
+  let mut total = 0
+  for i in 0..xs.len() {
+    total = total + xs[i]
+  }
+  assert total == 10
+  assert range(3)[2] == 2
+  let names = ["a", "b"]
+  assert names[1] == "b"
+  assert names[0] == "a"
+  assert table(3)[2][1] == 2
+}
+
+test "shared lists stay separate" {
+  let mut xs = [1, 2]
+  let saved = xs
+  xs = xs.push(3)
+  let ys = xs.map(|x| x * 10)
+  xs = xs.push(4)
+  assert saved == [1, 2]
+  assert ys == [10, 20, 30]
+  assert xs == [1, 2, 3, 4]
+
+  let mut grid = [[1], [2]]
+  let first = grid[0]
+  grid[0] = first.push(9)
+  assert first == [1]
+  assert grid == [[1, 9], [2]]
+}
+
+fn main() uses io {
+  let xs = range(5)
+  let squares = xs.map(|x| x * x)
+  print("{squares}")
+  for row in table(3) {
+    print("{row}")
+  }
+  let shown = xs.filter(|x| x > 2).map(|x| "<{x}>")
+  print(shown.join(" "))
+}
