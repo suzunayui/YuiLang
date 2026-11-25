@@ -1,20 +1,30 @@
 //! Ahead-of-time compiler: turns a program into a Windows x64 executable that
 //! contains no interpreter (see `docs/native-backend.md`).
 //!
-//! It handles programs made of functions over `Int`, `Bool`, `String` and
-//! `List<Int>`: arithmetic, comparisons, `if`, `while`, `for`, calls, list
-//! literals, `push`, `len`, indexing, `map` / `filter` / `fold` / `any` /
-//! `all` with a closure written in place, strings with `{...}` parts,
-//! comparisons and a few methods on strings, and `print`. Anything else is
-//! reported as `Unsupported`.
+//! It handles programs made of functions over `Int`, `Bool`, `String`,
+//! lists, structs and enums (with `Option` and `Result`): arithmetic,
+//! comparisons, `if`, `while`, `for`, `match`, `?`, calls, list literals,
+//! `push`, `len`, `get`, indexing, `map` / `filter` / `fold` / `any` / `all`
+//! with a closure written in place, strings with `{...}` parts, comparisons
+//! and a few methods on strings, and `print`. Anything else is reported as
+//! `Unsupported`.
 //!
-//! Lists and strings live on the heap with a reference count in front (the
-//! layouts are in `runtime.yui`, which also holds their routines; they are
-//! compiled by this same compiler). Every such variable owns one reference,
-//! and every such expression produces one; a reference is given up when its
-//! variable goes out of scope or is assigned to. String literals are
-//! constants in the executable, marked by a negative count that is never
-//! changed.
+//! Every value is 8 bytes. Lists, strings, structs and enum values with
+//! fields live on the heap with a reference count in front (lists and
+//! strings are laid out in `runtime.yui`, which also holds their routines;
+//! they are compiled by this same compiler). A struct is `[count][fields]`.
+//! An enum value is `[count][variant][fields]`, or, for a variant without
+//! fields, just the number of the variant: a number below `SMALL` is never
+//! an address. Every variable of such a type owns one reference, and every
+//! such expression produces one; a reference is given up when its variable
+//! goes out of scope or is assigned to. What a `for`, a `match` pattern or a
+//! closure parameter names is borrowed from the list or value it came from,
+//! which is kept alive meanwhile. String literals are constants in the
+//! executable, marked by a negative count that is never changed.
+//!
+//! Generic types are compiled once per combination of type arguments. The
+//! code that frees a value of each type (and what it holds) is generated on
+//! demand.
 //!
 //! Values have no tags: an Int is 8 bytes in a register. Each function keeps
 //! its busiest variables in registers that calls preserve (rbx, rsi, rdi,
@@ -22,7 +32,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_AE, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -69,10 +79,25 @@ const LIMIT: u8 = 1;
 const LIST: u8 = 2;
 const POS: u8 = 3;
 const OUT: u8 = 4;
+/// The value a `match` looks at.
+const SCRUT: u8 = 5;
+
+/// Enum values below this are variants without fields, not addresses.
+const SMALL: i32 = 4096;
 
 /// Writable memory (zero at start): the number of heap blocks in use, kept
 /// only when the executable is built to check for leaks.
 const LIVE_BLOCKS: usize = 0;
+/// The small-block allocator: for each size (a multiple of 8, up to
+/// `POOL_MAX`), at `POOL_HEADS + size`, the first of a chain of freed blocks
+/// of that size; and the unused rest of the memory it took from the system.
+const POOL_HEADS: usize = 8;
+const POOL_NEXT: usize = 88;
+const POOL_END: usize = 96;
+/// Blocks up to this size come from the small-block allocator.
+const POOL_MAX: usize = 64;
+/// How much it takes from the system at a time.
+const POOL_CHUNK: u32 = 1 << 16;
 
 /// Why a program cannot be compiled natively yet.
 pub struct Unsupported {
@@ -91,10 +116,14 @@ enum Ty {
     Int,
     Bool,
     Unit,
-    /// `List<Int>`: a pointer to a counted block on the heap.
-    List,
+    /// A list: a pointer to a counted block on the heap. The number says which list type.
+    List(u32),
     /// `String`: a pointer to a counted block on the heap, or to a constant.
     Str,
+    /// A struct: a pointer to a counted block on the heap.
+    Struct(u32),
+    /// An enum: the number of a variant without fields, or a pointer to a counted block.
+    Enum(u32),
     /// The expression does not produce a value (`return`, `break`, ...).
     Never,
 }
@@ -102,16 +131,19 @@ enum Ty {
 impl Ty {
     /// Whether values of this type are counted references.
     fn heap(self) -> bool {
-        matches!(self, Ty::List | Ty::Str)
+        matches!(self, Ty::List(_) | Ty::Str | Ty::Struct(_) | Ty::Enum(_))
     }
+}
 
-    /// The routine of `runtime.yui` that gives up a reference.
-    fn release(self) -> &'static str {
-        match self {
-            Ty::Str => "str_release",
-            _ => "list_release",
-        }
-    }
+/// What a numbered type is made of.
+#[derive(Clone)]
+enum Def {
+    /// The type of the items.
+    List(Ty),
+    /// The fields, in the order of the declaration.
+    Struct(Vec<(String, Ty)>),
+    /// The variants, in the order of the declaration, with the types of their fields.
+    Enum(Vec<(String, Vec<Ty>)>),
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +156,9 @@ enum Loc {
 struct Local {
     ty: Ty,
     loc: Loc,
+    /// The value belongs to something else that outlives this variable, so
+    /// the variable does not release it.
+    borrowed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +180,7 @@ enum Stub {
     Overflow { label: usize, a: Opnd, b: Opnd, record: usize },
     Bounds { label: usize, list: u8, index: u8, record: usize },
     /// `variable = variable.push(value)` when the item cannot be added in place.
-    Push { label: usize, back: usize, variable: Loc, value: u8 },
+    Push { label: usize, back: usize, variable: Loc, value: u8, list: Ty },
 }
 
 struct Native<'a> {
@@ -154,6 +189,17 @@ struct Native<'a> {
     types: &'a TypeInfo,
     /// The program's functions by name; the runtime's have a `%` in front.
     fns: HashMap<String, FnInfo>,
+    structs: HashMap<String, &'a StructDecl>,
+    enums: HashMap<String, &'a EnumDecl>,
+    /// The numbered types, the type each name stands for (`Option<Int>`), and the names.
+    defs: Vec<Def>,
+    def_ids: HashMap<String, Ty>,
+    def_keys: Vec<String>,
+    /// Generated code per type: giving up a reference, and `push` for lists
+    /// whose items are counted. The queue holds what is not emitted yet.
+    drop_labels: HashMap<u32, usize>,
+    push_labels: HashMap<u32, usize>,
+    glue_queue: Vec<(bool, u32)>,
     /// Positions of `call [rip + ...]` displacements and the import they call.
     iat_fixups: Vec<(usize, usize)>,
     /// Constant data, placed after the code.
@@ -173,6 +219,8 @@ struct Native<'a> {
     rt_alloc: usize,
     rt_realloc: usize,
     rt_free: usize,
+    rt_pool_alloc: usize,
+    rt_pool_free: usize,
     rt_write: usize,
     rt_print_int: usize,
     rt_fail: usize,
@@ -187,8 +235,12 @@ struct Native<'a> {
     decl_loc: HashMap<(usize, u8), Loc>,
     free: Vec<u8>,
     /// (label to leave the loop, label to start the next round, number of
-    /// scopes outside the loop body)
-    loops: Vec<(usize, usize, usize)>,
+    /// scopes outside the loop body, number of held values outside it)
+    loops: Vec<(usize, usize, usize, usize)>,
+    /// Counted values that an expression being compiled holds in spill slots
+    /// while it evaluates its other parts. If one of those parts leaves the
+    /// function or the loop (`?`, `return`, `break`), they are released there.
+    pending: Vec<(M, Ty)>,
     epilogue: usize,
     ret: Ty,
     /// Offset of the first spill slot, and how many are in use / were ever used.
@@ -206,7 +258,6 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     }
     let mut a = Asm::default();
     let mut fns = HashMap::new();
-    let mut decls = Vec::new();
     let Ok(runtime) = crate::parser::parse_file(RUNTIME, 0, "", true) else {
         return unsupported("its own runtime (it does not parse)", nowhere);
     };
@@ -221,45 +272,23 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     // Copying memory is machine code, but is called like a function of the runtime.
     let rt_copy = a.label();
     fns.insert("%__copy".to_string(), FnInfo { label: rt_copy, params: vec![Ty::Int; 3], ret: Ty::Unit });
-    for item in &program.items {
-        match item {
-            Item::Fn(f) => {
-                if !f.type_params.is_empty() {
-                    return unsupported("generic functions", f.name_span);
-                }
-                if !f.requires.is_empty() || !f.ensures.is_empty() {
-                    return unsupported("`requires` / `ensures`", f.name_span);
-                }
-                if f.params.len() > 4 {
-                    return unsupported("functions with more than four parameters", f.name_span);
-                }
-                let mut params = Vec::new();
-                for p in &f.params {
-                    params.push(simple_type(&p.ty)?);
-                }
-                let ret = match &f.ret {
-                    Some(t) => simple_type(t)?,
-                    None => Ty::Unit,
-                };
-                fns.insert(f.name.clone(), FnInfo { label: a.label(), params, ret });
-                decls.push(f.clone());
-            }
-            // Tests are not part of the built program.
-            Item::Test(_) => {}
-            Item::Struct(s) => return unsupported("structs", s.name_span),
-            Item::Enum(e) => return unsupported("enums", e.name_span),
-        }
-    }
-    let Some(main) = fns.get("main") else { return unsupported("a program without `main`", nowhere) };
-    let main_label = main.label;
 
     let (rt_write, rt_print_int, rt_fail, rt_overflow) = (a.label(), a.label(), a.label(), a.label());
     let (rt_alloc, rt_realloc, rt_free) = (a.label(), a.label(), a.label());
+    let (rt_pool_alloc, rt_pool_free) = (a.label(), a.label());
     let mut n = Native {
         a,
         sources,
         types: &program.types,
         fns,
+        structs: HashMap::new(),
+        enums: HashMap::new(),
+        defs: Vec::new(),
+        def_ids: HashMap::new(),
+        def_keys: Vec::new(),
+        drop_labels: HashMap::new(),
+        push_labels: HashMap::new(),
+        glue_queue: Vec::new(),
         iat_fixups: Vec::new(),
         data: Vec::new(),
         bss_fixups: Vec::new(),
@@ -272,6 +301,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         rt_alloc,
         rt_realloc,
         rt_free,
+        rt_pool_alloc,
+        rt_pool_free,
         rt_write,
         rt_print_int,
         rt_fail,
@@ -281,12 +312,51 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         decl_loc: HashMap::new(),
         free: Vec::new(),
         loops: Vec::new(),
+        pending: Vec::new(),
         epilogue: 0,
         ret: Ty::Unit,
         spill_base: 0,
         spill_depth: 0,
         spill_max: 0,
     };
+    for item in &program.items {
+        match item {
+            Item::Struct(decl) => {
+                n.structs.insert(decl.name.clone(), decl);
+            }
+            Item::Enum(decl) => {
+                n.enums.insert(decl.name.clone(), decl);
+            }
+            _ => {}
+        }
+    }
+    let mut decls = Vec::new();
+    for item in &program.items {
+        // Tests are not part of the built program.
+        let Item::Fn(f) = item else { continue };
+        if !f.type_params.is_empty() {
+            return unsupported("generic functions", f.name_span);
+        }
+        if !f.requires.is_empty() || !f.ensures.is_empty() {
+            return unsupported("`requires` / `ensures`", f.name_span);
+        }
+        if f.params.len() > 4 {
+            return unsupported("functions with more than four parameters", f.name_span);
+        }
+        let mut params = Vec::new();
+        for p in &f.params {
+            params.push(n.ty_expr(&p.ty)?);
+        }
+        let ret = match &f.ret {
+            Some(t) => n.ty_expr(t)?,
+            None => Ty::Unit,
+        };
+        let label = n.a.label();
+        n.fns.insert(f.name.clone(), FnInfo { label, params, ret });
+        decls.push(f.clone());
+    }
+    let Some(main) = n.fns.get("main") else { return unsupported("a program without `main`", nowhere) };
+    let main_label = main.label;
 
     // Entry point: run `main`, then leave with exit code 0.
     n.a.alu_imm(5, RSP, 40);
@@ -311,6 +381,13 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     for f in &decls {
         n.function(f, &f.name)?;
     }
+    while let Some((push, id)) = n.glue_queue.pop() {
+        if push {
+            n.emit_push(id);
+        } else {
+            n.emit_drop(id);
+        }
+    }
     if n.uses_heap {
         // Only the routines that are reached, to keep the executable small.
         n.in_runtime = true;
@@ -330,23 +407,6 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     Ok(write_pe(n.a.finish(), &iat_fixups, &bss_fixups))
 }
 
-fn simple_type(t: &TypeExpr) -> R<Ty> {
-    match &t.kind {
-        TypeKind::Named(name, args) if args.is_empty() => match name.as_str() {
-            "Int" => Ok(Ty::Int),
-            "Bool" => Ok(Ty::Bool),
-            "Unit" => Ok(Ty::Unit),
-            "String" => Ok(Ty::Str),
-            other => unsupported(format!("the type `{other}`"), t.span),
-        },
-        TypeKind::Named(name, args) if name == "List" && args.len() == 1 => match simple_type(&args[0])? {
-            Ty::Int => Ok(Ty::List),
-            _ => unsupported("a list of anything but Ints", t.span),
-        },
-        _ => unsupported("this type", t.span),
-    }
-}
-
 type Decls = Vec<(usize, String, u8)>;
 
 /// Registers a hidden value of the loop at `id`, used every round.
@@ -356,9 +416,41 @@ fn hidden(id: usize, kind: u8, depth: u32, weight: &mut HashMap<String, usize>, 
     decls.push((id, name, kind));
 }
 
+/// Registers the variables a pattern introduces.
+fn binds(pat: &Pattern, decls: &mut Decls) {
+    match &pat.kind {
+        PatKind::Bind(name) => decls.push((pat.span.start, name.clone(), VAR)),
+        PatKind::Ctor { args, .. } => {
+            for arg in args {
+                binds(arg, decls);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// How often each variable name is used, counting uses inside loops as more.
 fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Decls) {
     match &e.kind {
+        ExprKind::Field(base, ..) | ExprKind::Try(base) => weigh(base, depth, weight, decls),
+        ExprKind::StructLit { fields, .. } => {
+            for (_, _, value) in fields {
+                weigh(value, depth, weight, decls);
+            }
+        }
+        ExprKind::Ctor { args, .. } => {
+            for arg in args {
+                weigh(arg, depth, weight, decls);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            weigh(scrutinee, depth, weight, decls);
+            hidden(e.span.start, SCRUT, depth, weight, decls);
+            for arm in arms {
+                binds(&arm.pat, decls);
+                weigh(&arm.body, depth, weight, decls);
+            }
+        }
         ExprKind::List(items) => {
             for item in items {
                 weigh(item, depth, weight, decls);
@@ -475,8 +567,9 @@ impl Native<'_> {
             ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
             ExprKind::Unary(_, x) => self.has_call(x),
             ExprKind::Binary(_, l, r) => self.has_call(l) || self.has_call(r),
-            // Reading from a list held by a variable is done in place.
+            // Reading from a struct or a list held by a variable is done in place.
             // (The same on a string is a call into the runtime.)
+            ExprKind::Field(base, ..) => self.heap_var(base).is_none(),
             ExprKind::Index(list, index) => self.list_var(list).is_none() || self.has_call(index),
             ExprKind::MethodCall { recv, name, args, .. } => {
                 !(name == "len" && args.is_empty() && self.list_var(recv).is_some())
@@ -573,10 +666,19 @@ impl Native<'_> {
         }
     }
 
-    /// One more owner for the list or string in `reg`.
+    /// One more owner for the value in `reg`.
     fn retain(&mut self, reg: u8, ty: Ty) {
         match ty {
-            Ty::List => self.a.inc_mem(M(reg, 0)),
+            Ty::List(_) | Ty::Struct(_) => self.a.inc_mem(M(reg, 0)),
+            Ty::Enum(_) if self.plain_enum(ty) => {}
+            Ty::Enum(_) => {
+                // A variant without fields is a small number, not a block.
+                let small = self.a.label();
+                self.a.alu_imm(7, reg, SMALL);
+                self.a.jcc(CC_B, small);
+                self.a.inc_mem(M(reg, 0));
+                self.a.bind(small);
+            }
             Ty::Str => {
                 // A constant has a negative count and is left alone.
                 let constant = self.a.label();
@@ -587,6 +689,363 @@ impl Native<'_> {
             }
             _ => {}
         }
+    }
+
+    /// Gives up the reference in rcx.
+    fn drop_value(&mut self, ty: Ty) {
+        match ty {
+            Ty::Str => self.call_rt("str_release"),
+            Ty::List(_) if !self.item_ty(ty).heap() => self.call_rt("list_release"),
+            Ty::Enum(_) if self.plain_enum(ty) => {}
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => {
+                let label = self.glue(false, id);
+                self.call_label(label);
+            }
+            _ => {}
+        }
+    }
+
+    /// Calls `push` for a list of type `list` (rcx = the list, rdx = the item).
+    fn push_call(&mut self, list: Ty) {
+        match list {
+            Ty::List(id) if self.item_ty(list).heap() => {
+                let label = self.glue(true, id);
+                self.call_label(label);
+            }
+            _ => self.call_rt("list_push"),
+        }
+    }
+
+    /// The label of the generated code that releases a value of type `id`,
+    /// or (with `push`) that pushes onto a list of type `id`.
+    fn glue(&mut self, push: bool, id: u32) -> usize {
+        self.uses_heap = true;
+        let known = if push { self.push_labels.get(&id) } else { self.drop_labels.get(&id) };
+        if let Some(label) = known {
+            return *label;
+        }
+        let label = self.a.label();
+        if push {
+            self.push_labels.insert(id, label);
+        } else {
+            self.drop_labels.insert(id, label);
+        }
+        self.glue_queue.push((push, id));
+        label
+    }
+
+    /// `drop(rcx = value)`: one owner less; the last one frees the block
+    /// after giving up everything it holds.
+    fn emit_drop(&mut self, id: u32) {
+        let def = self.defs[id as usize].clone();
+        let (free, done) = (self.a.label(), self.a.label());
+        self.a.bind(self.drop_labels[&id]);
+        if matches!(def, Def::Enum(_)) {
+            self.a.alu_imm(7, RCX, SMALL);
+            self.a.jcc(CC_B, done);
+        }
+        self.a.cmp_imm(M(RCX, 0), 1);
+        self.a.jcc(CC_E, free);
+        self.a.dec_mem(M(RCX, 0));
+        self.a.bind(done);
+        self.a.b(0xC3);
+
+        self.a.bind(free);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.mov_rr(RBX, RCX);
+        match def {
+            Def::Struct(fields) => {
+                for (i, (_, ty)) in fields.iter().enumerate() {
+                    if ty.heap() {
+                        self.a.load(RCX, M(RBX, 8 + 8 * i as i32));
+                        self.drop_value(*ty);
+                    }
+                }
+            }
+            Def::Enum(variants) => {
+                let end = self.a.label();
+                for (tag, (_, fields)) in variants.iter().enumerate() {
+                    if !fields.iter().any(|ty| ty.heap()) {
+                        continue;
+                    }
+                    let next = self.a.label();
+                    self.a.cmp_imm(M(RBX, 8), tag as i32);
+                    self.a.jcc(CC_NE, next);
+                    for (i, ty) in fields.iter().enumerate() {
+                        if ty.heap() {
+                            self.a.load(RCX, M(RBX, 16 + 8 * i as i32));
+                            self.drop_value(*ty);
+                        }
+                    }
+                    self.a.jmp(end);
+                    self.a.bind(next);
+                }
+                self.a.bind(end);
+            }
+            Def::List(item) => {
+                let (top, end) = (self.a.label(), self.a.label());
+                self.a.mov_imm64(RSI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RSI, M(RBX, LENGTH));
+                self.a.jcc(CC_GE, end);
+                self.element(0x8B, RCX, RBX, RSI);
+                self.drop_value(item);
+                self.a.alu_imm(0, RSI, 1);
+                self.a.jmp(top);
+                self.a.bind(end);
+            }
+        }
+        self.a.mov_rr(RCX, RBX);
+        match self.block_size(id) {
+            Some(bytes) if bytes <= POOL_MAX => {
+                self.a.mov_imm64(RDX, bytes as i64);
+                self.call_label(self.rt_pool_free);
+            }
+            _ => self.call_label(self.rt_free),
+        }
+        self.a.alu_imm(0, RSP, 40);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
+    }
+
+    /// `push(rcx = list, rdx = item) -> rax` for a list whose items are
+    /// counted. When the list is shared, `list_push` copies it, and the copy
+    /// then holds every item once more.
+    fn emit_push(&mut self, id: u32) {
+        let item = self.item_ty(Ty::List(id));
+        let (top, done) = (self.a.label(), self.a.label());
+        self.a.bind(self.push_labels[&id]);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.load(RBX, M(RCX, 0));
+        self.a.load(RSI, M(RCX, LENGTH));
+        self.call_rt("list_push");
+        self.a.alu_imm(7, RBX, 1);
+        self.a.jcc(CC_E, done);
+        self.a.mov_imm64(RCX, 0);
+        self.a.bind(top);
+        self.a.alu_rr(0x39, RCX, RSI);
+        self.a.jcc(CC_GE, done);
+        self.element(0x8B, RDX, RAX, RCX);
+        self.retain(RDX, item);
+        self.a.alu_imm(0, RCX, 1);
+        self.a.jmp(top);
+        self.a.bind(done);
+        self.a.alu_imm(0, RSP, 40);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
+    }
+
+    // ---- types ----
+
+    fn ty_expr(&mut self, t: &TypeExpr) -> R<Ty> {
+        self.ty_text(&t.to_string(), &[], t.span)
+    }
+
+    /// The type the checker found for `e`.
+    fn expr_ty(&mut self, e: &Expr) -> R<Ty> {
+        let types = self.types;
+        match types.expr_types.get(&(e.span.start, e.span.end)) {
+            Some(text) => self.ty_text(text, &[], e.span),
+            None => unsupported("an expression whose type is not known", e.span),
+        }
+    }
+
+    /// The type written as `text`. `env` gives the types that the type
+    /// parameters in scope stand for.
+    fn ty_text(&mut self, text: &str, env: &[(String, Ty)], span: Span) -> R<Ty> {
+        let mut rest = text;
+        let ty = self.ty_parse(&mut rest, env, span)?;
+        if !rest.is_empty() {
+            return unsupported(format!("the type `{text}`"), span);
+        }
+        Ok(ty)
+    }
+
+    fn ty_parse(&mut self, rest: &mut &str, env: &[(String, Ty)], span: Span) -> R<Ty> {
+        let end = rest.find(['<', ',', '>']).unwrap_or(rest.len());
+        let name = rest[..end].trim().to_string();
+        *rest = &rest[end..];
+        let mut args = Vec::new();
+        if rest.starts_with('<') {
+            loop {
+                // Skips the `<` or the `,`.
+                *rest = &rest[1..];
+                args.push(self.ty_parse(rest, env, span)?);
+                if !rest.starts_with(',') {
+                    break;
+                }
+            }
+            if !rest.starts_with('>') {
+                return unsupported(format!("the type `{name}`"), span);
+            }
+            *rest = &rest[1..];
+        }
+        self.ty_apply(&name, &args, env, span)
+    }
+
+    fn ty_apply(&mut self, name: &str, args: &[Ty], env: &[(String, Ty)], span: Span) -> R<Ty> {
+        if args.is_empty() {
+            match name {
+                "Int" => return Ok(Ty::Int),
+                "Bool" => return Ok(Ty::Bool),
+                "Unit" => return Ok(Ty::Unit),
+                "String" => return Ok(Ty::Str),
+                "Never" => return Ok(Ty::Never),
+                _ => {}
+            }
+            if let Some((_, ty)) = env.iter().find(|(param, _)| param == name) {
+                return Ok(*ty);
+            }
+        }
+        let key = match args {
+            [] => name.to_string(),
+            _ => format!("{name}<{}>", args.iter().map(|ty| self.ty_key(*ty)).collect::<Vec<_>>().join(", ")),
+        };
+        if let Some(ty) = self.def_ids.get(&key) {
+            return Ok(*ty);
+        }
+        let id = self.defs.len() as u32;
+        match (name, args) {
+            ("List", [item]) => return Ok(self.define(key, Ty::List(id), Def::List(*item))),
+            ("Option", [some]) => {
+                let variants = vec![("None".to_string(), vec![]), ("Some".to_string(), vec![*some])];
+                return Ok(self.define(key, Ty::Enum(id), Def::Enum(variants)));
+            }
+            ("Result", [ok, err]) => {
+                let variants = vec![("Ok".to_string(), vec![*ok]), ("Err".to_string(), vec![*err])];
+                return Ok(self.define(key, Ty::Enum(id), Def::Enum(variants)));
+            }
+            _ => {}
+        }
+        // A type of the program. It is registered before its parts are
+        // looked at, so that it can refer to itself.
+        if let Some(decl) = self.structs.get(name).copied() {
+            if decl.type_params.len() == args.len() {
+                let ty = self.define(key, Ty::Struct(id), Def::Struct(Vec::new()));
+                let env: Vec<(String, Ty)> = decl.type_params.iter().cloned().zip(args.iter().copied()).collect();
+                let mut fields = Vec::new();
+                for field in &decl.fields {
+                    fields.push((field.name.clone(), self.ty_text(&field.ty.to_string(), &env, field.span)?));
+                }
+                self.defs[id as usize] = Def::Struct(fields);
+                return Ok(ty);
+            }
+        }
+        if let Some(decl) = self.enums.get(name).copied() {
+            if decl.type_params.len() == args.len() {
+                let ty = self.define(key, Ty::Enum(id), Def::Enum(Vec::new()));
+                let env: Vec<(String, Ty)> = decl.type_params.iter().cloned().zip(args.iter().copied()).collect();
+                let mut variants = Vec::new();
+                for variant in &decl.variants {
+                    let mut fields = Vec::new();
+                    for field in &variant.fields {
+                        fields.push(self.ty_text(&field.to_string(), &env, field.span)?);
+                    }
+                    variants.push((variant.name.clone(), fields));
+                }
+                self.defs[id as usize] = Def::Enum(variants);
+                return Ok(ty);
+            }
+        }
+        unsupported(format!("the type `{name}`"), span)
+    }
+
+    fn define(&mut self, key: String, ty: Ty, def: Def) -> Ty {
+        self.defs.push(def);
+        self.def_keys.push(key.clone());
+        self.def_ids.insert(key, ty);
+        ty
+    }
+
+    fn ty_key(&self, ty: Ty) -> String {
+        match ty {
+            Ty::Int => "Int".to_string(),
+            Ty::Bool => "Bool".to_string(),
+            Ty::Unit => "Unit".to_string(),
+            Ty::Str => "String".to_string(),
+            Ty::Never => "Never".to_string(),
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => self.def_keys[id as usize].clone(),
+        }
+    }
+
+    /// The type of the items of a list type.
+    fn item_ty(&self, list: Ty) -> Ty {
+        match list {
+            Ty::List(id) => match &self.defs[id as usize] {
+                Def::List(item) => *item,
+                _ => Ty::Never,
+            },
+            _ => Ty::Never,
+        }
+    }
+
+    fn fields(&self, ty: Ty) -> Vec<(String, Ty)> {
+        match ty {
+            Ty::Struct(id) => match &self.defs[id as usize] {
+                Def::Struct(fields) => fields.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    fn variants(&self, ty: Ty) -> Vec<(String, Vec<Ty>)> {
+        match ty {
+            Ty::Enum(id) => match &self.defs[id as usize] {
+                Def::Enum(variants) => variants.clone(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+
+    /// Whether no variant of the enum has fields: its values are plain numbers.
+    fn plain_enum(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Enum(id) => match &self.defs[id as usize] {
+                Def::Enum(variants) => variants.iter().all(|(_, fields)| fields.is_empty()),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// The size of the block of a struct or enum value. Every variant of an
+    /// enum gets the size of the largest, so that the size follows from the type.
+    fn block_size(&self, id: u32) -> Option<usize> {
+        match &self.defs[id as usize] {
+            Def::Struct(fields) => Some(8 + 8 * fields.len()),
+            Def::Enum(variants) => Some(16 + 8 * variants.iter().map(|(_, fields)| fields.len()).max().unwrap_or(0)),
+            Def::List(_) => None,
+        }
+    }
+
+    fn size_of(&self, ty: Ty) -> usize {
+        match ty {
+            Ty::Struct(id) | Ty::Enum(id) => self.block_size(id).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Allocates a counted block of `bytes` bytes with one owner, moves the
+    /// parked values in `parts` (spill slot, offset in the block) into it, and
+    /// leaves its address in `dst`. The slots stay taken.
+    fn fill_block(&mut self, bytes: usize, parts: &[(M, i32)], dst: u8) {
+        self.uses_heap = true;
+        self.a.mov_imm64(RCX, bytes as i64);
+        self.call_label(if bytes <= POOL_MAX { self.rt_pool_alloc } else { self.rt_alloc });
+        self.a.store_imm(M(RAX, 0), 1);
+        for (slot, offset) in parts {
+            self.a.load(RCX, *slot);
+            self.a.store(M(RAX, *offset), RCX);
+        }
+        self.a.mov_rr(dst, RAX);
     }
 
     /// A string that is part of the executable.
@@ -813,6 +1272,57 @@ impl Native<'_> {
         self.a.pop(RSI);
         self.a.b(0xC3);
 
+        // pool_alloc(rcx = bytes, a multiple of 8 up to POOL_MAX) -> rax:
+        // a freed block of that size if there is one, else the next piece
+        // of the memory taken from the system.
+        let (fresh, refill) = (self.a.label(), self.a.label());
+        self.a.bind(self.rt_pool_alloc);
+        if self.check_heap {
+            self.rip_bss(&[0x48, 0xFF, 0x05], LIVE_BLOCKS); // inc qword [live blocks]
+        }
+        self.rip_bss(&[0x48, 0x8D, 0x15], POOL_HEADS); // lea rdx, [heads]
+        self.a.buf.extend_from_slice(&[0x48, 0x8B, 0x04, 0x0A]); // mov rax, [rdx + rcx]
+        self.a.alu_rr(0x85, RAX, RAX);
+        self.a.jcc(CC_Z, fresh);
+        self.a.buf.extend_from_slice(&[0x4C, 0x8B, 0x00]); // mov r8, [rax]
+        self.a.buf.extend_from_slice(&[0x4C, 0x89, 0x04, 0x0A]); // mov [rdx + rcx], r8
+        self.a.b(0xC3);
+        self.a.bind(fresh);
+        self.rip_bss(&[0x48, 0x8B, 0x05], POOL_NEXT); // mov rax, [next]
+        self.a.buf.extend_from_slice(&[0x4C, 0x8D, 0x04, 0x08]); // lea r8, [rax + rcx]
+        self.rip_bss(&[0x4C, 0x3B, 0x05], POOL_END); // cmp r8, [end]
+        self.a.jcc(CC_A, refill);
+        self.rip_bss(&[0x4C, 0x89, 0x05], POOL_NEXT); // mov [next], r8
+        self.a.b(0xC3);
+        self.a.bind(refill);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.store(M(RSP, 48), RCX);
+        self.process_heap();
+        self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+        self.a.buf.extend_from_slice(&[0x41, 0xB8]); // mov r8d, POOL_CHUNK
+        self.a.buf.extend_from_slice(&POOL_CHUNK.to_le_bytes());
+        self.call_import(HEAP_ALLOC);
+        self.a.alu_rr(0x85, RAX, RAX);
+        self.a.jcc(CC_Z, oom);
+        self.rip_bss(&[0x48, 0x89, 0x05], POOL_NEXT); // mov [next], rax
+        self.a.buf.extend_from_slice(&[0x48, 0x8D, 0x90]); // lea rdx, [rax + POOL_CHUNK]
+        self.a.buf.extend_from_slice(&POOL_CHUNK.to_le_bytes());
+        self.rip_bss(&[0x48, 0x89, 0x15], POOL_END); // mov [end], rdx
+        self.a.load(RCX, M(RSP, 48));
+        self.a.alu_imm(0, RSP, 40);
+        self.a.jmp(fresh);
+
+        // pool_free(rcx = block, rdx = its size): onto the chain of its size.
+        self.a.bind(self.rt_pool_free);
+        if self.check_heap {
+            self.rip_bss(&[0x48, 0xFF, 0x0D], LIVE_BLOCKS); // dec qword [live blocks]
+        }
+        self.rip_bss(&[0x4C, 0x8D, 0x05], POOL_HEADS); // lea r8, [heads]
+        self.a.buf.extend_from_slice(&[0x49, 0x8B, 0x04, 0x10]); // mov rax, [r8 + rdx]
+        self.a.buf.extend_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+        self.a.buf.extend_from_slice(&[0x49, 0x89, 0x0C, 0x10]); // mov [r8 + rdx], rcx
+        self.a.b(0xC3);
+
         // Reached with the stack as inside the routines above.
         self.a.bind(oom);
         let text = b"error: out of memory\n";
@@ -855,11 +1365,11 @@ impl Native<'_> {
                     self.lea_label(R8, record);
                     self.call_label(self.rt_overflow);
                 }
-                Stub::Push { label, back, variable, value } => {
+                Stub::Push { label, back, variable, value, list } => {
                     self.a.bind(label);
                     self.a.mov_rr(RDX, value);
                     self.load_loc(RCX, variable);
-                    self.call_rt("list_push");
+                    self.push_call(list);
                     self.store_loc(variable, RAX);
                     self.a.jmp(back);
                 }
@@ -944,9 +1454,11 @@ impl Native<'_> {
         self.spill_max = 0;
         self.free = TEMPS.to_vec();
         self.loops.clear();
+        self.pending.clear();
         self.epilogue = self.a.label();
         let info = &self.fns[key];
         let (label, ret) = (info.label, info.ret);
+        let param_tys = info.params.clone();
         self.ret = ret;
 
         self.a.bind(label);
@@ -959,7 +1471,7 @@ impl Native<'_> {
         for (i, p) in f.params.iter().enumerate() {
             let loc = self.decl_loc[&(p.span.start, VAR)];
             self.store_loc(loc, ARG_REGS[i]);
-            scope.insert(p.name.clone(), Local { ty: simple_type(&p.ty)?, loc });
+            scope.insert(p.name.clone(), Local { ty: param_tys[i], loc, borrowed: false });
         }
         self.scopes = vec![scope];
 
@@ -1004,7 +1516,7 @@ impl Native<'_> {
     fn declare(&mut self, name: &str, local: Local) {
         let scope = self.scopes.last_mut().expect("scope");
         if let Some(old) = scope.insert(name.to_string(), local) {
-            if old.ty.heap() {
+            if old.ty.heap() && !old.borrowed {
                 // Shadowed, but it still holds a list until the scope ends.
                 let hidden = format!("{name}%{}", scope.len());
                 scope.insert(hidden, old);
@@ -1016,7 +1528,7 @@ impl Native<'_> {
     /// from `from` on. `keep` is a register whose value must survive.
     fn release_scopes(&mut self, from: usize, keep: Option<u8>) {
         let mut locs: Vec<Local> =
-            self.scopes[from..].iter().flat_map(|s| s.values()).filter(|l| l.ty.heap()).copied().collect();
+            self.scopes[from..].iter().flat_map(|s| s.values()).filter(|l| l.ty.heap() && !l.borrowed).copied().collect();
         if locs.is_empty() {
             return;
         }
@@ -1032,7 +1544,7 @@ impl Native<'_> {
         });
         for local in locs {
             self.load_loc(RCX, local.loc);
-            self.call_rt(local.ty.release());
+            self.drop_value(local.ty);
         }
         if let (Some(reg), Some(slot)) = (keep, slot) {
             self.a.load(reg, slot);
@@ -1040,11 +1552,41 @@ impl Native<'_> {
         }
     }
 
-    /// Gives up the list in rcx without losing the value in `keep`.
-    fn release_keeping(&mut self, keep: u8) {
+    /// Leaving early: gives up the values held by expressions in progress
+    /// (from `held` on) and by the variables of the scopes from `from` on.
+    fn unwind(&mut self, from: usize, held: usize, keep: Option<u8>) {
+        let pending: Vec<(M, Ty)> = self.pending[held..].to_vec();
+        if !pending.is_empty() {
+            let slot = keep.map(|reg| {
+                let slot = self.push_spill();
+                self.a.store(slot, reg);
+                slot
+            });
+            for (at, ty) in pending {
+                self.a.load(RCX, at);
+                self.drop_value(ty);
+            }
+            if let (Some(reg), Some(slot)) = (keep, slot) {
+                self.a.load(reg, slot);
+                self.spill_depth -= 1;
+            }
+        }
+        self.release_scopes(from, keep);
+    }
+
+    /// Notes that the spill slot `at` owns a value of type `ty` for now.
+    /// Undone by cutting `pending` back to its length before.
+    fn hold(&mut self, at: M, ty: Ty) {
+        if ty.heap() {
+            self.pending.push((at, ty));
+        }
+    }
+
+    /// Gives up the reference in rcx without losing the value in `keep`.
+    fn release_keeping(&mut self, keep: u8, ty: Ty) {
         let slot = self.push_spill();
         self.a.store(slot, keep);
-        self.call_rt("list_release");
+        self.drop_value(ty);
         self.a.load(keep, slot);
         self.spill_depth -= 1;
     }
@@ -1053,12 +1595,12 @@ impl Native<'_> {
     /// (The type checker already rejects unused values.)
     fn discard(&self, ty: Ty, span: Span) -> R<()> {
         if ty.heap() {
-            return unsupported("a list or a string that is not used", span);
+            return unsupported("a value that is not used", span);
         }
         Ok(())
     }
 
-    /// The variable `e` names, if it holds a list or a string.
+    /// The variable `e` names, if what it holds is counted.
     fn heap_var(&self, e: &Expr) -> Option<Local> {
         let ExprKind::Ident(name) = &e.kind else { return None };
         let local = self.scopes.iter().rev().find_map(|s| s.get(name.as_str()))?;
@@ -1088,7 +1630,12 @@ impl Native<'_> {
     fn str_op(&mut self, routine: &str, left: (M, bool), right: Option<&Expr>, dst: u8) -> R<()> {
         let mut second = None;
         if let Some(right) = right {
+            let held = self.pending.len();
+            if left.1 {
+                self.hold(left.0, Ty::Str);
+            }
             let (slot, owned, ty) = self.park(right, dst)?;
+            self.pending.truncate(held);
             if ty != Ty::Str {
                 return unsupported("this operation on a String and something else", right.span);
             }
@@ -1112,62 +1659,42 @@ impl Native<'_> {
         Ok(())
     }
 
-    /// What `e` evaluates to, as far as it can be told without compiling it.
-    fn type_of(&self, e: &Expr) -> Option<Ty> {
+    /// What `e` evaluates to, where that is plain to see. Only used to guess sizes.
+    fn quick_ty(&self, e: &Expr) -> Option<Ty> {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Index(..) => Some(Ty::Int),
+            ExprKind::Int(_) => Some(Ty::Int),
             ExprKind::Bool(_) => Some(Ty::Bool),
-            ExprKind::Str(_) => Some(Ty::Str),
-            ExprKind::List(_) => Some(Ty::List),
             ExprKind::Ident(name) => self.scopes.iter().rev().find_map(|s| s.get(name.as_str())).map(|l| l.ty),
-            ExprKind::Call { name, local: false, .. } => self.fns.get(name).map(|f| f.ret),
-            ExprKind::Unary(UnOp::Neg, _) => Some(Ty::Int),
-            ExprKind::Unary(UnOp::Not, _) => Some(Ty::Bool),
             ExprKind::Binary(op, ..) => match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Some(Ty::Int),
                 _ => Some(Ty::Bool),
             },
-            ExprKind::MethodCall { name, .. } => match name.as_str() {
-                "to_string" => Some(Ty::Str),
-                "push" | "map" | "filter" => Some(Ty::List),
-                "len" => Some(Ty::Int),
-                "any" | "all" | "is_empty" | "contains" | "starts_with" | "ends_with" => Some(Ty::Bool),
-                _ => None,
-            },
-            ExprKind::Block(b) => self.type_of_block(b),
-            ExprKind::If { then, els, .. } => {
-                self.type_of_block(then).or_else(|| els.as_ref().and_then(|e| self.type_of(e)))
-            }
+            ExprKind::MethodCall { name, .. } if name == "len" => Some(Ty::Int),
             _ => None,
         }
     }
 
-    fn type_of_block(&self, b: &Block) -> Option<Ty> {
-        match b.stmts.last() {
-            Some(Stmt::Expr(e)) => self.type_of(e),
-            _ => None,
+    /// The type of the receiver of a method call.
+    fn recv_ty(&mut self, e: &Expr) -> R<Ty> {
+        match &e.kind {
+            ExprKind::Ident(name) => Ok(self.lookup(name, e.span)?.ty),
+            ExprKind::Int(_) => Ok(Ty::Int),
+            ExprKind::Bool(_) => Ok(Ty::Bool),
+            _ => self.expr_ty(e),
         }
     }
 
     /// The variable `e` names, if it holds a list.
     fn list_var(&self, e: &Expr) -> Option<Local> {
-        let ExprKind::Ident(name) = &e.kind else { return None };
-        let local = self.scopes.iter().rev().find_map(|s| s.get(name.as_str()))?;
-        (local.ty == Ty::List).then_some(*local)
+        self.heap_var(e).filter(|local| matches!(local.ty, Ty::List(_)))
     }
 
-    /// Evaluates `e`, which must be a list, into `dst`; `dst` then owns a reference.
-    fn owned_list(&mut self, e: &Expr, dst: u8) -> R<()> {
+    /// Evaluates `e`, which must be a list, into `dst`; `dst` then owns a
+    /// reference. Returns the type of the list.
+    fn owned_list(&mut self, e: &Expr, dst: u8) -> R<Ty> {
         match self.eval(e, dst)? {
-            Ty::List => Ok(()),
-            _ => unsupported("this operation on anything but a list of Ints", e.span),
-        }
-    }
-
-    fn expect_int(&self, ty: Ty, span: Span) -> R<()> {
-        match ty {
-            Ty::Int => Ok(()),
-            _ => unsupported("a list of anything but Ints", span),
+            ty @ Ty::List(_) => Ok(ty),
+            _ => unsupported("this operation on anything but a list", e.span),
         }
     }
 
@@ -1227,21 +1754,12 @@ impl Native<'_> {
                 let loc = self.decl_loc[&(name_span.start, VAR)];
                 // The new variable is not visible in its own initializer.
                 let ty = self.eval_into(value, loc, true)?;
-                let known = match ty {
-                    Ty::Int | Ty::Bool | Ty::Str => true,
-                    // An empty list says nothing about its items; ask the type checker.
-                    // (`_` is never read, so its items do not matter.)
-                    Ty::List => {
-                        name == "_" || self.types.var_types.get(&name_span.start).is_some_and(|t| t == "List<Int>")
-                    }
-                    _ => false,
-                };
-                if !known {
-                    return unsupported("a variable that is not an Int, a Bool, a String or a List<Int>", *name_span);
+                if matches!(ty, Ty::Unit | Ty::Never) {
+                    return unsupported("a variable that holds no value", *name_span);
                 }
                 // `_` cannot be read, but what it holds is still released with the scope.
                 if name != "_" || ty.heap() {
-                    self.declare(name, Local { ty, loc });
+                    self.declare(name, Local { ty, loc, borrowed: false });
                 }
             }
             Stmt::Assign { target, value } => {
@@ -1266,7 +1784,7 @@ impl Native<'_> {
                 let (top, exit) = (self.a.label(), self.a.label());
                 self.a.bind(top);
                 self.cond(cond, exit)?;
-                self.loops.push((exit, top, self.scopes.len()));
+                self.loops.push((exit, top, self.scopes.len(), self.pending.len()));
                 let t = self.take_temp(cond.span)?;
                 let ty = self.block(body, t)?;
                 self.discard(ty, body.span)?;
@@ -1288,8 +1806,8 @@ impl Native<'_> {
                     Loc::Stack(off) => self.a.alu_m(0x3B, RAX, M(RSP, off)),
                 }
                 self.a.jcc(CC_GE, exit);
-                self.scopes.push(HashMap::from([(var.clone(), Local { ty: Ty::Int, loc: counter })]));
-                self.loops.push((exit, next, self.scopes.len()));
+                self.scopes.push(HashMap::from([(var.clone(), Local { ty: Ty::Int, loc: counter, borrowed: false })]));
+                self.loops.push((exit, next, self.scopes.len(), self.pending.len()));
                 let t = self.take_temp(*var_span)?;
                 let ty = self.block(body, t)?;
                 self.discard(ty, body.span)?;
@@ -1311,18 +1829,21 @@ impl Native<'_> {
                 let item = self.decl_loc[&(var_span.start, VAR)];
                 // The loop holds its own reference: the list it walks stays as
                 // it is even if the body changes the variable it came from.
-                if self.eval_into(iter, list, true)? != Ty::List {
-                    return unsupported("`for` over anything but a list of Ints", iter.span);
+                let list_ty = self.eval_into(iter, list, true)?;
+                if !matches!(list_ty, Ty::List(_)) {
+                    return unsupported("`for` over anything but a list", iter.span);
                 }
                 self.set_loc(pos, 0);
                 let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
+                // The loop variable is borrowed from the list, which the loop keeps alive.
+                let item_ty = self.item_ty(list_ty);
                 self.scopes.push(HashMap::from([
-                    ("%for".to_string(), Local { ty: Ty::List, loc: list }),
-                    (var.clone(), Local { ty: Ty::Int, loc: item }),
+                    ("%for".to_string(), Local { ty: list_ty, loc: list, borrowed: false }),
+                    (var.clone(), Local { ty: item_ty, loc: item, borrowed: true }),
                 ]));
                 self.a.bind(top);
                 self.next_item(list, pos, item, exit);
-                self.loops.push((exit, next, self.scopes.len()));
+                self.loops.push((exit, next, self.scopes.len(), self.pending.len()));
                 let t = self.take_temp(*var_span)?;
                 let ty = self.block(body, t)?;
                 self.discard(ty, body.span)?;
@@ -1334,7 +1855,7 @@ impl Native<'_> {
                 self.a.bind(exit);
                 self.scopes.pop();
                 self.load_loc(RCX, list);
-                self.call_rt("list_release");
+                self.drop_value(list_ty);
             }
             Stmt::Assert { span, .. } => return unsupported("`assert`", *span),
             Stmt::Expr(e) => {
@@ -1347,19 +1868,19 @@ impl Native<'_> {
         Ok(())
     }
 
-    /// `name = value` for a list or string variable: what it held is given up.
+    /// `name = value` for a variable whose value is counted: what it held is given up.
     fn assign_heap(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
         // `xs = xs.push(v)` hands the variable's own reference to `push`, which
         // can then add the item in place instead of copying the list.
         if let ExprKind::MethodCall { recv, name: method, args, .. } = &value.kind {
-            if local.ty == Ty::List && method == "push" && args.len() == 1 && matches!(&recv.kind, ExprKind::Ident(n) if n == name) {
+            let pushes_itself = matches!(&recv.kind, ExprKind::Ident(n) if n == name);
+            if matches!(local.ty, Ty::List(_)) && method == "push" && args.len() == 1 && pushes_itself {
                 let t = self.take_temp(value.span)?;
-                let ty = self.eval(&args[0], t)?;
-                self.expect_int(ty, args[0].span)?;
+                self.eval(&args[0], t)?;
                 // The usual case is written out here: the variable is the only
                 // owner and there is room. Everything else goes to `list_push`.
                 let (slow, back) = (self.a.label(), self.a.label());
-                self.stubs.push(Stub::Push { label: slow, back, variable: local.loc, value: t });
+                self.stubs.push(Stub::Push { label: slow, back, variable: local.loc, value: t, list: local.ty });
                 self.uses_heap = true;
                 let l = self.reg(local.loc, RCX);
                 self.a.cmp_imm(M(l, 0), 1);
@@ -1381,7 +1902,7 @@ impl Native<'_> {
         self.load_loc(RCX, local.loc);
         self.store_loc(local.loc, t);
         self.free.push(t);
-        self.call_rt(local.ty.release());
+        self.drop_value(local.ty);
         Ok(())
     }
 
@@ -1481,20 +2002,27 @@ impl Native<'_> {
             }
             ExprKind::Str(parts) => self.string(parts, dst),
             ExprKind::List(items) => {
+                let ty = self.expr_ty(e)?;
+                if !matches!(ty, Ty::List(_)) {
+                    return unsupported("this list", e.span);
+                }
                 self.a.mov_imm64(RCX, items.len() as i64);
                 self.call_rt("list_new");
                 let slot = self.push_spill();
                 self.a.store(slot, RAX);
+                let held = self.pending.len();
+                self.hold(slot, ty);
                 for (i, item) in items.iter().enumerate() {
-                    let ty = self.eval(item, dst)?;
-                    self.expect_int(ty, item.span)?;
+                    self.eval(item, dst)?;
                     self.a.load(RAX, slot);
                     self.a.store(M(RAX, ELEMENTS + 8 * i as i32), dst);
+                    // The length follows the items, so the list is whole at every point.
+                    self.a.store_imm(M(RAX, LENGTH), i as i32 + 1);
                 }
+                self.pending.truncate(held);
                 self.a.load(dst, slot);
                 self.spill_depth -= 1;
-                self.a.store_imm(M(dst, LENGTH), items.len() as i32);
-                Ok(Ty::List)
+                Ok(ty)
             }
             ExprKind::Index(list, index) => {
                 if let Some(local) = self.list_var(list) {
@@ -1508,24 +2036,143 @@ impl Native<'_> {
                     // Unsigned, so that a negative index is out of bounds too.
                     self.a.jcc(CC_AE, stub);
                     self.element(0x8B, dst, l, dst);
-                    return Ok(Ty::Int);
+                    let item = self.item_ty(local.ty);
+                    self.retain(dst, item);
+                    return Ok(item);
                 }
-                self.owned_list(list, dst)?;
+                let list_ty = self.owned_list(list, dst)?;
                 let slot = self.push_spill();
                 self.a.store(slot, dst);
+                let held = self.pending.len();
+                self.hold(slot, list_ty);
                 if self.eval(index, dst)? != Ty::Int {
                     return unsupported("an index that is not an Int", index.span);
                 }
+                self.pending.truncate(held);
                 self.a.load(RCX, slot);
                 self.spill_depth -= 1;
                 let stub = self.bounds_stub(RCX, dst, e.span);
                 self.a.alu_m(0x3B, dst, M(RCX, LENGTH));
                 self.a.jcc(CC_AE, stub);
                 self.element(0x8B, dst, RCX, dst);
-                self.release_keeping(dst);
-                Ok(Ty::Int)
+                let item = self.item_ty(list_ty);
+                self.retain(dst, item);
+                self.release_keeping(dst, list_ty);
+                Ok(item)
             }
-            ExprKind::MethodCall { recv, name, name_span, args } => self.method(recv, name, *name_span, args, dst),
+            ExprKind::StructLit { fields, .. } => {
+                let ty = self.expr_ty(e)?;
+                let layout = self.fields(ty);
+                // The values first, in the order written, each parked; then
+                // the block, with each value in the place the declaration gives it.
+                let held = self.pending.len();
+                let mut parts = Vec::new();
+                for (name, name_span, value) in fields {
+                    let Some(at) = layout.iter().position(|(field, _)| field == name) else {
+                        return unsupported(format!("the field `{name}`"), *name_span);
+                    };
+                    let value_ty = self.eval(value, dst)?;
+                    let slot = self.push_spill();
+                    if value_ty != Ty::Unit {
+                        self.a.store(slot, dst);
+                        parts.push((slot, 8 + 8 * at as i32));
+                    }
+                    self.hold(slot, value_ty);
+                }
+                self.fill_block(self.size_of(ty), &parts, dst);
+                self.spill_depth -= fields.len() as i32;
+                self.pending.truncate(held);
+                Ok(ty)
+            }
+            ExprKind::Field(base, name, name_span) => {
+                let (owned, ty) = match self.heap_var(base) {
+                    Some(local) => (false, local.ty),
+                    None => (true, self.eval(base, dst)?),
+                };
+                let layout = self.fields(ty);
+                let Some(at) = layout.iter().position(|(field, _)| field == name) else {
+                    return unsupported(format!("the field `{name}` here"), *name_span);
+                };
+                let field_ty = layout[at].1;
+                let from = match self.heap_var(base) {
+                    // Read in place: the variable keeps the struct alive.
+                    Some(local) => self.reg(local.loc, RCX),
+                    None => {
+                        self.a.mov_rr(RCX, dst);
+                        RCX
+                    }
+                };
+                if field_ty != Ty::Unit {
+                    self.a.load(dst, M(from, 8 + 8 * at as i32));
+                    self.retain(dst, field_ty);
+                }
+                if owned {
+                    self.release_keeping(dst, ty);
+                }
+                Ok(field_ty)
+            }
+            ExprKind::Ctor { variant, args, .. } => {
+                let ty = self.expr_ty(e)?;
+                let variants = self.variants(ty);
+                let Some(tag) = variants.iter().position(|(name, _)| name == variant) else {
+                    return unsupported(format!("the variant `{variant}`"), e.span);
+                };
+                if variants[tag].1.is_empty() {
+                    // No fields: the number of the variant is the value.
+                    self.a.mov_imm64(dst, tag as i64);
+                    return Ok(ty);
+                }
+                let held = self.pending.len();
+                let mut parts = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_ty = self.eval(arg, dst)?;
+                    let slot = self.push_spill();
+                    if arg_ty != Ty::Unit {
+                        self.a.store(slot, dst);
+                        parts.push((slot, 16 + 8 * i as i32));
+                    }
+                    self.hold(slot, arg_ty);
+                }
+                self.fill_block(self.size_of(ty), &parts, dst);
+                self.a.store_imm(M(dst, 8), tag as i32);
+                self.spill_depth -= args.len() as i32;
+                self.pending.truncate(held);
+                Ok(ty)
+            }
+            ExprKind::Match { scrutinee, arms } => self.match_(scrutinee, arms, dst, e.span),
+            ExprKind::Try(inner) => {
+                let ty = self.eval(inner, dst)?;
+                let variants = self.variants(ty);
+                if variants.len() != 2 {
+                    return unsupported("`?` on this value", e.span);
+                }
+                let ok = self.a.label();
+                let value_ty = if variants[0].1.is_empty() {
+                    // Option: `None` is the number 0.
+                    self.a.alu_imm(7, dst, 0);
+                    self.a.jcc(CC_NE, ok);
+                    variants[1].1[0]
+                } else {
+                    // Result: `Ok` is variant 0.
+                    self.a.cmp_imm(M(dst, 8), 0);
+                    self.a.jcc(CC_E, ok);
+                    variants[0].1[0]
+                };
+                // `None` or `Err(e)` is the result of the function as it is:
+                // it looks the same whatever the type of the other variant.
+                self.a.mov_rr(RAX, dst);
+                self.unwind(1, 0, Some(RAX));
+                self.a.jmp(self.epilogue);
+                self.a.bind(ok);
+                self.a.mov_rr(RCX, dst);
+                if value_ty != Ty::Unit {
+                    self.a.load(dst, M(RCX, 16));
+                    self.retain(dst, value_ty);
+                }
+                self.release_keeping(dst, ty);
+                Ok(value_ty)
+            }
+            ExprKind::MethodCall { recv, name, name_span, args } => self.method(e, recv, name, *name_span, args, dst),
             ExprKind::Unary(UnOp::Neg, x) => {
                 if self.eval(x, dst)? != Ty::Int {
                     return unsupported("negating anything but an Int", e.span);
@@ -1584,15 +2231,15 @@ impl Native<'_> {
                     }
                 }
                 // The parameters (scope 0) are released at the common exit.
-                self.release_scopes(1, keep);
+                self.unwind(1, 0, keep);
                 self.a.jmp(self.epilogue);
                 Ok(Ty::Never)
             }
             ExprKind::Break | ExprKind::Continue => {
-                let Some((exit, next, outside)) = self.loops.last().copied() else {
+                let Some((exit, next, outside, held)) = self.loops.last().copied() else {
                     return unsupported("`break` outside a loop", e.span);
                 };
-                self.release_scopes(outside, None);
+                self.unwind(outside, held, None);
                 self.a.jmp(if matches!(e.kind, ExprKind::Break) { exit } else { next });
                 Ok(Ty::Never)
             }
@@ -1774,7 +2421,9 @@ impl Native<'_> {
         // evaluating an expression with a call in it. Each argument goes to
         // its own temp; the temps of later arguments serve as scratch.
         let outer = std::mem::take(&mut self.free);
+        let held = self.pending.len();
         let mut parked: Vec<Option<M>> = vec![None; args.len()];
+        let mut arg_tys = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             if self.has_call(arg) {
                 // The call inside would overwrite the arguments computed so far.
@@ -1783,12 +2432,14 @@ impl Native<'_> {
                         let slot = self.push_spill();
                         self.a.store(slot, ARG_TEMPS[j]);
                         parked[j] = Some(slot);
+                        self.hold(slot, arg_tys[j]);
                     }
                 }
             }
             self.free = ARG_TEMPS[i + 1..].iter().copied().filter(|r| TEMPS.contains(r)).collect();
-            self.eval(arg, ARG_TEMPS[i])?;
+            arg_tys.push(self.eval(arg, ARG_TEMPS[i])?);
         }
+        self.pending.truncate(held);
         for i in 0..args.len() {
             match parked[i] {
                 Some(slot) => self.a.load(ARG_REGS[i], slot),
@@ -1878,7 +2529,7 @@ impl Native<'_> {
             .iter()
             .map(|p| match p {
                 StrPart::Lit(text) => text.len(),
-                StrPart::Expr(value) => match self.type_of(value) {
+                StrPart::Expr(value) => match self.quick_ty(value) {
                     Some(Ty::Int) => 20,
                     Some(Ty::Bool) => 5,
                     _ => 24,
@@ -1889,6 +2540,8 @@ impl Native<'_> {
         self.call_rt("str_new");
         let building = self.push_spill();
         self.a.store(building, RAX);
+        let held = self.pending.len();
+        self.hold(building, Ty::Str);
         for part in parts {
             match part {
                 StrPart::Lit(text) if text.is_empty() => continue,
@@ -1930,6 +2583,7 @@ impl Native<'_> {
             }
             self.a.store(building, RAX);
         }
+        self.pending.truncate(held);
         self.a.load(dst, building);
         self.spill_depth -= 1;
         Ok(Ty::Str)
@@ -1950,19 +2604,130 @@ impl Native<'_> {
         self.a.bind(done);
     }
 
+    /// `match`: the value is kept in a place of its own while the arms are
+    /// tried in order; what the patterns name is borrowed from it.
+    fn match_(&mut self, scrutinee: &Expr, arms: &[Arm], dst: u8, span: Span) -> R<Ty> {
+        let outer = self.fresh_temps(dst);
+        let root = self.decl_loc[&(span.start, SCRUT)];
+        let ty = self.eval_into(scrutinee, root, true)?;
+        self.scopes.push(HashMap::from([("%match".to_string(), Local { ty, loc: root, borrowed: false })]));
+        let end = self.a.label();
+        let mut result = Ty::Never;
+        for arm in arms {
+            let next = self.a.label();
+            self.scopes.push(HashMap::new());
+            self.pattern(&arm.pat, root, &mut Vec::new(), ty, next)?;
+            let arm_ty = self.eval(&arm.body, dst)?;
+            self.scopes.pop();
+            if arm_ty != Ty::Never {
+                if result == Ty::Never {
+                    result = arm_ty;
+                }
+                self.a.jmp(end);
+            }
+            self.a.bind(next);
+        }
+        // The checker made sure that some arm matches, so nothing falls out of the last one.
+        self.a.bind(end);
+        let keep = (!matches!(result, Ty::Unit | Ty::Never) && TEMPS.contains(&dst)).then_some(dst);
+        self.release_scopes(self.scopes.len() - 1, keep);
+        self.scopes.pop();
+        self.free = outer;
+        Ok(result)
+    }
+
+    /// Loads into `reg` the part of the value at `root` that `path` leads
+    /// to: each step is the offset of a field in the block reached so far.
+    fn walk(&mut self, reg: u8, root: Loc, path: &[i32]) {
+        self.load_loc(reg, root);
+        for offset in path {
+            self.a.load(reg, M(reg, *offset));
+        }
+    }
+
+    /// Jumps to `fail` unless the part of the value at `root` that `path`
+    /// leads to, of type `ty`, matches `pat`. Declares the variables of the pattern.
+    fn pattern(&mut self, pat: &Pattern, root: Loc, path: &mut Vec<i32>, ty: Ty, fail: usize) -> R<()> {
+        match &pat.kind {
+            PatKind::Wildcard => {}
+            PatKind::Bind(name) => {
+                let loc = self.decl_loc[&(pat.span.start, VAR)];
+                if ty != Ty::Unit {
+                    self.walk(RAX, root, path);
+                    self.store_loc(loc, RAX);
+                }
+                self.declare(name, Local { ty, loc, borrowed: true });
+            }
+            PatKind::Int(n) => {
+                self.walk(RAX, root, path);
+                match i32::try_from(*n) {
+                    Ok(n) => self.a.alu_imm(7, RAX, n),
+                    Err(_) => {
+                        self.a.mov_imm64(RCX, *n);
+                        self.a.alu_rr(0x39, RAX, RCX);
+                    }
+                }
+                self.a.jcc(CC_NE, fail);
+            }
+            PatKind::Bool(b) => {
+                self.walk(RAX, root, path);
+                self.a.alu_imm(7, RAX, *b as i32);
+                self.a.jcc(CC_NE, fail);
+            }
+            PatKind::Str(text) => {
+                self.walk(RCX, root, path);
+                let constant = self.str_constant(text);
+                self.lea_label(RDX, constant);
+                self.call_rt("str_eq");
+                self.a.alu_imm(7, RAX, 1);
+                self.a.jcc(CC_NE, fail);
+            }
+            PatKind::Ctor { variant, args, .. } => {
+                let variants = self.variants(ty);
+                let Some(tag) = variants.iter().position(|(name, _)| name == variant) else {
+                    return unsupported(format!("the variant `{variant}` in a pattern"), pat.span);
+                };
+                let fields = &variants[tag].1;
+                self.walk(RAX, root, path);
+                if fields.is_empty() {
+                    self.a.alu_imm(7, RAX, tag as i32);
+                    self.a.jcc(CC_NE, fail);
+                    return Ok(());
+                }
+                if variants.iter().any(|(_, fields)| fields.is_empty()) {
+                    // A variant without fields is a small number, not a block.
+                    self.a.alu_imm(7, RAX, SMALL);
+                    self.a.jcc(CC_B, fail);
+                }
+                self.a.cmp_imm(M(RAX, 8), tag as i32);
+                self.a.jcc(CC_NE, fail);
+                for (i, arg) in args.iter().enumerate() {
+                    let Some(field_ty) = fields.get(i) else {
+                        return unsupported("this pattern", arg.span);
+                    };
+                    path.push(16 + 8 * i as i32);
+                    self.pattern(arg, root, path, *field_ty, fail)?;
+                    path.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// A method call. Which methods there are depends on the receiver.
-    fn method(&mut self, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
-        match (self.type_of(recv), name, args) {
-            (Some(Ty::List), ..) => self.list_method(recv, name, name_span, args, dst),
-            (Some(Ty::Str), "to_string", []) => self.eval(recv, dst),
-            (Some(Ty::Int), "to_string", []) => {
+    fn method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        match (self.recv_ty(recv)?, name, args) {
+            (Ty::List(_), ..) => self.list_method(e, recv, name, name_span, args, dst),
+            (ty @ Ty::Enum(_), ..) => self.enum_method(recv, ty, name, name_span, args, dst),
+            (Ty::Str, "to_string", []) => self.eval(recv, dst),
+            (Ty::Int, "to_string", []) => {
                 self.eval(recv, dst)?;
                 self.a.mov_rr(RCX, dst);
                 self.call_rt("str_from_int");
                 self.a.mov_rr(dst, RAX);
                 Ok(Ty::Str)
             }
-            (Some(Ty::Bool), "to_string", []) => {
+            (Ty::Bool, "to_string", []) => {
                 let (yes, no) = (self.str_constant("true"), self.str_constant("false"));
                 let (is_false, done) = (self.a.label(), self.a.label());
                 self.cond(recv, is_false)?;
@@ -1973,7 +2738,7 @@ impl Native<'_> {
                 self.a.bind(done);
                 Ok(Ty::Str)
             }
-            (Some(Ty::Str), ..) => {
+            (Ty::Str, ..) => {
                 let (routine, result) = match (name, args.len()) {
                     ("len", 0) => ("str_chars", Ty::Int),
                     ("is_empty", 0) => ("str_is_empty", Ty::Bool),
@@ -1991,42 +2756,160 @@ impl Native<'_> {
         }
     }
 
+    /// A method of an `Option` or a `Result`.
+    fn enum_method(&mut self, recv: &Expr, ty: Ty, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        let variants = self.variants(ty);
+        if variants.len() != 2 {
+            return unsupported(format!("the method `{name}` here"), name_span);
+        }
+        // Option: None is the number 0 and Some is variant 1. Result: Ok is variant 0, Err is 1.
+        let option = variants[0].1.is_empty();
+        let value_ty = if option { variants[1].1[0] } else { variants[0].1[0] };
+        match (name, args) {
+            ("is_some" | "is_none" | "is_ok" | "is_err", []) => {
+                let (slot, owned, _) = self.park(recv, dst)?;
+                if option {
+                    self.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+                    self.a.alu_rr(0x85, dst, dst);
+                    self.a.buf.extend_from_slice(&[0x0F, 0x95, 0xC0]); // setne al
+                } else {
+                    self.a.load(RAX, M(dst, 8));
+                }
+                self.a.alu_imm(7, RAX, matches!(name, "is_some" | "is_err") as i32);
+                self.a.buf.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                self.a.buf.extend_from_slice(&[0x0F, 0xB6, 0xC0]); // movzx eax, al
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.a.store(slot, RAX);
+                    self.drop_value(ty);
+                    self.a.load(RAX, slot);
+                }
+                self.spill_depth -= 1;
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Bool)
+            }
+            ("unwrap_or", [default]) => {
+                let (slot, owned, _) = self.park(recv, dst)?;
+                // The default is an argument, so it is evaluated either way.
+                let held = self.pending.len();
+                if owned {
+                    self.hold(slot, ty);
+                }
+                self.eval(default, dst)?;
+                self.pending.truncate(held);
+                let (has, done) = (self.a.label(), self.a.label());
+                self.a.load(RAX, slot);
+                if option {
+                    self.a.alu_rr(0x85, RAX, RAX);
+                    self.a.jcc(CC_NZ, has);
+                } else {
+                    self.a.cmp_imm(M(RAX, 8), 0);
+                    self.a.jcc(CC_E, has);
+                }
+                self.a.jmp(done);
+                self.a.bind(has);
+                if value_ty.heap() {
+                    self.a.mov_rr(RCX, dst);
+                    self.drop_value(value_ty);
+                    self.a.load(RAX, slot);
+                }
+                if value_ty != Ty::Unit {
+                    self.a.load(dst, M(RAX, 16));
+                    self.retain(dst, value_ty);
+                }
+                self.a.bind(done);
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.release_keeping(dst, ty);
+                }
+                self.spill_depth -= 1;
+                Ok(value_ty)
+            }
+            _ => unsupported(format!("the method `{name}` here"), name_span),
+        }
+    }
+
     /// A method of a list.
-    fn list_method(&mut self, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+    fn list_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (name, args) {
             ("len", []) => {
                 if let Some(local) = self.list_var(recv) {
                     let l = self.reg(local.loc, RCX);
                     self.a.load(dst, M(l, LENGTH));
                 } else {
-                    self.owned_list(recv, dst)?;
+                    let ty = self.owned_list(recv, dst)?;
                     self.a.mov_rr(RCX, dst);
                     self.a.load(dst, M(RCX, LENGTH));
-                    self.release_keeping(dst);
+                    self.release_keeping(dst, ty);
                 }
                 Ok(Ty::Int)
             }
             ("push", [item]) => {
-                self.owned_list(recv, dst)?;
+                let ty = self.owned_list(recv, dst)?;
                 let slot = self.push_spill();
                 self.a.store(slot, dst);
-                let ty = self.eval(item, dst)?;
-                self.expect_int(ty, item.span)?;
+                let held = self.pending.len();
+                self.hold(slot, ty);
+                self.eval(item, dst)?;
+                self.pending.truncate(held);
                 self.a.mov_rr(RDX, dst);
                 self.a.load(RCX, slot);
                 self.spill_depth -= 1;
-                self.call_rt("list_push");
+                self.push_call(ty);
                 self.a.mov_rr(dst, RAX);
-                Ok(Ty::List)
+                Ok(ty)
             }
-            ("map" | "filter" | "any" | "all", [f]) => self.list_loop(recv, name, name_span, None, f, dst),
-            ("fold", [start, f]) => self.list_loop(recv, name, name_span, Some(start), f, dst),
+            ("get", [index]) => {
+                // `Some(item)` if the index is inside the list, else `None` (the number 0).
+                let result = self.expr_ty(e)?;
+                let (slot, owned, list_ty) = self.park(recv, dst)?;
+                let item = self.item_ty(list_ty);
+                let held = self.pending.len();
+                if owned {
+                    self.hold(slot, list_ty);
+                }
+                self.eval(index, dst)?;
+                self.pending.truncate(held);
+                let (none, done) = (self.a.label(), self.a.label());
+                self.a.load(RCX, slot);
+                self.a.alu_m(0x3B, dst, M(RCX, LENGTH));
+                self.a.jcc(CC_AE, none);
+                self.element(0x8B, dst, RCX, dst);
+                self.retain(dst, item);
+                let value = self.push_spill();
+                self.a.store(value, dst);
+                self.fill_block(self.size_of(result), &[(value, 16)], dst);
+                self.a.store_imm(M(dst, 8), 1);
+                self.spill_depth -= 1;
+                self.a.jmp(done);
+                self.a.bind(none);
+                self.a.mov_imm64(dst, 0);
+                self.a.bind(done);
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.release_keeping(dst, list_ty);
+                }
+                self.spill_depth -= 1;
+                Ok(result)
+            }
+            ("map" | "filter" | "any" | "all", [f]) => self.list_loop(e, recv, name, name_span, None, f, dst),
+            ("fold", [start, f]) => self.list_loop(e, recv, name, name_span, Some(start), f, dst),
             _ => unsupported(format!("the method `{name}`"), name_span),
         }
     }
 
     /// `recv.map(|x| ...)` and its relatives, as a loop with the closure's body inside.
-    fn list_loop(&mut self, recv: &Expr, name: &str, name_span: Span, start: Option<&Expr>, f: &Expr, dst: u8) -> R<Ty> {
+    #[allow(clippy::too_many_arguments)]
+    fn list_loop(
+        &mut self,
+        e: &Expr,
+        recv: &Expr,
+        name: &str,
+        name_span: Span,
+        start: Option<&Expr>,
+        f: &Expr,
+        dst: u8,
+    ) -> R<Ty> {
         let arity = 1 + start.is_some() as usize;
         let (params, body) = match &f.kind {
             ExprKind::Closure { params, body, .. } if params.len() == arity && !crate::bytecode::can_return(body) => {
@@ -2040,33 +2923,39 @@ impl Native<'_> {
         let item = self.decl_loc[&(params[arity - 1].span.start, VAR)];
         // A list held by a variable is walked where it is: the closure cannot
         // assign to that variable. Any other list is this loop's to release.
-        let (list, owned) = match self.list_var(recv) {
-            Some(local) => (local.loc, false),
+        let (list, owned, list_ty) = match self.list_var(recv) {
+            Some(local) => (local.loc, false, local.ty),
             None => {
                 let list = self.decl_loc[&(id, LIST)];
-                if self.eval_into(recv, list, true)? != Ty::List {
-                    return unsupported(format!("`{name}` on anything but a list of Ints"), recv.span);
+                let ty = self.eval_into(recv, list, true)?;
+                if !matches!(ty, Ty::List(_)) {
+                    return unsupported(format!("`{name}` on anything but a list"), recv.span);
                 }
-                (list, true)
+                (list, true, ty)
             }
         };
-        let mut scope = HashMap::from([(params[arity - 1].name.clone(), Local { ty: Ty::Int, loc: item })]);
+        // The closure's parameters are borrowed: the item from the list, and
+        // the result so far from the place this loop keeps it in.
+        let item_ty = self.item_ty(list_ty);
+        let item_local = Local { ty: item_ty, loc: item, borrowed: true };
+        let mut scope = HashMap::from([(params[arity - 1].name.clone(), item_local)]);
         let result = match (name, start) {
             ("fold", Some(start)) => {
                 let ty = self.eval_into(start, out, false)?;
-                if !matches!(ty, Ty::Int | Ty::Bool) {
-                    return unsupported("`fold` to anything but an Int or a Bool", start.span);
+                if matches!(ty, Ty::Unit | Ty::Never) {
+                    return unsupported("`fold` to no value", start.span);
                 }
-                scope.insert(params[0].name.clone(), Local { ty, loc: out });
+                scope.insert(params[0].name.clone(), Local { ty, loc: out, borrowed: true });
                 ty
             }
             ("map" | "filter", _) => {
+                let ty = if name == "map" { self.expr_ty(e)? } else { list_ty };
                 // Room for every item, so that the loop never has to grow the result.
                 let l = self.reg(list, RAX);
                 self.a.load(RCX, M(l, LENGTH));
                 self.call_rt("list_new");
                 self.store_loc(out, RAX);
-                Ty::List
+                ty
             }
             _ => {
                 self.set_loc(out, (name == "all") as i32);
@@ -2082,13 +2971,18 @@ impl Native<'_> {
             "map" | "fold" => {
                 let t = self.take_temp(body.span)?;
                 let ty = self.eval(body, t)?;
-                if ty != (if name == "map" { Ty::Int } else { result }) {
+                if ty != (if name == "map" { self.item_ty(result) } else { result }) {
                     return unsupported("this closure", body.span);
                 }
                 if name == "map" {
                     let o = self.reg(out, RCX);
                     let p = self.reg(pos, RAX);
                     self.element(0x89, t, o, p);
+                } else if result.heap() {
+                    // The new result replaces the one so far, which is given up.
+                    self.load_loc(RCX, out);
+                    self.store_loc(out, t);
+                    self.drop_value(result);
                 } else {
                     self.store_loc(out, t);
                 }
@@ -2100,6 +2994,8 @@ impl Native<'_> {
                 let o = self.reg(out, RCX);
                 self.a.load(RAX, M(o, LENGTH));
                 let x = self.reg(item, RDX);
+                // The result holds the item too.
+                self.retain(x, item_ty);
                 self.element(0x89, x, o, RAX);
                 self.a.inc_mem(M(o, LENGTH));
             }
@@ -2132,7 +3028,7 @@ impl Native<'_> {
         }
         if owned {
             self.load_loc(RCX, list);
-            self.call_rt("list_release");
+            self.drop_value(list_ty);
         }
         self.free = outer;
         self.load_loc(dst, out);

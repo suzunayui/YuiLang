@@ -322,6 +322,8 @@ fn real_main() -> i32 {
     // `run` keeps stdout for the program's own output.
     let json_to_stdout = opts.cmd != "run";
     let root = opts.root.as_deref().map(Path::new);
+    // The native compiler works from the types of all expressions.
+    yuilang::checker::RECORD_EXPR_TYPES.store(opts.native, std::sync::atomic::Ordering::Relaxed);
     let loaded = match yuilang::load_path(Path::new(&opts.file), root) {
         Ok(l) => l,
         Err((diags, sources)) => {

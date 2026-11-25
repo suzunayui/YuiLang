@@ -1,0 +1,283 @@
+// 構造体、列挙、Option / Result、match、?、任意の要素のリスト
+
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+struct Item {
+  name: String,
+  price: Int,
+  tags: List<String>,
+}
+
+struct Pair<A, B> {
+  first: A,
+  second: B,
+}
+
+struct Line {
+  from: Point,
+  to: Point,
+}
+
+enum Color {
+  Red,
+  Green,
+  Blue,
+}
+
+enum Shape {
+  Circle(Int),
+  Rect(Int, Int),
+  Named(String, Point),
+  Empty,
+}
+
+enum Tree {
+  Leaf,
+  Node(Tree, Int, Tree),
+}
+
+fn area(s: Shape) -> Int {
+  match s {
+    Shape.Circle(r) => r * r * 3
+    Shape.Rect(w, h) => w * h
+    Shape.Named(_, p) => p.x * p.y
+    Shape.Empty => 0
+  }
+}
+
+fn label(s: Shape) -> String {
+  match s {
+    Shape.Named(name, _) => name
+    Shape.Circle(0) => "dot"
+    Shape.Circle(_) => "circle"
+    Shape.Rect(w, h) => if w == h { "square" } else { "rect {w}x{h}" }
+    Shape.Empty => "nothing"
+  }
+}
+
+fn color_name(c: Color) -> String {
+  match c {
+    Color.Red => "red"
+    Color.Green => "green"
+    Color.Blue => "blue"
+  }
+}
+
+fn insert(t: Tree, v: Int) -> Tree {
+  match t {
+    Tree.Leaf => Tree.Node(Tree.Leaf, v, Tree.Leaf)
+    Tree.Node(l, x, r) => if v < x { Tree.Node(insert(l, v), x, r) } else { Tree.Node(l, x, insert(r, v)) }
+  }
+}
+
+fn total(t: Tree) -> Int {
+  match t {
+    Tree.Leaf => 0
+    Tree.Node(l, x, r) => total(l) + x + total(r)
+  }
+}
+
+fn depth(t: Tree) -> Int {
+  match t {
+    Tree.Leaf => 0
+    Tree.Node(l, _, r) => {
+      let a = depth(l)
+      let b = depth(r)
+      if a > b { a + 1 } else { b + 1 }
+    }
+  }
+}
+
+fn divide(a: Int, b: Int) -> Result<Int, String> {
+  if b == 0 {
+    return Err("division by zero: {a} / {b}")
+  }
+  Ok(a / b)
+}
+
+fn half_twice(n: Int) -> Result<Int, String> {
+  let once = divide(n, 2)?
+  let twice = divide(once, 2)?
+  Ok(twice + divide(100, n)?)
+}
+
+// 値を組み立てている途中で ? が関数を抜ける
+fn build(n: Int, word: String) -> Result<Pair<String, List<Int>>, String> {
+  Ok(Pair { first: "{word}-{n}", second: [n, divide(10, n)?, n] })
+}
+
+fn describe(n: Int, word: String) -> Result<String, String> {
+  let made = build(n, word)?
+  Ok(join("<{made.first}>", "{made.second[1]}{divide(n, n - 5)?}"))
+}
+
+fn first_bad(xs: List<Int>) -> Result<Int, String> {
+  let mut sum = 0
+  for x in xs {
+    let text = "at {x}"
+    if x > 100 {
+      break
+    }
+    sum = sum + join(text, "{divide(sum + 1, x)?}").len()
+  }
+  Ok(sum)
+}
+
+fn find(xs: List<Int>, wanted: Int) -> Option<Int> {
+  let mut i = 0
+  for x in xs {
+    if x == wanted {
+      return Some(i)
+    }
+    i = i + 1
+  }
+  None
+}
+
+fn second_after(xs: List<Int>, wanted: Int) -> Option<Int> {
+  let at = find(xs, wanted)?
+  let next = xs.get(at + 1)?
+  Some(next * 10)
+}
+
+fn show(r: Result<Int, String>) -> String {
+  match r {
+    Ok(v) => "ok {v}"
+    Err(e) => "error: {e}"
+  }
+}
+
+fn show_text(r: Result<String, String>) -> String {
+  match r {
+    Ok(v) => "ok {v}"
+    Err(e) => "error: {e}"
+  }
+}
+
+fn show_option(o: Option<Int>) -> String {
+  match o {
+    Some(0) => "zero"
+    Some(v) => "some {v}"
+    None => "none"
+  }
+}
+
+fn cheapest(items: List<Item>) -> Option<Item> {
+  let mut best: Option<Item> = None
+  for item in items {
+    best = match best {
+      None => Some(item)
+      Some(b) => if item.price < b.price { Some(item) } else { Some(b) }
+    }
+  }
+  best
+}
+
+fn kind(n: Int, word: String) -> String {
+  let size = match n {
+    0 => "none"
+    1 => "one"
+    _ => "many"
+  }
+  let what = match word {
+    "apple" => "fruit"
+    "pen" => "tool"
+    _ => "thing"
+  }
+  "{size} {what}"
+}
+
+fn join(a: String, b: String) -> String {
+  "{a}[{b}]"
+}
+
+fn main() uses io {
+  let p = Point { x: 3, y: 4 }
+  let q = Point { y: 10, x: p.x + 1 }
+  print("{p.x} {p.y} {q.x} {q.y} {p.x * q.y}")
+  let line = Line { from: p, to: Point { x: 7, y: 8 } }
+  print("{line.from.x} {line.to.y} {line.to.x - line.from.x}")
+  let pair = Pair { first: 1, second: "one" }
+  let nested = Pair { first: pair, second: [1, 2, 3] }
+  print("{pair.first} {pair.second} {nested.first.second} {nested.second.len()} {nested.second[2]}")
+
+  let named = Shape.Named("p", p)
+  print("{area(Shape.Circle(2))} {area(Shape.Rect(3, 4))} {area(named)} {area(Shape.Empty)} {label(named)}")
+  let shapes = [Shape.Circle(0), Shape.Circle(5), Shape.Rect(2, 2), Shape.Rect(2, 3), Shape.Named("origin", q), Shape.Empty]
+  for s in shapes {
+    print("{label(s)}: {area(s)}")
+  }
+  print("{shapes.map(|s| area(s)).fold(0, |acc, a| acc + a)} {shapes.filter(|s| area(s) > 3).len()}")
+  print("{color_name(Color.Red)} {color_name(Color.Green)} {color_name(Color.Blue)}")
+  let colors = [Color.Blue, Color.Red]
+  print(colors.fold("", |acc, c| "{acc}{color_name(c)};"))
+
+  let mut tree = Tree.Leaf
+  for v in [5, 2, 8, 1, 9, 3, 7] {
+    tree = insert(tree, v)
+  }
+  let before = tree
+  tree = insert(tree, 100)
+  print("{total(tree)} {depth(tree)} {total(before)} {depth(before)}")
+
+  print(show(divide(7, 2)))
+  print(show(divide(7, 0)))
+  print(show(half_twice(20)))
+  print(show(half_twice(0)))
+  print("{divide(9, 3).unwrap_or(-1)} {divide(9, 0).unwrap_or(-1)} {divide(1, 1).is_ok()} {divide(1, 0).is_ok()} {divide(1, 0).is_err()}")
+
+  let xs = [4, 8, 15, 16, 23, 42]
+  print("{show_option(find(xs, 15))} {show_option(find(xs, 4))} {show_option(find(xs, 5))}")
+  print("{show_option(second_after(xs, 16))} {show_option(second_after(xs, 42))} {show_option(second_after(xs, 0))}")
+  print("{show_option(xs.get(0))} {show_option(xs.get(5))} {show_option(xs.get(6))} {show_option(xs.get(-1))}")
+  let found = find(xs, 23)
+  print("{found.is_some()} {found.is_none()} {found.unwrap_or(-1)} {find(xs, 1).unwrap_or(-1)} {find(xs, 1).is_none()}")
+
+  let items = [
+    Item { name: "pen", price: 120, tags: ["office", "small"] },
+    Item { name: "desk", price: 9800, tags: ["office"] },
+    Item { name: "gum", price: 100, tags: [] },
+  ]
+  print("{items.fold(0, |acc, item| acc + item.price)} {items.map(|item| item.tags.len()).fold(0, |acc, n| acc + n)}")
+  let names = items.map(|item| item.name)
+  let empty = ""
+  print("{names.len()} {names[0]} {names[2]} {names.fold(empty, |acc, n| join(acc, n))}")
+  let cheap = items.filter(|item| item.price < 1000)
+  print("{cheap.len()} {cheap[1].name} {cheap[0].tags[1]} {items[1].tags[0]}")
+  match cheapest(items) {
+    Some(item) => print("cheapest: {item.name} at {item.price}")
+    None => print("no items")
+  }
+  let nothing: List<Item> = []
+  print("{cheapest(nothing).is_none()} {items.any(|item| item.tags.len() == 0)} {items.all(|item| item.price > 100)}")
+
+  // リストのリスト、共有されたリストへの追加
+  let mut rows: List<List<Int>> = []
+  for i in 0..4 {
+    rows = rows.push([i, i * i])
+  }
+  let saved = rows
+  rows = rows.push([9, 9, 9])
+  print("{rows.len()} {saved.len()} {rows[3][1]} {rows[4].len()} {saved[2][1]}")
+  let mut words = ["a"]
+  let shared = words
+  words = words.push("b")
+  let more = shared.push("c")
+  print("{words.len()} {shared.len()} {more.len()} {words[1]} {more[1]} {shared[0]}")
+
+  let apple = "apple"
+  print("{kind(0, apple)} / {kind(1, names[0])} / {kind(7, kind(1, apple))}")
+  let options = [Some(3), None, Some(0)]
+  print(options.fold("", |acc, o| "{acc}{show_option(o)},"))
+  let results = [divide(4, 2), divide(1, 0)]
+  for r in results {
+    print(show(r))
+  }
+  let _ = insert(before, 0)
+  let word = "w"
+  print("{show_text(describe(2, word))} / {show_text(describe(0, word))} / {show_text(describe(5, word))}")
+  print("{show(first_bad([1, 2, 3]))} / {show(first_bad([4, 0, 3]))} / {show(first_bad([7, 500, 0]))}")
+}

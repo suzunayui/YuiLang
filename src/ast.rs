@@ -32,6 +32,10 @@ pub struct TypeInfo {
     /// The type of every declared variable, written as in source (`List<Int>`),
     /// by the start of the span it is declared at.
     pub var_types: std::collections::HashMap<usize, String>,
+    /// Only when asked for (`checker::RECORD_EXPR_TYPES`): the type of every
+    /// expression that is not a plain literal or variable, written as in
+    /// source, by span.
+    pub expr_types: std::collections::HashMap<(usize, usize), String>,
     /// For each field access `a.b`, by span: the position of the field in its struct.
     pub field_index: std::collections::HashMap<(usize, usize), u32>,
 }

@@ -86,11 +86,20 @@ struct Checker {
     diags: Vec<Diagnostic>,
     /// Type of every declared variable, by the start of its declaration span.
     decl_types: Vec<(usize, Type)>,
+    /// With `record_exprs`: the type of every expression that is not a plain
+    /// literal or variable, by span.
+    record_exprs: bool,
+    expr_types: Vec<((usize, usize), Type)>,
     /// Operand type of every arithmetic and comparison expression, by span.
     op_types: Vec<((usize, usize), Type)>,
     /// Position of the field read by every field access, by span.
     field_uses: Vec<((usize, usize), u32)>,
 }
+
+/// Set to make `check` also report the type of every expression
+/// (`TypeInfo::expr_types`). The native compiler needs this; running a
+/// program does not, and should not pay for it.
+pub static RECORD_EXPR_TYPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Checks the program. The second result tells the code generator which
 /// variables and operations are known to work on `Int`.
@@ -110,6 +119,8 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
         loop_depth: 0,
         diags: Vec::new(),
         decl_types: Vec::new(),
+        record_exprs: RECORD_EXPR_TYPES.load(std::sync::atomic::Ordering::Relaxed),
+        expr_types: Vec::new(),
         op_types: Vec::new(),
         field_uses: Vec::new(),
     };
@@ -143,6 +154,9 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
         if sig.ret == Type::Int {
             info.int_fns.insert(name.clone());
         }
+    }
+    for (at, ty) in &c.expr_types {
+        info.expr_types.insert(*at, c.show(ty));
     }
     info.field_index = c.field_uses.iter().copied().collect();
     (c.diags, info)
@@ -978,6 +992,14 @@ impl Checker {
 
     /// `want` is false when the value of the expression is discarded.
     fn expr(&mut self, e: &Expr, want: bool) -> Type {
+        let ty = self.expr_kind(e, want);
+        if self.record_exprs && !matches!(e.kind, ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_)) {
+            self.expr_types.push(((e.span.start, e.span.end), ty.clone()));
+        }
+        ty
+    }
+
+    fn expr_kind(&mut self, e: &Expr, want: bool) -> Type {
         match &e.kind {
             ExprKind::Int(_) => Type::Int,
             ExprKind::Float(_) => Type::Float,
