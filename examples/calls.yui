@@ -113,3 +113,62 @@ fn main() uses io {
   print("ackermann(2, 3) = {ackermann(2, 3)}")
   print("{pair(sum_to(10), label_length(7))}")
 }
+
+// ループの途中から整数を返す
+fn find_first(xs: List<Int>, limit: Int) -> Int {
+  for x in xs {
+    if x > limit { return x }
+  }
+  0 - 1
+}
+
+// 文字列の引数を持ち、整数を返す
+fn length_plus(s: String, n: Int) -> Int {
+  s.len() + n
+}
+
+fn seventeen_locals(x: Int) -> Int {
+  let a = x + 1
+  let b = a + 1
+  let c = b + 1
+  let d = c + 1
+  let e = d + 1
+  let f = e + 1
+  let g = f + 1
+  let h = g + 1
+  let i = h + 1
+  let j = i + 1
+  let k = j + 1
+  let l = k + 1
+  let m = l + 1
+  let n = m + 1
+  let o = n + 1
+  let p = o + 1
+  let q = p + 1
+  a + q
+}
+
+fn first_or(xs: List<Int>, default: Int) -> Int {
+  let found = xs.first()
+  match found {
+    Some(x) => x
+    None => default
+  }
+}
+
+test "integer results" {
+  assert find_first([1, 5, 9], 4) == 5
+  assert find_first([1, 2], 4) == 0 - 1
+  assert length_plus("abc", 4) == 7
+  assert seventeen_locals(0) == 18
+  assert first_or([7, 8], 0) == 7
+  assert first_or([], 3) == 3
+  let _ = fib(5)
+  let mut total = 0
+  for i in 0..5 {
+    total = total + length_plus("ab", i) + find_first([i, 10], 3)
+  }
+  assert total == 64
+  assert [1, 2, 3].map(seventeen_locals) == [20, 22, 24]
+  assert [4, 5].map(|x| find_first([x, 9], 4)) == [9, 5]
+}

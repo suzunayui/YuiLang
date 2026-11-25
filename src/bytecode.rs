@@ -154,6 +154,8 @@ pub struct Func {
     /// Free value-stack cells the function needs before it may be entered.
     /// Set together with `native`.
     pub need: Cell<usize>,
+    /// The function is declared to return `Int`.
+    pub int_ret: bool,
     /// For each local slot: it only ever holds an `Int`.
     pub int_slots: Vec<bool>,
     /// For each op: it is an `Arith` or `Cmp` whose operands are `Int`.
@@ -172,6 +174,7 @@ pub struct Globals {
 pub fn compile_fn(g: &mut Globals, f: &FnDecl) -> Func {
     let mut c = Compiler::new(g, &f.name);
     c.func.unit_ret = f.ret.is_none();
+    c.func.int_ret = c.g.types.int_fns.contains(&f.name);
     c.push_scope();
     for p in &f.params {
         let slot = c.alloc_var(p.span);

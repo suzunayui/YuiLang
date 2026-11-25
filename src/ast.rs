@@ -27,6 +27,8 @@ pub struct TypeInfo {
     pub int_vars: std::collections::HashSet<usize>,
     /// Binary operations whose operands are `Int`, by span.
     pub int_ops: std::collections::HashSet<(usize, usize)>,
+    /// Functions that return `Int`, by name.
+    pub int_fns: std::collections::HashSet<String>,
 }
 
 pub struct Import {

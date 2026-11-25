@@ -1655,6 +1655,7 @@ mod native {
                     func: Rc::as_ptr(f) as usize,
                     native: f.native.as_ptr() as usize,
                     nlocals: f.nlocals,
+                    int_ret: f.int_ret,
                     // The same margin `push_frame` asks for.
                     need: f.nlocals + f.code.len() + 64,
                 })

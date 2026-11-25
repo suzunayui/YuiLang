@@ -71,6 +71,8 @@ pub struct Callee {
     /// until it has been compiled).
     pub native: usize,
     pub nlocals: usize,
+    /// The function returns `Int`, and so also leaves its result in rdx.
+    pub int_ret: bool,
     /// Free value-stack cells the function needs before it may be entered.
     pub need: usize,
 }
@@ -870,7 +872,6 @@ impl Gen<'_> {
         a.bind(filled);
 
         a.store(M(R14, FRAME_FUNC), RSI);
-        a.store_imm(M(R14, FRAME_PC), 0);
         a.store_value(M(R14, FRAME_SPAN), span.start, RDX);
         a.store_value(M(R14, FRAME_SPAN + 8), span.end, RDX);
         a.alu_imm(0, R14, FRAME_SIZE);
@@ -898,6 +899,9 @@ impl Gen<'_> {
         a.mov_rr(RDI, RBX);
         a.call(self.helpers.ret);
         a.reload_all();
+        if self.func.int_ret {
+            a.load(RDX, top(1).at(8));
+        }
         a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
         a.jmp(self.exit);
     }
@@ -948,7 +952,6 @@ impl Gen<'_> {
             a.alu_imm(0, R13, extra * V);
         }
         a.store_value(M(R14, FRAME_FUNC), callee.func, RDX);
-        a.store_imm(M(R14, FRAME_PC), 0);
         a.store_value(M(R14, FRAME_SPAN), span.start, RDX);
         a.store_value(M(R14, FRAME_SPAN + 8), span.end, RDX);
         a.alu_imm(0, R14, FRAME_SIZE);
@@ -983,12 +986,15 @@ impl Gen<'_> {
             a.cmp_byte(slot(s), FIRST_HEAP_TAG);
             a.jcc(CC_AE, slow);
         }
+        // The result goes to the stack and, for callers that know it is an
+        // `Int`, to rdx.
         a.store_imm(slot(0), TAG_INT as i32);
         match item {
-            VItem::Reg(r) => a.store(slot(0).at(8), r),
-            VItem::Imm(n) => a.store_value(slot(0).at(8), n as usize, RAX),
+            VItem::Reg(r) => a.mov_rr(RDX, r),
+            VItem::Imm(n) => a.mov_imm64(RDX, n),
             VItem::Cond(_) => {}
         }
+        a.store(slot(0).at(8), RDX);
         a.lea(R13, slot(1));
         a.alu_imm(5, R14, FRAME_SIZE);
         a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
@@ -1029,6 +1035,9 @@ impl Gen<'_> {
                 a.load(RAX, top(1).at(offset));
                 a.store(slot(0).at(offset), RAX);
             }
+        }
+        if self.func.int_ret {
+            a.load(RDX, slot(0).at(8));
         }
         // The result replaces the locals, and the frame is gone.
         a.lea(R13, slot(1));
@@ -1275,9 +1284,22 @@ impl Gen<'_> {
                 self.a.jcc(condition(op) ^ 1, target);
             }
             Op::Jump(target) => {
+                // A jump to a return is a return: no need to pass the value through memory.
+                if matches!(self.func.code[target as usize], Op::Return) && self.try_ret_value() {
+                    return true;
+                }
                 let target = self.ops[target as usize];
                 self.flush();
                 self.a.jmp(target);
+            }
+            Op::Call(index, argc) if (self.callee)(index).is_some_and(|c| c.int_ret) => {
+                // The callee leaves its `Int` result on the stack and in rdx.
+                self.flush();
+                self.call(index, argc, pc);
+                self.a.alu_imm(5, R13, V);
+                let t = self.tmp();
+                self.a.mov_rr(t, RDX);
+                self.vstack.push(VItem::Reg(t));
             }
             Op::ForRange(s, target) => {
                 let target = self.ops[target as usize];
@@ -1308,22 +1330,30 @@ impl Gen<'_> {
         true
     }
 
+    /// If the virtual stack holds exactly one `Int`, returns it from the
+    /// function and reports true.
+    fn try_ret_value(&mut self) -> bool {
+        let [item @ (VItem::Reg(_) | VItem::Imm(_))] = self.vstack.as_slice() else { return false };
+        if self.func.unit_ret || self.func.nlocals > MAX_INLINE_LOCALS {
+            return false;
+        }
+        let item = *item;
+        self.ret_value(item);
+        self.vstack.clear();
+        if let VItem::Reg(r) = item {
+            self.free.push(r);
+        }
+        true
+    }
+
     /// Generates code for one op.
     fn step(&mut self, pc: u32, op: Op) {
         // A pending condition is only usable by the jump that tests it.
         if matches!(self.vstack.last(), Some(VItem::Cond(_))) && !matches!(op, Op::JumpIfFalse(_)) {
             self.flush();
         }
-        if let (Op::Return, [item @ (VItem::Reg(_) | VItem::Imm(_))]) = (op, self.vstack.as_slice()) {
-            if !self.func.unit_ret && self.func.nlocals <= MAX_INLINE_LOCALS {
-                let item = *item;
-                self.ret_value(item);
-                self.vstack.clear();
-                if let VItem::Reg(r) = item {
-                    self.free.push(r);
-                }
-                return;
-            }
+        if matches!(op, Op::Return) && self.try_ret_value() {
+            return;
         }
         if !self.typed(pc, op) {
             self.flush();
@@ -1705,7 +1735,7 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
 
     for (pc, op) in func.code.iter().enumerate() {
         // Every way of reaching a jump target must agree on what is in memory.
-        if is_target[pc] {
+        if is_target[pc] && !(matches!(op, Op::Return) && g.try_ret_value()) {
             g.flush();
         }
         g.a.bind(g.ops[pc]);
@@ -1732,6 +1762,9 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
     g.a.jcc(CC_NE, exit);
     // The interpreter finished the call: take over the stack tops it left.
     g.a.reload_all();
+    if func.int_ret {
+        g.a.load(RDX, top(1).at(8));
+    }
     g.a.jmp(exit);
 
     for stub in std::mem::take(&mut g.stubs) {

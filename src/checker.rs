@@ -135,6 +135,11 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
             info.int_ops.insert(*at);
         }
     }
+    for (name, sig) in &c.fns {
+        if sig.ret == Type::Int {
+            info.int_fns.insert(name.clone());
+        }
+    }
     (c.diags, info)
 }
 
