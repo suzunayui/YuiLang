@@ -1,10 +1,11 @@
 //! x86-64 code generator: turns a function's bytecode into machine code.
 //!
-//! Integer arithmetic, comparisons, branches, counting loops and calls are
-//! emitted as native instructions that work directly on the value stack.
-//! Every fast path first checks that its operands are the plain values it
-//! expects; when they are not, and for every other op, the code calls back into
-//! the interpreter to run that single op. The two therefore always agree.
+//! Integer arithmetic, comparisons, branches, counting loops, calls and
+//! returns are emitted as native instructions that work directly on the value
+//! stack and the frame stack. Every fast path first checks that its operands
+//! are the plain values it expects; when they are not, and for every other
+//! op, the code calls back into the interpreter to run that single op. The
+//! two therefore always agree.
 //!
 //! Register use inside generated code:
 //!   rbx  the machine's `Stack` (see `interp`)
@@ -25,8 +26,34 @@ pub const TAG_BOOL: u8 = 2;
 pub const TAG_UNIT: u8 = 3;
 /// Values with this discriminant or above own heap memory.
 pub const FIRST_HEAP_TAG: u8 = 4;
-/// Offset of the top-of-stack pointer inside `Stack`.
+/// Offsets inside `Stack`: the top and end of the value stack, and the top
+/// and limit of the frame stack.
 pub const STACK_TOP_OFFSET: i32 = 8;
+pub const STACK_END_OFFSET: i32 = 16;
+pub const FRAMES_TOP_OFFSET: i32 = 40;
+pub const FRAMES_LIMIT_OFFSET: i32 = 48;
+/// Size of a `Frame` and the offsets of its fields.
+pub const FRAME_SIZE: i32 = 40;
+pub const FRAME_FUNC: i32 = 0;
+pub const FRAME_PC: i32 = 8;
+pub const FRAME_BASE: i32 = 16;
+pub const FRAME_SPAN: i32 = 24;
+
+/// A call or a return is generated inline only for functions with at most
+/// this many local slots to set up or check.
+const MAX_INLINE_LOCALS: usize = 8;
+
+/// What the generated code needs to know about a function it calls.
+pub struct Callee {
+    /// Address of the `Func`.
+    pub func: usize,
+    /// Address of the cell holding the function's machine code address (0
+    /// until it has been compiled).
+    pub native: usize,
+    pub nlocals: usize,
+    /// Free value-stack cells the function needs before it may be entered.
+    pub need: usize,
+}
 
 /// What a helper tells the generated code to do next.
 pub const NEXT: u32 = 0;
@@ -255,10 +282,26 @@ impl Asm {
 
     /// `cmp qword [m], imm32`
     fn cmp_imm(&mut self, m: M, imm: i32) {
-        self.rex_m(true, 7, m);
+        self.alu_mem_imm(7, m, imm);
+    }
+
+    /// `add` (0), `sub` (5) or `cmp` (7) `qword [m], imm32`.
+    fn alu_mem_imm(&mut self, ext: u8, m: M, imm: i32) {
+        self.rex_m(true, ext, m);
         self.b(0x81);
-        self.modrm_m(7, m);
+        self.modrm_m(ext, m);
         self.d32(imm);
+    }
+
+    /// `mov qword [m], value`, using `scratch` when the value needs 64 bits.
+    fn store_value(&mut self, m: M, value: usize, scratch: u8) {
+        match i32::try_from(value) {
+            Ok(v) => self.store_imm(m, v),
+            Err(_) => {
+                self.mov_imm64(scratch, value as i64);
+                self.store(m, scratch);
+            }
+        }
     }
 
     /// `setcc byte [m]`
@@ -322,17 +365,25 @@ impl Asm {
     }
 }
 
-/// Out-of-line code that runs one op in the interpreter when a fast path cannot.
+/// Out-of-line code that asks the interpreter to do what a fast path cannot.
 struct Stub {
     entry: usize,
     resume: usize,
-    pc: u32,
-    target: Option<usize>,
+    kind: StubKind,
+}
+
+enum StubKind {
+    /// Run the op at `pc`.
+    Op { pc: u32, target: Option<usize> },
+    Call { index: u32, argc: u32, pc: u32 },
+    Return,
 }
 
 struct Gen<'a> {
     a: Asm,
     helpers: &'a Helpers,
+    func: &'a Func,
+    callee: &'a dyn Fn(u32) -> Option<Callee>,
     /// One label per op, plus one for the end of the code.
     ops: Vec<usize>,
     stubs: Vec<Stub>,
@@ -365,10 +416,131 @@ impl Gen<'_> {
     /// Reserves a stub for the op at `pc` and returns the label of its entry.
     /// The fast path must be followed by `resume`.
     fn stub(&mut self, pc: u32, target: Option<usize>) -> (usize, usize) {
+        self.stub_of(StubKind::Op { pc, target })
+    }
+
+    fn stub_of(&mut self, kind: StubKind) -> (usize, usize) {
         let entry = self.a.label();
         let resume = self.a.label();
-        self.stubs.push(Stub { entry, resume, pc, target });
+        self.stubs.push(Stub { entry, resume, kind });
         (entry, resume)
+    }
+
+    /// Asks the interpreter to start a call, then enters the callee.
+    fn call_helper(&mut self, index: u32, argc: u32, pc: u32) {
+        let a = &mut self.a;
+        a.sync();
+        a.mov_rr(RDI, RBX);
+        a.mov_imm32(RSI, index);
+        a.mov_imm32(RDX, argc);
+        a.mov_imm32(RCX, pc);
+        a.call(self.helpers.call);
+        self.enter_callee();
+    }
+
+    /// Asks the interpreter to finish the current call, then leaves.
+    fn return_helper(&mut self) {
+        let a = &mut self.a;
+        a.sync();
+        a.mov_rr(RDI, RBX);
+        a.call(self.helpers.ret);
+        a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+        a.jmp(self.exit);
+    }
+
+    /// A call to a known function, without leaving machine code when the
+    /// callee is already compiled and both stacks have room.
+    fn call(&mut self, index: u32, argc: u32, pc: u32) {
+        let callee = (self.callee)(index).filter(|c| {
+            c.nlocals >= argc as usize
+                && c.nlocals - argc as usize <= MAX_INLINE_LOCALS
+                && c.need <= (i32::MAX / V) as usize
+        });
+        let Some(callee) = callee else {
+            self.call_helper(index, argc, pc);
+            return;
+        };
+        let span = self.func.spans[pc as usize];
+        let extra = (callee.nlocals - argc as usize) as i32;
+        let (slow, resume) = self.stub_of(StubKind::Call { index, argc, pc });
+        let fail = self.fail;
+        let a = &mut self.a;
+
+        // rax = the callee's machine code, if it has been compiled.
+        a.mov_imm64(RAX, callee.native as i64);
+        a.load(RAX, M(RAX, 0));
+        a.buf.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
+        a.jcc(CC_E, slow);
+        // rcx = the new frame; the interpreter reports running out of room.
+        a.load(RCX, M(RBX, FRAMES_TOP_OFFSET));
+        a.alu_m(0x3B, RCX, M(RBX, FRAMES_LIMIT_OFFSET));
+        a.jcc(CC_AE, slow);
+        a.lea(RDX, top(0).at(callee.need as i32 * V));
+        a.alu_m(0x3B, RDX, M(RBX, STACK_END_OFFSET));
+        a.jcc(CC_A, slow);
+
+        // The arguments are the first locals; the rest start out as `()`.
+        a.lea(RDX, top(argc as i32));
+        a.store(M(RCX, FRAME_BASE), RDX);
+        for i in 0..extra {
+            a.store_imm(top(0).at(i * V), TAG_UNIT as i32);
+        }
+        if extra > 0 {
+            a.alu_imm(0, R13, extra * V);
+        }
+        a.store_value(M(RCX, FRAME_FUNC), callee.func, RDX);
+        a.store_imm(M(RCX, FRAME_PC), 0);
+        a.store_value(M(RCX, FRAME_SPAN), span.start, RDX);
+        a.store_value(M(RCX, FRAME_SPAN + 8), span.end, RDX);
+        a.alu_imm(0, RCX, FRAME_SIZE);
+        a.store(M(RBX, FRAMES_TOP_OFFSET), RCX);
+
+        a.sync();
+        a.mov_rr(RDI, RBX);
+        a.buf.extend_from_slice(&[0xFF, 0xD0]); // call rax
+        a.buf.extend_from_slice(&[0x85, 0xC0]); // test eax, eax
+        a.jcc(CC_NE, fail);
+        a.reload();
+        a.bind(resume);
+    }
+
+    /// A return, without leaving machine code when no local needs dropping.
+    fn ret(&mut self) {
+        let nlocals = self.func.nlocals;
+        if nlocals > MAX_INLINE_LOCALS {
+            self.return_helper();
+            return;
+        }
+        let (slow, _) = self.stub_of(StubKind::Return);
+        let exit = self.exit;
+        let unit_ret = self.func.unit_ret;
+        let a = &mut self.a;
+
+        // The stack must hold exactly the locals and the result.
+        a.lea(RAX, slot(nlocals as u32 + 1));
+        a.buf.extend_from_slice(&[0x4C, 0x39, 0xE8]); // cmp rax, r13
+        a.jcc(CC_NE, slow);
+        for i in 0..nlocals as u32 {
+            a.cmp_byte(slot(i), FIRST_HEAP_TAG);
+            a.jcc(CC_AE, slow);
+        }
+        if unit_ret {
+            // The result is discarded, so it must not need dropping either.
+            a.cmp_byte(top(1), FIRST_HEAP_TAG);
+            a.jcc(CC_AE, slow);
+            a.store_imm(slot(0), TAG_UNIT as i32);
+        } else if nlocals > 0 {
+            for offset in [0, 8, 16] {
+                a.load(RAX, top(1).at(offset));
+                a.store(slot(0).at(offset), RAX);
+            }
+        }
+        // The result replaces the locals, and the frame is gone.
+        a.lea(R13, slot(1));
+        a.sync();
+        a.alu_mem_imm(5, M(RBX, FRAMES_TOP_OFFSET), FRAME_SIZE);
+        a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+        a.jmp(exit);
     }
 
     /// Jumps to `slow` unless the value at `m` is an Int.
@@ -604,15 +776,7 @@ impl Gen<'_> {
                 a.jcc(CC_L, target);
                 a.bind(resume);
             }
-            Op::Call(index, argc) => {
-                a.sync();
-                a.mov_rr(RDI, RBX);
-                a.mov_imm32(RSI, index);
-                a.mov_imm32(RDX, argc);
-                a.mov_imm32(RCX, pc);
-                a.call(self.helpers.call);
-                self.enter_callee();
-            }
+            Op::Call(index, argc) => self.call(index, argc, pc),
             Op::CallValue(argc) => {
                 a.sync();
                 a.mov_rr(RDI, RBX);
@@ -621,13 +785,7 @@ impl Gen<'_> {
                 a.call(self.helpers.call_value);
                 self.enter_callee();
             }
-            Op::Return => {
-                a.sync();
-                a.mov_rr(RDI, RBX);
-                a.call(self.helpers.ret);
-                a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
-                a.jmp(self.exit);
-            }
+            Op::Return => self.ret(),
             Op::AndJump(target) | Op::OrJump(target) | Op::ForList(_, target) => {
                 let target = self.ops[target as usize];
                 self.run_op(pc, Some(target));
@@ -642,11 +800,12 @@ impl Gen<'_> {
 }
 
 /// Compiles a function. The result is position independent.
-pub fn compile(func: &Func, helpers: &Helpers) -> Vec<u8> {
+/// `callee` describes the function with a given index, for calls to it.
+pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Callee>) -> Vec<u8> {
     let mut a = Asm::default();
     let ops = (0..=func.code.len()).map(|_| a.label()).collect();
     let (exit, fail, status) = (a.label(), a.label(), a.label());
-    let mut g = Gen { a, helpers, ops, stubs: Vec::new(), exit, fail, status };
+    let mut g = Gen { a, helpers, func, callee, ops, stubs: Vec::new(), exit, fail, status };
 
     // Three pushes leave the native stack aligned for calls.
     g.a.push(RBX);
@@ -678,8 +837,17 @@ pub fn compile(func: &Func, helpers: &Helpers) -> Vec<u8> {
 
     for stub in std::mem::take(&mut g.stubs) {
         g.a.bind(stub.entry);
-        g.run_op(stub.pc, stub.target);
-        g.a.jmp(stub.resume);
+        match stub.kind {
+            StubKind::Op { pc, target } => {
+                g.run_op(pc, target);
+                g.a.jmp(stub.resume);
+            }
+            StubKind::Call { index, argc, pc } => {
+                g.call_helper(index, argc, pc);
+                g.a.jmp(stub.resume);
+            }
+            StubKind::Return => g.return_helper(),
+        }
     }
     g.a.finish()
 }

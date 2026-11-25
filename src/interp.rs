@@ -423,10 +423,19 @@ pub struct Stack {
     /// The interpreter that owns this stack, for helpers called by generated code.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     owner: *mut u8,
+    /// The calls in progress: a second fixed block, so that generated code
+    /// can start and finish a call without leaving machine code.
+    frames_base: *mut Frame,
+    /// Just past the innermost call.
+    frames_top: *mut Frame,
+    /// Calls may not nest beyond this point.
+    frames_limit: *mut Frame,
 }
 
 impl Stack {
     const CAPACITY: usize = 1 << 22;
+    /// Room for the deepest allowed recursion plus the frame of a test body.
+    const FRAME_CAPACITY: usize = MAX_DEPTH + 8;
 
     fn new() -> Stack {
         let mut block: Vec<Value> = Vec::with_capacity(Self::CAPACITY);
@@ -434,7 +443,18 @@ impl Stack {
         std::mem::forget(block);
         // Safety: `base + CAPACITY` is the end of the allocation.
         let end = unsafe { base.add(Self::CAPACITY) };
-        Stack { base, top: base, end, owner: std::ptr::null_mut() }
+        let mut frames: Vec<Frame> = Vec::with_capacity(Self::FRAME_CAPACITY);
+        let frames_base = frames.as_mut_ptr();
+        std::mem::forget(frames);
+        Stack {
+            base,
+            top: base,
+            end,
+            owner: std::ptr::null_mut(),
+            frames_base,
+            frames_top: frames_base,
+            frames_limit: frames_base,
+        }
     }
 
     fn len(&self) -> usize {
@@ -529,8 +549,12 @@ impl std::ops::DerefMut for Stack {
 impl Drop for Stack {
     fn drop(&mut self) {
         self.clear();
-        // Safety: `base` came from a Vec with this capacity, and is now empty.
-        unsafe { drop(Vec::from_raw_parts(self.base, 0, Self::CAPACITY)) };
+        // Safety: both blocks came from Vecs with these capacities. The value
+        // block is now empty, and frames own nothing.
+        unsafe {
+            drop(Vec::from_raw_parts(self.base, 0, Self::CAPACITY));
+            drop(Vec::from_raw_parts(self.frames_base, 0, Self::FRAME_CAPACITY));
+        }
     }
 }
 
@@ -547,14 +571,37 @@ enum Flow {
     Return(Value),
 }
 
+/// One call in progress. `#[repr(C)]` because generated code writes these.
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct Frame {
-    func: Rc<Func>,
+    /// The function being run. `Globals::funcs` keeps every function alive
+    /// for as long as the interpreter exists; `start` does so for a test body.
+    func: *const Func,
     /// Where to continue in `func` once the call it made returns.
     pc: usize,
-    /// Stack index of the function's first local slot.
-    base: usize,
+    /// Address of the function's first local slot.
+    base: *mut Value,
     /// Where the function was called from, for contract violations.
-    call_span: Span,
+    span_start: usize,
+    span_end: usize,
+}
+
+impl Frame {
+    fn func<'f>(&self) -> &'f Func {
+        // Safety: see the field.
+        unsafe { &*self.func }
+    }
+
+    fn call_span(&self) -> Span {
+        Span::new(self.span_start, self.span_end)
+    }
+
+    /// Stack index of the function's first local slot.
+    fn base_index(&self, stack: &Stack) -> usize {
+        // Safety: `base` points into the value stack.
+        unsafe { self.base.offset_from(stack.base) as usize }
+    }
 }
 
 pub struct Interp<'a> {
@@ -562,7 +609,6 @@ pub struct Interp<'a> {
     g: Globals,
     main: Option<(u32, Span)>,
     stack: Stack,
-    frames: Vec<Frame>,
     /// The error that made generated code stop.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     fault: Option<Fault>,
@@ -571,8 +617,7 @@ pub struct Interp<'a> {
     /// Run generated machine code instead of interpreting the bytecode.
     /// Only available on x86-64; set `YUI_JIT=0` to turn it off.
     pub jit: bool,
-    /// Frames that do not count as a call: 1 while running a test body.
-    free_frames: usize,
+
     /// Command line arguments returned by `args()`.
     pub args: Vec<String>,
     /// When set, `print` appends here instead of writing to stdout.
@@ -613,12 +658,10 @@ impl<'a> Interp<'a> {
             g,
             main,
             stack: Stack::new(),
-            frames: Vec::new(),
             fault: None,
             #[cfg(target_arch = "x86_64")]
             code: Default::default(),
             jit: false,
-            free_frames: 0,
             args: Vec::new(),
             captured: None,
         };
@@ -632,22 +675,44 @@ impl<'a> Interp<'a> {
                 .hint("add `fn main() uses io { ... }`"));
         };
         let func = self.g.funcs[index as usize].clone();
-        self.start(func, 0, span)
+        self.start(&func, 0, span)
     }
 
     pub fn run_test(&mut self, test: &TestDecl) -> Result<(), Diagnostic> {
         let func = Rc::new(bytecode::compile_test(&mut self.g, test));
-        self.start(func, 1, test.name_span)
+        self.start(&func, 1, test.name_span)
     }
 
-    fn start(&mut self, func: Rc<Func>, free_frames: usize, span: Span) -> Result<(), Diagnostic> {
+    /// Runs `func` from an empty stack. `free_frames` is the number of frames
+    /// that do not count as a call: 1 for a test body.
+    fn start(&mut self, func: &Rc<Func>, free_frames: usize, span: Span) -> Result<(), Diagnostic> {
         self.stack.clear();
-        self.frames.clear();
-        self.free_frames = free_frames;
-        let result = self.push_frame(func, 0, &[], span).and_then(|_| self.enter());
+        self.stack.frames_top = self.stack.frames_base;
+        // Safety: `FRAME_CAPACITY` leaves room for `MAX_DEPTH` plus the free frames.
+        self.stack.frames_limit = unsafe { self.stack.frames_base.add(MAX_DEPTH + free_frames) };
+        let result = self.push_frame(Rc::as_ptr(func), 0, &[], span).and_then(|_| self.enter());
         self.stack.clear();
-        self.frames.clear();
+        self.stack.frames_top = self.stack.frames_base;
         result.map(|_| ()).map_err(|d| *d)
+    }
+
+    /// Number of calls in progress.
+    fn depth(&self) -> usize {
+        // Safety: both point into the frame block, and `frames_top >= frames_base`.
+        unsafe { self.stack.frames_top.offset_from(self.stack.frames_base) as usize }
+    }
+
+    /// The innermost call.
+    #[inline]
+    fn frame(&self) -> Frame {
+        debug_assert!(self.depth() > 0);
+        // Safety: a call is in progress whenever code runs.
+        unsafe { *self.stack.frames_top.sub(1) }
+    }
+
+    fn set_pc(&mut self, pc: usize) {
+        // Safety: as in `frame`.
+        unsafe { (*self.stack.frames_top.sub(1)).pc = pc };
     }
 
     fn text(&self, span: Span) -> &'a str {
@@ -658,8 +723,10 @@ impl<'a> Interp<'a> {
 
     /// Starts a call whose `argc` arguments are on top of the stack.
     #[inline]
-    fn push_frame(&mut self, func: Rc<Func>, argc: usize, captured: &[Value], span: Span) -> R<()> {
-        if self.frames.len() >= MAX_DEPTH + self.free_frames {
+    fn push_frame(&mut self, callee: *const Func, argc: usize, captured: &[Value], span: Span) -> R<()> {
+        // Safety: callers pass a function that outlives the call (see `Frame::func`).
+        let func = unsafe { &*callee };
+        if self.stack.frames_top >= self.stack.frames_limit {
             return Err(panic_hint(
                 "E0506",
                 format!("stack overflow: more than {MAX_DEPTH} nested calls"),
@@ -684,22 +751,34 @@ impl<'a> Interp<'a> {
         for _ in self.stack.len()..base + func.nlocals {
             self.stack.push(Value::Unit);
         }
-        self.frames.push(Frame { func, pc: 0, base, call_span: span });
+        // Safety: `frames_top < frames_limit`, which is inside the frame block,
+        // and `base` is at most the stack length.
+        unsafe {
+            let frame = Frame {
+                func: callee,
+                pc: 0,
+                base: self.stack.base.add(base),
+                span_start: span.start,
+                span_end: span.end,
+            };
+            self.stack.frames_top.write(frame);
+            self.stack.frames_top = self.stack.frames_top.add(1);
+        }
         Ok(())
     }
 
     /// Starts a call to a function value (a named function or a closure).
     fn push_value_frame(&mut self, f: &Value, argc: usize, span: Span) -> R<()> {
         match f {
-            Value::Fn(func) => self.push_frame(func.clone(), argc, &[], span),
-            Value::Closure(c) => self.push_frame(c.func.clone(), argc, &c.captured, span),
+            Value::Fn(func) => self.push_frame(Rc::as_ptr(func), argc, &[], span),
+            Value::Closure(c) => self.push_frame(Rc::as_ptr(&c.func), argc, &c.captured, span),
             _ => Err(internal(span)),
         }
     }
 
     /// Calls a function value from native code and waits for its result.
     fn call_value(&mut self, f: &Value, args: Vec<Value>, span: Span) -> R<Value> {
-        let depth = self.frames.len();
+        let depth = self.depth();
         let argc = args.len();
         self.stack.extend(args);
         self.push_value_frame(f, argc, span)?;
@@ -715,15 +794,17 @@ impl<'a> Interp<'a> {
         if self.jit {
             self.enter_native()
         } else {
-            self.run(self.frames.len() - 1)
+            self.run(self.depth() - 1)
         }
     }
 
     /// Ends the current call, leaving `value` on the stack as its result.
     fn finish_call(&mut self, value: Value) {
-        let frame = self.frames.pop().expect("frame");
-        let value = if frame.func.unit_ret { Value::Unit } else { value };
-        self.stack.truncate(frame.base);
+        let frame = self.frame();
+        // Safety: a call is in progress, so there is a frame to remove.
+        self.stack.frames_top = unsafe { self.stack.frames_top.sub(1) };
+        let value = if frame.func().unit_ret { Value::Unit } else { value };
+        self.stack.truncate(frame.base_index(&self.stack));
         self.stack.push(value);
     }
 
@@ -738,22 +819,22 @@ impl<'a> Interp<'a> {
     /// frames, and returns the value that last call returned.
     fn run(&mut self, stop: usize) -> R<Value> {
         let (mut func, mut pc, mut base) = {
-            let frame = self.frames.last().expect("frame");
-            (frame.func.clone(), frame.pc, frame.base)
+            let frame = self.frame();
+            (frame.func(), frame.pc, frame.base_index(&self.stack))
         };
         // Continue in whichever frame is now on top.
         macro_rules! resume {
             () => {{
-                let frame = self.frames.last().expect("frame");
-                func = frame.func.clone();
+                let frame = self.frame();
+                func = frame.func();
                 pc = frame.pc;
-                base = frame.base;
+                base = frame.base_index(&self.stack);
             }};
         }
         macro_rules! ret {
             ($value:expr) => {{
                 self.finish_call($value);
-                if self.frames.len() == stop {
+                if self.depth() == stop {
                     return Ok(self.pop());
                 }
                 resume!();
@@ -765,14 +846,14 @@ impl<'a> Interp<'a> {
             match op {
                 Op::Jump(target) => pc = target as usize,
                 Op::Call(index, argc) => {
-                    let callee = self.g.funcs[index as usize].clone();
-                    self.frames.last_mut().expect("frame").pc = pc;
+                    let callee = Rc::as_ptr(&self.g.funcs[index as usize]);
+                    self.set_pc(pc);
                     self.push_frame(callee, argc as usize, &[], func.spans[pc - 1])?;
                     resume!();
                 }
                 Op::CallValue(argc) => {
                     let callee = self.pop();
-                    self.frames.last_mut().expect("frame").pc = pc;
+                    self.set_pc(pc);
                     self.push_value_frame(&callee, argc as usize, func.spans[pc - 1])?;
                     resume!();
                 }
@@ -780,7 +861,7 @@ impl<'a> Interp<'a> {
                     let v = self.pop();
                     ret!(v);
                 }
-                op => match self.exec(&func, op, pc, base)? {
+                op => match self.exec(func, op, pc, base)? {
                     Flow::Next => {}
                     Flow::Jump(target) => pc = target,
                     Flow::Return(v) => ret!(v),
@@ -1180,7 +1261,7 @@ impl<'a> Interp<'a> {
                         short(&func.name),
                         self.text(func.aux[aux as usize])
                     );
-                    return Err(panic("E0502", msg, self.frames.last().expect("frame").call_span));
+                    return Err(panic("E0502", msg, self.frame().call_span()));
                 }
             }
             Op::Ensure(aux, slot) => {
@@ -1191,7 +1272,7 @@ impl<'a> Interp<'a> {
                         self.text(func.aux[aux as usize]),
                         self.stack[base + slot as usize].repr()
                     );
-                    return Err(panic("E0502", msg, self.frames.last().expect("frame").call_span));
+                    return Err(panic("E0502", msg, self.frame().call_span()));
                 }
             }
             Op::Internal => return Err(internal(span!())),
@@ -1474,6 +1555,15 @@ mod native {
             && byte(&Value::Float(0.0), 0) < jit::FIRST_HEAP_TAG
             && byte(&Value::str(""), 0) == jit::FIRST_HEAP_TAG
             && std::mem::offset_of!(Stack, top) == jit::STACK_TOP_OFFSET as usize
+            && std::mem::offset_of!(Stack, end) == jit::STACK_END_OFFSET as usize
+            && std::mem::offset_of!(Stack, frames_top) == jit::FRAMES_TOP_OFFSET as usize
+            && std::mem::offset_of!(Stack, frames_limit) == jit::FRAMES_LIMIT_OFFSET as usize
+            && std::mem::size_of::<Frame>() == jit::FRAME_SIZE as usize
+            && std::mem::offset_of!(Frame, func) == jit::FRAME_FUNC as usize
+            && std::mem::offset_of!(Frame, pc) == jit::FRAME_PC as usize
+            && std::mem::offset_of!(Frame, base) == jit::FRAME_BASE as usize
+            && std::mem::offset_of!(Frame, span_start) == jit::FRAME_SPAN as usize
+            && std::mem::offset_of!(Frame, span_end) == jit::FRAME_SPAN as usize + 8
     }
 
     impl Interp<'_> {
@@ -1484,14 +1574,24 @@ mod native {
 
         /// Address of the machine code for the top frame's function.
         fn entry(&mut self) -> R<usize> {
-            let frame = self.frames.last().expect("frame");
-            let address = frame.func.native.get();
+            let frame = self.frame();
+            let func = frame.func();
+            let address = func.native.get();
             if address != 0 {
                 return Ok(address);
             }
-            let func = frame.func.clone();
-            let span = frame.call_span;
-            let code = jit::compile(&func, &helpers());
+            let span = frame.call_span();
+            let funcs = &self.g.funcs;
+            let callee = |index: u32| {
+                funcs.get(index as usize).map(|f| jit::Callee {
+                    func: Rc::as_ptr(f) as usize,
+                    native: f.native.as_ptr() as usize,
+                    nlocals: f.nlocals,
+                    // The same margin `push_frame` asks for.
+                    need: f.nlocals + f.code.len() + 64,
+                })
+            };
+            let code = jit::compile(func, &helpers(), &callee);
             match self.code.install(&code) {
                 Some(address) => {
                     func.native.set(address);
@@ -1515,11 +1615,9 @@ mod native {
         }
 
         fn native_op(&mut self, pc: usize) -> u32 {
-            let frame = self.frames.last().expect("frame");
-            let base = frame.base;
-            // Safety: the frame keeps the function alive, and `exec` never
-            // removes the frame it runs in.
-            let func = unsafe { &*Rc::as_ptr(&frame.func) };
+            let frame = self.frame();
+            let base = frame.base_index(&self.stack);
+            let func = frame.func();
             match self.exec(func, func.code[pc], pc + 1, base) {
                 Ok(Flow::Next) => jit::NEXT,
                 Ok(Flow::Jump(_)) => jit::JUMP,
@@ -1536,14 +1634,14 @@ mod native {
 
         /// Starts a call and returns the callee's entry address, or 0 on failure.
         fn native_call(&mut self, index: usize, argc: usize, pc: usize) -> usize {
-            let span = self.frames.last().expect("frame").func.spans[pc];
-            let callee = self.g.funcs[index].clone();
+            let span = self.frame().func().spans[pc];
+            let callee = Rc::as_ptr(&self.g.funcs[index]);
             let entry = self.push_frame(callee, argc, &[], span).and_then(|_| self.entry());
             self.entry_or_fault(entry)
         }
 
         fn native_call_value(&mut self, argc: usize, pc: usize) -> usize {
-            let span = self.frames.last().expect("frame").func.spans[pc];
+            let span = self.frame().func().spans[pc];
             let callee = self.pop();
             let entry = self.push_value_frame(&callee, argc, span).and_then(|_| self.entry());
             self.entry_or_fault(entry)
