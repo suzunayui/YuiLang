@@ -1,7 +1,8 @@
-# YuiLang 言語仕様 v0.2
+# YuiLang 言語仕様
 
 YuiLang は、AIが書き、AIが直すことを前提に設計した静的型付き言語です。
-この文書は v0.2 の処理系（`yui`）が実装している範囲を記述します。
+この文書は、同じリポジトリにある処理系（`yui`）が実装している範囲を記述します。
+バージョンは `yui --version` で確認できます。
 
 ## 1. 設計原則
 
@@ -347,6 +348,7 @@ yui run     <file> [--json] [-- 引数...]  main を実行
 yui test    <file> [--json]              test ブロックを実行
 yui fmt     <file> [--check]             整形して上書き（--check は確認のみ）
 yui outline <file>                       宣言のシグネチャだけを表示
+yui --version                            バージョンを表示
 
 --root <dir>   import の基準フォルダ（既定: <file> のあるフォルダ）
 ```

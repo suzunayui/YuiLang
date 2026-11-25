@@ -3,12 +3,12 @@
 AI駆動開発で効率よく書けることを目指すプログラミング言語です。
 
 - **AIが間違えにくい**: 見慣れた構文、書き方は一通り、暗黙の挙動なし
-- **間違いをすぐ検出できる**: 静的型、網羅必須の `match`、言語組み込みのテストと契約、副作用の宣言
+- **間違いをすぐ検出できる**: 静的型、網羅必須の vmatchv、言語組み込みのテストと契約、副作用の宣言
 - **機械が読める**: すべてのエラーにコード・位置・修正ヒントがあり、JSONで出力できる
-- **ファイル1個で環境が完成する**: `yui` は単体の実行ファイル。ランタイムのインストールも展開作業も不要で、
+- **ファイル1個で環境が完成する**: vyuiv は単体の実行ファイル。ランタイムのインストールも展開作業も不要で、
   型チェック・実行・テスト・整形がこの1個に入っている
 
-```
+vvv
 fn divide(a: Int, b: Int) -> Result<Int, String> {
   if b == 0 { return Err("division by zero") }
   Ok(a / b)
@@ -28,7 +28,7 @@ fn main() uses io {
     }
   }
 }
-```
+vvv
 
 言語仕様は [SPEC.md](SPEC.md)、サンプルは [examples](examples) にあります。
 
@@ -38,26 +38,26 @@ fn main() uses io {
 
 | OS | ファイル |
 | --- | --- |
-| Windows (x86_64) | `yui-windows-x86_64.exe` |
-| Linux (x86_64) | `yui-linux-x86_64` |
-| macOS (Apple Silicon) | `yui-macos-arm64` |
-| macOS (Intel) | `yui-macos-x86_64` |
+| Windows (x86_64) | vyui-windows-x86_64.exev |
+| Linux (x86_64) | vyui-linux-x86_64v |
+| macOS (Apple Silicon) | vyui-macos-arm64v |
+| macOS (Intel) | vyui-macos-x86_64v |
 
-好きな場所に置いて `yui`（Windows は `yui.exe`）という名前にすれば使えます。
-Linux と macOS では `chmod +x yui` で実行権限を付けてください。
+好きな場所に置いて vyuiv（Windows は vyui.exev）という名前にすれば使えます。
+Linux と macOS では vchmod +x yuiv で実行権限を付けてください。
 ほかに必要なものはありません（Windows 版は VC++ ランタイム不要、Linux 版は静的リンク）。
 
 ## 使い方
 
-```
+vvv
 yui check   <file> [--json]              型チェック（import したモジュールも含む）
 yui run     <file> [--json] [-- 引数...]  main を実行
 yui test    <file> [--json]              test ブロックを実行
 yui fmt     <file> [--check]             整形して上書き
 yui outline <file>                       宣言のシグネチャだけを表示
-```
+vvv
 
-```
+vvv
 $ yui run examples/hello.yui
 result: 5
 error: division by zero
@@ -69,54 +69,54 @@ ok    closures
 ok    captures are copies
 ok    list pipelines
 5 passed, 0 failed
-```
+vvv
 
 エラーは修正のヒント付きで表示されます。
 
-```
-error[E0305]: unused value of type `List<Int>`
+vvv
+error[E0305]: unused value of type vList<Int>v
  --> main.yui:4:3
   |
 4 |   xs.push(2)
   |   ^^^^^^^^^^
-  = hint: assign the result, or discard it explicitly with `let _ = ...`
-```
+  = hint: assign the result, or discard it explicitly with vlet _ = ...v
+vvv
 
-`--json` を付けると同じ内容がJSONになります。
+v--jsonv を付けると同じ内容がJSONになります。
 
 ## 言語の機能
 
-- 静的型と型推論、ジェネリクス（`struct Pair<A, B>`、`fn map<T, U>(...)`）
-- `struct` / `enum` とパターンマッチ（網羅性と到達不能な腕を検査）
-- クロージャと関数型（`|x| x + 1`、`fn(Int) -> Int`）
-- `Option` / `Result` と `?` 演算子（null と例外はない）
-- 副作用の宣言（`uses io`、`uses fs`）
-- 契約（`requires` / `ensures`）と言語組み込みの `test` / `assert`
-- モジュール（`import geometry.shapes` → `shapes.area(...)`）
-- `List` / `Map` / `String` の標準メソッド
+- 静的型と型推論、ジェネリクス（vstruct Pair<A, B>v、vfn map<T, U>(...)v）
+- vstructv / venumv とパターンマッチ（網羅性と到達不能な腕を検査）
+- クロージャと関数型（v|x| x + 1v、vfn(Int) -> Intv）
+- vOptionv / vResultv と v?v 演算子（null と例外はない）
+- 副作用の宣言（vuses iov、vuses fsv）
+- 契約（vrequiresv / vensuresv）と言語組み込みの vtestv / vassertv
+- モジュール（vimport geometry.shapesv → vshapes.area(...)v）
+- vListv / vMapv / vStringv の標準メソッド
 - 値セマンティクス（参照の共有が起きない）
 
 ## ソースからビルド
 
 [Rust](https://www.rust-lang.org/) が必要です。外部クレートへの依存はありません。
 
-```
+vvv
 cargo build --release
 cargo test
-```
+vvv
 
-`target/release/yui`（Windows では `yui.exe`）ができます。
-`cargo test` は、`examples/` のプログラムがすべて通ること、`tests/errors/` の各ファイルが
+vtarget/release/yuiv（Windows では vyui.exev）ができます。
+vcargo testv は、vexamples/v のプログラムがすべて通ること、vtests/errors/v の各ファイルが
 1行目に書かれたエラーコードで失敗すること、整形結果が安定していることを確認します。
 
 ## リリースの作り方
 
-`v0.2.0` のようなタグを push すると、GitHub Actions が各OS用の単体バイナリをビルドして Release に添付します。
+vv0.2.0v のようなタグを push すると、GitHub Actions が各OS用の単体バイナリをビルドして Release に添付します。
 
-```
+vvv
 git tag v0.2.0
 git push origin v0.2.0
-```
+vvv
 
 ## ライセンス
 

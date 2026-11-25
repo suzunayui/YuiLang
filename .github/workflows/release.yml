@@ -1,5 +1,5 @@
 # Builds single-file `yui` binaries and attaches them to a GitHub Release
-# whenever a tag such as `v0.2.0` is pushed.
+# whenever a tag such as `v2026.1125.1` is pushed.
 name: Release
 
 on:
@@ -14,6 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check that the tag matches the version in Cargo.toml
+        run: |
+          actual="$(cargo run --quiet -- --version)"
+          expected="yui ${GITHUB_REF_NAME#v}"
+          echo "binary reports: $actual / tag expects: $expected"
+          test "$actual" = "$expected"
       - name: Create the release if it does not exist
         env:
           GH_TOKEN: ${{ github.token }}

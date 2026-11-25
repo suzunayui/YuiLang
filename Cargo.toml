@@ -1,6 +1,6 @@
 [package]
 name = "yuilang"
-version = "0.2.0"
+version = "2026.1125.1"
 edition = "2021"
 description = "YuiLang: a programming language designed for AI-driven development"
 license = "MIT"

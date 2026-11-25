@@ -5,9 +5,19 @@ use yuilang::ast::Item;
 use yuilang::diag::{json_str, render_human, render_json, Diagnostic, SourceMap};
 use yuilang::interp::Interp;
 
-const USAGE: &str = "\
-YuiLang 0.2.0
+/// Version as `YYYY.MMDD.N`: release year, month and day, and a serial number
+/// for that day. Cargo does not allow leading zeros, so the month-day part is
+/// stored without them (`105` for January 5th) and padded here.
+fn version() -> String {
+    let month_day: u32 = env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0);
+    format!("{}.{:04}.{}", env!("CARGO_PKG_VERSION_MAJOR"), month_day, env!("CARGO_PKG_VERSION_PATCH"))
+}
 
+fn print_usage() {
+    eprint!("YuiLang {}\n\n{USAGE}", version());
+}
+
+const USAGE: &str = "\
 Usage:
   yui check   <file> [--json]         type-check a file and the modules it imports
   yui run     <file> [--json] [-- args...]
@@ -15,6 +25,7 @@ Usage:
   yui test    <file> [--json]         run the `test` blocks of a file
   yui fmt     <file> [--check]        format a file in place (--check: only report)
   yui outline <file>                  print declarations without bodies
+  yui --version                       print the version
 
 Options:
   --root <dir>   directory that `import` paths are relative to
@@ -81,8 +92,12 @@ fn parse_args() -> Option<Options> {
 }
 
 fn real_main() -> i32 {
+    if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("yui {}", version());
+        return 0;
+    }
     let Some(opts) = parse_args() else {
-        eprint!("{USAGE}");
+        print_usage();
         return 2;
     };
     let json = opts.json;
@@ -91,7 +106,7 @@ fn real_main() -> i32 {
         "fmt" => return format_file(&opts),
         other => {
             eprintln!("unknown command `{other}`\n");
-            eprint!("{USAGE}");
+            print_usage();
             return 2;
         }
     }
