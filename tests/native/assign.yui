@@ -1,0 +1,119 @@
+// リストの要素とフィールドへの代入。値は共有されない: ほかの持ち主からは変わって見えない
+
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+struct Board {
+  name: String,
+  cells: List<Int>,
+  rows: List<List<Int>>,
+  origin: Point,
+}
+
+fn zeros(n: Int) -> List<Int> {
+  let mut out = []
+  for i in 0..n {
+    out = out.push(0)
+  }
+  out
+}
+
+fn sum(xs: List<Int>) -> Int {
+  xs.fold(0, |acc, x| acc + x)
+}
+
+// 引数は呼び出し側と共有されている。書き換えても呼び出し側は変わらない
+fn bumped(xs: List<Int>) -> List<Int> {
+  let mut ys = xs
+  ys[0] = ys[0] + 100
+  ys
+}
+
+fn sieve(limit: Int) -> Int {
+  let mut flags = zeros(limit + 1)
+  let mut count = 0
+  let mut i = 2
+  while i <= limit {
+    if flags[i] == 0 {
+      count = count + 1
+      let mut j = i * i
+      while j <= limit {
+        flags[j] = 1
+        j = j + i
+      }
+    }
+    i = i + 1
+  }
+  count
+}
+
+fn reversed(xs: List<Int>) -> List<Int> {
+  let mut out = xs
+  let mut lo = 0
+  let mut hi = out.len() - 1
+  while lo < hi {
+    let t = out[lo]
+    out[lo] = out[hi]
+    out[hi] = t
+    lo = lo + 1
+    hi = hi - 1
+  }
+  out
+}
+
+fn main() uses io {
+  let mut xs = [1, 2, 3, 4]
+  xs[0] = 10
+  xs[3] = xs[1] + xs[2]
+  xs[xs[1]] = sum(xs)
+  print("{xs[0]} {xs[1]} {xs[2]} {xs[3]} {sum(xs)}")
+
+  // 共有しているリスト
+  let saved = xs
+  xs[1] = 99
+  let again = bumped(xs)
+  print("{saved[1]} {xs[1]} {xs[0]} {again[0]} {sum(saved)} {sum(xs)} {sum(again)}")
+  print("{sieve(100)} {sieve(5000)} {sum(reversed([1, 2, 3, 4, 5]))} {reversed([1, 2, 3, 4, 5])[0]} {reversed(xs)[3]}")
+
+  // 文字列のリスト: 古い要素は手放す
+  let name = "yui"
+  let mut words = ["a", "b", "c"]
+  let before = words
+  words[1] = "{name}-{words[1]}"
+  words[2] = words[0]
+  words[0] = name
+  print("{words[0]} {words[1]} {words[2]} / {before[0]} {before[1]} {before[2]}")
+
+  // フィールド
+  let mut p = Point { x: 1, y: 2 }
+  let q = p
+  p.x = 7
+  p.y = p.x * 2
+  print("{p.x} {p.y} {q.x} {q.y}")
+
+  // 入れ子
+  let mut board = Board { name: "first", cells: zeros(3), rows: [zeros(2), zeros(2)], origin: p }
+  let copy = board
+  board.name = "second"
+  board.cells[1] = 5
+  board.rows[1][0] = 8
+  board.rows[0] = [1, 2, 3]
+  board.origin.x = -1
+  print("{board.name} {sum(board.cells)} {board.rows[1][0]} {board.rows[0].len()} {board.origin.x} {board.origin.y}")
+  print("{copy.name} {sum(copy.cells)} {copy.rows[1][0]} {copy.rows[0].len()} {copy.origin.x} {p.x}")
+
+  let mut grid = [zeros(3), zeros(3), zeros(3)]
+  let row = grid[1]
+  for i in 0..3 {
+    grid[i][i] = i + 1
+    grid[i][2 - i] = grid[i][2 - i] + 10
+  }
+  print("{sum(grid[0])} {sum(grid[1])} {sum(grid[2])} {sum(row)} {grid[1][1]}")
+
+  let mut boards = [board, copy]
+  boards[1].cells[2] = 3
+  boards[0].origin.y = boards[1].cells[2] * 2
+  print("{sum(boards[1].cells)} {sum(copy.cells)} {boards[0].origin.y} {board.origin.y}")
+}

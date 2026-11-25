@@ -1,0 +1,7 @@
+fn main() uses io {
+  let mut rows = [[1, 2], [3]]
+  rows[0][1] = 5
+  print("{rows[0][1]}")
+  rows[1][1] = 6
+  print("not reached")
+}

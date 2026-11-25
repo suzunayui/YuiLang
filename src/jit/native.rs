@@ -218,6 +218,9 @@ enum Stub {
     Bounds { label: usize, list: u8, index: u8, record: usize },
     /// `variable = variable.push(value)` when the item cannot be added in place.
     Push { label: usize, back: usize, variable: Loc, value: u8, list: Ty },
+    /// `variable[a] = b` when the list is shared: the variable gets a copy
+    /// of its own first. `saves` are spill slots for `a` and `b` meanwhile.
+    Unshare { label: usize, back: usize, variable: Loc, list: Ty, a: Opnd, b: Opnd, saves: [M; 2] },
 }
 
 struct Native<'a> {
@@ -237,6 +240,10 @@ struct Native<'a> {
     drop_labels: HashMap<u32, usize>,
     push_labels: HashMap<u32, usize>,
     glue_queue: Vec<(bool, u32)>,
+    /// Generated code per type that copies a list or a struct, for a
+    /// variable that is about to change a value it shares.
+    clone_labels: HashMap<u32, usize>,
+    clone_queue: Vec<u32>,
     /// Closures to compile, and for each function used as a value, the code
     /// that calls it the way a closure is called: (label, the function).
     closures: Vec<Closure>,
@@ -285,6 +292,13 @@ struct Native<'a> {
     /// while it evaluates its other parts. If one of those parts leaves the
     /// function or the loop (`?`, `return`, `break`), they are released there.
     pending: Vec<(M, Ty)>,
+    /// A variable whose next read is its last, so that the read takes over
+    /// the variable's reference instead of adding one. With `true` the
+    /// variable is then treated as borrowed (it no longer owns anything);
+    /// with `false` whoever set this gives the variable a new value.
+    moving: Option<(String, bool)>,
+    /// Whether that read happened.
+    moved: bool,
     epilogue: usize,
     ret: Ty,
     /// Offset of the first spill slot, and how many are in use / were ever used.
@@ -333,6 +347,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         drop_labels: HashMap::new(),
         push_labels: HashMap::new(),
         glue_queue: Vec::new(),
+        clone_labels: HashMap::new(),
+        clone_queue: Vec::new(),
         closures: Vec::new(),
         thunks: HashMap::new(),
         thunk_queue: Vec::new(),
@@ -361,6 +377,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         free: Vec::new(),
         loops: Vec::new(),
         pending: Vec::new(),
+        moving: None,
+        moved: false,
         epilogue: 0,
         ret: Ty::Unit,
         spill_base: 0,
@@ -440,6 +458,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             } else {
                 n.emit_drop(id);
             }
+        } else if let Some(id) = n.clone_queue.pop() {
+            n.emit_clone(id);
         } else if let Some((label, target)) = n.thunk_queue.pop() {
             // The block comes first; the arguments move up by one.
             n.a.bind(label);
@@ -654,10 +674,12 @@ impl Native<'_> {
             ExprKind::Binary(_, l, r) => self.has_call(l) || self.has_call(r),
             // Reading from a struct or a list held by a variable is done in place.
             // (The same on a string is a call into the runtime.)
-            ExprKind::Field(base, ..) => self.heap_var(base).is_none(),
-            ExprKind::Index(list, index) => self.list_var(list).is_none() || self.has_call(index),
+            ExprKind::Field(base, ..) => self.path_ty(base).is_none(),
+            ExprKind::Index(list, index) => {
+                !matches!(self.path_ty(list), Some(Ty::List(_))) || self.has_call(index)
+            }
             ExprKind::MethodCall { recv, name, args, .. } => {
-                !(name == "len" && args.is_empty() && self.list_var(recv).is_some())
+                !(name == "len" && args.is_empty() && matches!(self.path_ty(recv), Some(Ty::List(_))))
             }
             // Reading memory in the runtime is one instruction, not a call.
             ExprKind::Call { name, args, .. } if self.in_runtime && (name == "__load" || name == "__load8") => {
@@ -1536,6 +1558,32 @@ impl Native<'_> {
                     self.store_loc(variable, RAX);
                     self.a.jmp(back);
                 }
+                Stub::Unshare { label, back, variable, list, a, b, saves } => {
+                    self.a.bind(label);
+                    // The copy is made by a call, which overwrites r8-r11.
+                    let parked: Vec<(u8, M)> = [a, b]
+                        .iter()
+                        .zip(saves)
+                        .filter_map(|(o, slot)| match o {
+                            Opnd::Reg(r) if TEMPS.contains(r) => Some((*r, slot)),
+                            _ => None,
+                        })
+                        .collect();
+                    for (r, slot) in &parked {
+                        self.a.store(*slot, *r);
+                    }
+                    self.load_loc(RCX, variable);
+                    let clone = self.clone_label(list);
+                    self.call_label(clone);
+                    // The other owners keep the list as it was.
+                    self.load_loc(RCX, variable);
+                    self.a.dec_mem(M(RCX, 0));
+                    self.store_loc(variable, RAX);
+                    for (r, slot) in &parked {
+                        self.a.load(*r, *slot);
+                    }
+                    self.a.jmp(back);
+                }
                 Stub::Bounds { label, list, index, record } => {
                     self.a.bind(label);
                     // The index is in neither rcx nor rdx; the list may be in rcx.
@@ -1830,15 +1878,57 @@ impl Native<'_> {
         local.ty.heap().then_some(*local)
     }
 
+    /// The type of `e` if it can be read where it is: a variable holding a
+    /// counted value, or a counted field (of a field ...) of one. The
+    /// variable keeps everything on the way alive.
+    fn path_ty(&self, e: &Expr) -> Option<Ty> {
+        match &e.kind {
+            ExprKind::Ident(_) => self.heap_var(e).map(|local| local.ty),
+            ExprKind::Field(base, name, _) => {
+                let ty = self.path_ty(base)?;
+                self.fields(ty).into_iter().find(|(field, _)| field == name).map(|(_, ty)| ty).filter(|ty| ty.heap())
+            }
+            _ => None,
+        }
+    }
+
+    /// Loads into `reg` the value `path_ty` describes, without counting it.
+    fn load_path(&mut self, e: &Expr, reg: u8) {
+        match &e.kind {
+            ExprKind::Field(base, name, _) => {
+                self.load_path(base, reg);
+                let ty = self.path_ty(base).unwrap_or(Ty::Never);
+                let at = self.fields(ty).iter().position(|(field, _)| field == name).unwrap_or(0);
+                self.a.load(reg, M(reg, 8 + 8 * at as i32));
+            }
+            _ => {
+                if let Some(local) = self.heap_var(e) {
+                    self.load_loc(reg, local.loc);
+                }
+            }
+        }
+    }
+
+    /// The register holding the list `e` (see `path_ty`): the variable's own, or rcx.
+    fn path_reg(&mut self, e: &Expr) -> u8 {
+        match self.heap_var(e) {
+            Some(local) => self.reg(local.loc, RCX),
+            None => {
+                self.load_path(e, RCX);
+                RCX
+            }
+        }
+    }
+
     /// Puts the value of `e` in a new spill slot, using `dst` on the way.
     /// A list or string held by a variable is only borrowed (the variable
     /// keeps it alive); otherwise the slot owns a reference. Returns the
     /// slot, whether it owns, and the type.
     fn park(&mut self, e: &Expr, dst: u8) -> R<(M, bool, Ty)> {
-        let (owned, ty) = match self.heap_var(e) {
-            Some(local) => {
-                self.load_loc(dst, local.loc);
-                (false, local.ty)
+        let (owned, ty) = match self.path_ty(e) {
+            Some(ty) => {
+                self.load_path(e, dst);
+                (false, ty)
             }
             None => (true, self.eval(e, dst)?),
         };
@@ -1938,7 +2028,19 @@ impl Native<'_> {
                     Ty::Unit
                 }
                 other => {
+                    // `let w = v` in the body of a function, with `v` not used
+                    // after it: `w` takes over what `v` holds. (The statements
+                    // of the body run once, in order, so "after" is what follows.)
+                    if let Stmt::Let { value, .. } = other {
+                        if let ExprKind::Ident(source) = &value.kind {
+                            let later = &b.stmts[i + 1..];
+                            if self.scopes.len() == 2 && !later.iter().any(|s| any_stmt(s, &mut |e| refers(e, source))) {
+                                self.moving = Some((source.clone(), true));
+                            }
+                        }
+                    }
                     self.stmt(other)?;
+                    self.moving = None;
                     Ty::Unit
                 }
             };
@@ -1987,7 +2089,7 @@ impl Native<'_> {
             }
             Stmt::Assign { target, value } => {
                 let ExprKind::Ident(name) = &target.kind else {
-                    return unsupported("assigning to anything but a variable", target.span);
+                    return self.assign_place(target, value);
                 };
                 let local = self.lookup(name, target.span)?;
                 if local.ty.heap() {
@@ -2091,6 +2193,255 @@ impl Native<'_> {
         Ok(())
     }
 
+    /// The label of the generated code that copies a value of type `ty`.
+    fn clone_label(&mut self, ty: Ty) -> usize {
+        let (Ty::List(id) | Ty::Struct(id)) = ty else { return self.rt_fail };
+        self.uses_heap = true;
+        if let Some(label) = self.clone_labels.get(&id) {
+            return *label;
+        }
+        let label = self.a.label();
+        self.clone_labels.insert(id, label);
+        self.clone_queue.push(id);
+        label
+    }
+
+    /// `clone(rcx = value) -> rax`: a new block with one owner and the same
+    /// contents; what it holds is held once more.
+    fn emit_clone(&mut self, id: u32) {
+        let def = self.defs[id as usize].clone();
+        self.a.bind(self.clone_labels[&id]);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.alu_imm(5, RSP, 40);
+        self.a.mov_rr(RBX, RCX);
+        match def {
+            Def::Struct(fields) => {
+                let bytes = 8 + 8 * fields.len();
+                self.a.mov_imm64(RCX, bytes as i64);
+                self.call_label(if bytes <= POOL_MAX { self.rt_pool_alloc } else { self.rt_alloc });
+                self.a.store_imm(M(RAX, 0), 1);
+                for (i, (_, ty)) in fields.iter().enumerate() {
+                    let at = 8 + 8 * i as i32;
+                    self.a.load(RDX, M(RBX, at));
+                    self.retain(RDX, *ty);
+                    self.a.store(M(RAX, at), RDX);
+                }
+            }
+            Def::List(item) => {
+                let (top, done) = (self.a.label(), self.a.label());
+                self.a.load(RCX, M(RBX, LENGTH));
+                self.call_rt("list_new");
+                self.a.load(RSI, M(RBX, LENGTH));
+                self.a.store(M(RAX, LENGTH), RSI);
+                self.a.mov_imm64(RCX, 0);
+                self.a.bind(top);
+                self.a.alu_rr(0x39, RCX, RSI);
+                self.a.jcc(CC_GE, done);
+                self.element(0x8B, RDX, RBX, RCX);
+                self.retain(RDX, item);
+                self.element(0x89, RDX, RAX, RCX);
+                self.a.alu_imm(0, RCX, 1);
+                self.a.jmp(top);
+                self.a.bind(done);
+            }
+            _ => {}
+        }
+        self.a.alu_imm(0, RSP, 40);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
+    }
+
+    /// `place = value` where the place is an item of a list or a field of a
+    /// struct, possibly nested (`rows[i][j]`, `p.items[i]`), in a variable.
+    /// Values are not shared with whoever else holds them: every list or
+    /// struct on the way that has another owner is copied first.
+    fn assign_place(&mut self, target: &Expr, value: &Expr) -> R<()> {
+        enum Step<'e> {
+            Field(&'e str, Span),
+            Index(&'e Expr, Span),
+        }
+        let mut steps = Vec::new();
+        let mut root = target;
+        loop {
+            match &root.kind {
+                ExprKind::Field(base, name, name_span) => {
+                    steps.push(Step::Field(name, *name_span));
+                    root = base;
+                }
+                ExprKind::Index(base, index) => {
+                    steps.push(Step::Index(index, root.span));
+                    root = base;
+                }
+                _ => break,
+            }
+        }
+        steps.reverse();
+        let ExprKind::Ident(name) = &root.kind else {
+            return unsupported("assigning to this", target.span);
+        };
+        let var = self.lookup(name, root.span)?;
+        if var.borrowed {
+            return unsupported("assigning into a value that is only borrowed", target.span);
+        }
+
+        // The usual case, `xs[i] = v` with plain items, without leaving the registers.
+        if let ([Step::Index(index, span)], Ty::List(_)) = (&steps[..], var.ty) {
+            if !self.item_ty(var.ty).heap() {
+                let t = self.take_temp(index.span)?;
+                if self.eval(index, t)? != Ty::Int {
+                    return unsupported("an index that is not an Int", index.span);
+                }
+                let (a, b, _, temp, spilled) = self.operands(t, value)?;
+                let saves = [self.push_spill(), self.push_spill()];
+                let (unshare, back) = (self.a.label(), self.a.label());
+                self.stubs.push(Stub::Unshare { label: unshare, back, variable: var.loc, list: var.ty, a, b, saves });
+                self.a.bind(back);
+                let l = self.reg(var.loc, RCX);
+                self.a.cmp_imm(M(l, 0), 1);
+                self.a.jcc(CC_NE, unshare);
+                // The index and the value are used from where they are when
+                // they are already in registers.
+                let at = match a {
+                    Opnd::Reg(r) => r,
+                    _ => {
+                        self.load_opnd(RAX, a);
+                        RAX
+                    }
+                };
+                let stub = self.bounds_stub(l, at, *span);
+                self.a.alu_m(0x3B, at, M(l, LENGTH));
+                self.a.jcc(CC_AE, stub);
+                match b {
+                    Opnd::Reg(r) => self.element(0x89, r, l, at),
+                    Opnd::Imm(n) => {
+                        // mov qword [l + at * 8 + ELEMENTS], n
+                        self.a.b(0x48 | (at >> 3) << 1 | (l >> 3));
+                        self.a.b(0xC7);
+                        self.a.b(0x44);
+                        self.a.b(0xC0 | (at & 7) << 3 | (l & 7));
+                        self.a.b(ELEMENTS as u8);
+                        self.a.d32(n);
+                    }
+                    Opnd::Mem(_) => {
+                        self.load_opnd(RDX, b);
+                        self.element(0x89, RDX, l, at);
+                    }
+                }
+                self.spill_depth -= 2;
+                self.release(temp, spilled);
+                self.free.push(t);
+                return Ok(());
+            }
+        }
+
+        // In general: the indexes and the value are computed and parked,
+        // then the way to the place is walked.
+        let t = self.take_temp(target.span)?;
+        let (held, depth) = (self.pending.len(), self.spill_depth);
+        let mut indexes = Vec::new();
+        for step in &steps {
+            if let Step::Index(index, _) = step {
+                if self.eval(index, t)? != Ty::Int {
+                    return unsupported("an index that is not an Int", index.span);
+                }
+                let slot = self.push_spill();
+                self.a.store(slot, t);
+                indexes.push(slot);
+            }
+        }
+        let value_ty = self.eval(value, t)?;
+        let parked = self.push_spill();
+        self.a.store(parked, t);
+        self.hold(parked, value_ty);
+        // The list or struct being looked into, and the offset of the place in it.
+        let (container, offset) = (self.push_spill(), self.push_spill());
+
+        // The variable's own value first.
+        let unique = self.a.label();
+        self.load_loc(RAX, var.loc);
+        self.a.cmp_imm(M(RAX, 0), 1);
+        self.a.jcc(CC_E, unique);
+        self.a.mov_rr(RCX, RAX);
+        let clone = self.clone_label(var.ty);
+        self.call_label(clone);
+        self.load_loc(RCX, var.loc);
+        self.a.dec_mem(M(RCX, 0));
+        self.store_loc(var.loc, RAX);
+        self.a.bind(unique);
+        self.a.store(container, RAX);
+
+        let mut ty = var.ty;
+        let mut indexes = indexes.into_iter();
+        for (i, step) in steps.iter().enumerate() {
+            // rdx = the offset of the place in the container.
+            let inner = match step {
+                Step::Field(name, name_span) => {
+                    let layout = self.fields(ty);
+                    let Some(at) = layout.iter().position(|(field, _)| field == name) else {
+                        return unsupported(format!("assigning to the field `{name}` here"), *name_span);
+                    };
+                    self.a.mov_imm64(RDX, 8 + 8 * at as i64);
+                    layout[at].1
+                }
+                Step::Index(_, span) => {
+                    if !matches!(ty, Ty::List(_)) {
+                        return unsupported("assigning to an item of anything but a list", *span);
+                    }
+                    let slot = indexes.next().expect("one slot per index");
+                    self.a.load(RAX, slot);
+                    self.a.load(RCX, container);
+                    let stub = self.bounds_stub(RCX, RAX, *span);
+                    self.a.alu_m(0x3B, RAX, M(RCX, LENGTH));
+                    self.a.jcc(CC_AE, stub);
+                    self.a.mov_rr(RDX, RAX);
+                    self.a.buf.extend_from_slice(&[0x48, 0xC1, 0xE2, 0x03]); // shl rdx, 3
+                    self.a.alu_imm(0, RDX, ELEMENTS);
+                    self.item_ty(ty)
+                }
+            };
+            if i + 1 < steps.len() {
+                // Not there yet: the value at this place is the next
+                // container, and must be the variable's alone as well.
+                if !matches!(inner, Ty::List(_) | Ty::Struct(_)) {
+                    return unsupported("assigning into this kind of value", target.span);
+                }
+                let unique = self.a.label();
+                self.a.store(offset, RDX);
+                self.a.load(RCX, container);
+                self.a.buf.extend_from_slice(&[0x48, 0x8B, 0x04, 0x11]); // mov rax, [rcx + rdx]
+                self.a.cmp_imm(M(RAX, 0), 1);
+                self.a.jcc(CC_E, unique);
+                self.a.mov_rr(RCX, RAX);
+                let clone = self.clone_label(inner);
+                self.call_label(clone);
+                self.a.load(RCX, container);
+                self.a.load(RDX, offset);
+                self.a.buf.extend_from_slice(&[0x4C, 0x8B, 0x04, 0x11]); // mov r8, [rcx + rdx]
+                self.a.dec_mem(M(R8, 0));
+                self.a.buf.extend_from_slice(&[0x48, 0x89, 0x04, 0x11]); // mov [rcx + rdx], rax
+                self.a.bind(unique);
+                self.a.store(container, RAX);
+            } else if inner != Ty::Unit {
+                // The place: the new value goes in, the old one is given up.
+                self.a.load(RCX, container);
+                self.a.buf.extend_from_slice(&[0x48, 0x8B, 0x04, 0x11]); // mov rax, [rcx + rdx]
+                self.a.load(R8, parked);
+                self.a.buf.extend_from_slice(&[0x4C, 0x89, 0x04, 0x11]); // mov [rcx + rdx], r8
+                if inner.heap() {
+                    self.a.mov_rr(RCX, RAX);
+                    self.drop_value(inner);
+                }
+            }
+            ty = inner;
+        }
+        self.spill_depth = depth;
+        self.pending.truncate(held);
+        self.free.push(t);
+        Ok(())
+    }
+
     /// `name = value` for a variable whose value is counted: what it held is given up.
     fn assign_heap(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
         // `xs = xs.push(v)` hands the variable's own reference to `push`, which
@@ -2118,9 +2469,31 @@ impl Native<'_> {
                 return Ok(());
             }
         }
+        // `x = f(.., x, ..)`: the function takes over what `x` holds, so that
+        // it can change it in place, and `x` gets the result. Only when `x`
+        // is read exactly once, as an argument, and nothing can leave in between.
+        self.moved = false;
+        if let ExprKind::Call { name: callee, local: by_value, args, .. } = &value.kind {
+            let is_x = |arg: &Expr| matches!(&arg.kind, ExprKind::Ident(n) if n == name);
+            let direct = args.iter().filter(|arg| is_x(arg)).count();
+            let elsewhere = args.iter().any(|arg| !is_x(arg) && any_expr(arg, &mut |e| refers(e, name)));
+            let leaves = any_expr(value, &mut |e| {
+                matches!(e.kind, ExprKind::Return(_) | ExprKind::Try(_) | ExprKind::Break | ExprKind::Continue)
+            });
+            if direct == 1 && !elsewhere && !leaves && !local.borrowed && !(*by_value && callee == name) {
+                self.moving = Some((name.to_string(), false));
+            }
+        }
         let t = self.take_temp(value.span)?;
-        if self.eval(value, t)? != local.ty {
+        let ty = self.eval(value, t);
+        self.moving = None;
+        if ty? != local.ty {
             return unsupported("this assignment", value.span);
+        }
+        if self.moved {
+            self.store_loc(local.loc, t);
+            self.free.push(t);
+            return Ok(());
         }
         self.load_loc(RCX, local.loc);
         self.store_loc(local.loc, t);
@@ -2220,6 +2593,19 @@ impl Native<'_> {
             ExprKind::Ident(name) => {
                 let local = self.lookup(name, e.span)?;
                 self.load_loc(dst, local.loc);
+                if self.moving.as_ref().is_some_and(|(source, _)| source == name) {
+                    let give_up = self.moving.take().is_some_and(|(_, give_up)| give_up);
+                    if local.ty.heap() && !local.borrowed {
+                        // The last read of the variable: its reference moves on.
+                        if give_up {
+                            if let Some(source) = self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name.as_str())) {
+                                source.borrowed = true;
+                            }
+                        }
+                        self.moved = true;
+                        return Ok(local.ty);
+                    }
+                }
                 self.retain(dst, local.ty);
                 Ok(local.ty)
             }
@@ -2248,18 +2634,18 @@ impl Native<'_> {
                 Ok(ty)
             }
             ExprKind::Index(list, index) => {
-                if let Some(local) = self.list_var(list) {
+                if let Some(list_ty @ Ty::List(_)) = self.path_ty(list) {
                     // Read in place: the variable keeps the list alive.
                     if self.eval(index, dst)? != Ty::Int {
                         return unsupported("an index that is not an Int", index.span);
                     }
-                    let l = self.reg(local.loc, RCX);
+                    let l = self.path_reg(list);
                     let stub = self.bounds_stub(l, dst, e.span);
                     self.a.alu_m(0x3B, dst, M(l, LENGTH));
                     // Unsigned, so that a negative index is out of bounds too.
                     self.a.jcc(CC_AE, stub);
                     self.element(0x8B, dst, l, dst);
-                    let item = self.item_ty(local.ty);
+                    let item = self.item_ty(list_ty);
                     self.retain(dst, item);
                     return Ok(item);
                 }
@@ -2308,8 +2694,8 @@ impl Native<'_> {
                 Ok(ty)
             }
             ExprKind::Field(base, name, name_span) => {
-                let (owned, ty) = match self.heap_var(base) {
-                    Some(local) => (false, local.ty),
+                let (owned, ty) = match self.path_ty(base) {
+                    Some(ty) => (false, ty),
                     None => (true, self.eval(base, dst)?),
                 };
                 let layout = self.fields(ty);
@@ -2317,13 +2703,12 @@ impl Native<'_> {
                     return unsupported(format!("the field `{name}` here"), *name_span);
                 };
                 let field_ty = layout[at].1;
-                let from = match self.heap_var(base) {
+                let from = if owned {
+                    self.a.mov_rr(RCX, dst);
+                    RCX
+                } else {
                     // Read in place: the variable keeps the struct alive.
-                    Some(local) => self.reg(local.loc, RCX),
-                    None => {
-                        self.a.mov_rr(RCX, dst);
-                        RCX
-                    }
+                    self.path_reg(base)
                 };
                 if field_ty != Ty::Unit {
                     self.a.load(dst, M(from, 8 + 8 * at as i32));
@@ -3153,8 +3538,8 @@ impl Native<'_> {
     fn list_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (name, args) {
             ("len", []) => {
-                if let Some(local) = self.list_var(recv) {
-                    let l = self.reg(local.loc, RCX);
+                if let Some(Ty::List(_)) = self.path_ty(recv) {
+                    let l = self.path_reg(recv);
                     self.a.load(dst, M(l, LENGTH));
                 } else {
                     let ty = self.owned_list(recv, dst)?;
@@ -3547,6 +3932,68 @@ impl Native<'_> {
         self.a.mov_imm64(RDX, bytes.len() as i64);
         self.a.mov_imm64(R8, to);
         self.call_label(self.rt_write);
+    }
+}
+
+/// Whether `test` holds for `e` or anything inside it.
+fn any_expr(e: &Expr, test: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    if test(e) {
+        return true;
+    }
+    let all = |es: &[Expr], test: &mut dyn FnMut(&Expr) -> bool| es.iter().any(|x| any_expr(x, test));
+    match &e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Unit
+        | ExprKind::Ident(_)
+        | ExprKind::FnRef(_)
+        | ExprKind::Break
+        | ExprKind::Continue
+        | ExprKind::Return(None) => false,
+        ExprKind::Str(parts) => parts.iter().any(|part| matches!(part, StrPart::Expr(x) if any_expr(x, test))),
+        ExprKind::List(items) => all(items, test),
+        ExprKind::MapLit(entries) => entries.iter().any(|(k, v)| any_expr(k, test) || any_expr(v, test)),
+        ExprKind::Unary(_, x) | ExprKind::Field(x, ..) | ExprKind::Try(x) | ExprKind::Return(Some(x)) => any_expr(x, test),
+        ExprKind::Binary(_, l, r) | ExprKind::Index(l, r) => any_expr(l, test) || any_expr(r, test),
+        ExprKind::Call { args, .. } | ExprKind::Ctor { args, .. } => all(args, test),
+        ExprKind::MethodCall { recv, args, .. } => any_expr(recv, test) || all(args, test),
+        ExprKind::StructLit { fields, .. } => fields.iter().any(|(_, _, value)| any_expr(value, test)),
+        ExprKind::If { cond, then, els } => {
+            any_expr(cond, test) || any_block(then, test) || els.as_ref().is_some_and(|x| any_expr(x, test))
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            any_expr(scrutinee, test) || arms.iter().any(|arm| any_expr(&arm.body, test))
+        }
+        ExprKind::Block(block) => any_block(block, test),
+        ExprKind::Closure { body, .. } => any_expr(body, test),
+    }
+}
+
+fn any_block(b: &Block, test: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    b.stmts.iter().any(|stmt| any_stmt(stmt, test))
+}
+
+fn any_stmt(stmt: &Stmt, test: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    match stmt {
+        Stmt::Let { value, .. } => any_expr(value, test),
+        Stmt::Assign { target, value } => any_expr(target, test) || any_expr(value, test),
+        Stmt::While { cond, body, .. } => any_expr(cond, test) || any_block(body, test),
+        Stmt::For { iter, end, body, .. } => {
+            any_expr(iter, test) || end.as_ref().is_some_and(|x| any_expr(x, test)) || any_block(body, test)
+        }
+        Stmt::Assert { cond, .. } => any_expr(cond, test),
+        Stmt::Expr(e) => any_expr(e, test),
+    }
+}
+
+/// Whether the expression `e` itself (not what is inside it) refers to the variable `name`.
+fn refers(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::Ident(n) => n == name,
+        ExprKind::Call { name: callee, local: true, .. } => callee == name,
+        ExprKind::Closure { captures, .. } => captures.iter().any(|c| c == name),
+        _ => false,
     }
 }
 
