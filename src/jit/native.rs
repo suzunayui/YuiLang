@@ -218,9 +218,11 @@ enum Stub {
     Bounds { label: usize, list: u8, index: u8, record: usize },
     /// `variable = variable.push(value)` when the item cannot be added in place.
     Push { label: usize, back: usize, variable: Loc, value: u8, list: Ty },
-    /// `variable[a] = b` when the list is shared: the variable gets a copy
-    /// of its own first. `saves` are spill slots for `a` and `b` meanwhile.
-    Unshare { label: usize, back: usize, variable: Loc, list: Ty, a: Opnd, b: Opnd, saves: [M; 2] },
+    /// A store into `variable` (through the fields at the offsets in
+    /// `fields`, with the type each holds) when something on the way is
+    /// shared: the variable gets copies of its own first. `saves` are spill
+    /// slots for `a`, `b` and the value being walked meanwhile.
+    Unshare { label: usize, back: usize, variable: Loc, root: Ty, fields: Vec<(i32, Ty)>, a: Opnd, b: Opnd, saves: [M; 3] },
 }
 
 struct Native<'a> {
@@ -1558,9 +1560,9 @@ impl Native<'_> {
                     self.store_loc(variable, RAX);
                     self.a.jmp(back);
                 }
-                Stub::Unshare { label, back, variable, list, a, b, saves } => {
+                Stub::Unshare { label, back, variable, root, fields, a, b, saves } => {
                     self.a.bind(label);
-                    // The copy is made by a call, which overwrites r8-r11.
+                    // The copies are made by calls, which overwrite r8-r11.
                     let parked: Vec<(u8, M)> = [a, b]
                         .iter()
                         .zip(saves)
@@ -1572,13 +1574,36 @@ impl Native<'_> {
                     for (r, slot) in &parked {
                         self.a.store(*slot, *r);
                     }
-                    self.load_loc(RCX, variable);
-                    let clone = self.clone_label(list);
+                    // The variable's own value: the other owners keep it as it was.
+                    let unique = self.a.label();
+                    self.load_loc(RAX, variable);
+                    self.a.cmp_imm(M(RAX, 0), 1);
+                    self.a.jcc(CC_E, unique);
+                    self.a.mov_rr(RCX, RAX);
+                    let clone = self.clone_label(root);
                     self.call_label(clone);
-                    // The other owners keep the list as it was.
                     self.load_loc(RCX, variable);
                     self.a.dec_mem(M(RCX, 0));
                     self.store_loc(variable, RAX);
+                    self.a.bind(unique);
+                    // Then each field on the way, in the value reached so far (rax).
+                    for (offset, ty) in fields {
+                        let (same, next) = (self.a.label(), self.a.label());
+                        self.a.store(saves[2], RAX);
+                        self.a.load(RCX, M(RAX, offset));
+                        self.a.cmp_imm(M(RCX, 0), 1);
+                        self.a.jcc(CC_E, same);
+                        let clone = self.clone_label(ty);
+                        self.call_label(clone);
+                        self.a.load(RDX, saves[2]);
+                        self.a.load(RCX, M(RDX, offset));
+                        self.a.dec_mem(M(RCX, 0));
+                        self.a.store(M(RDX, offset), RAX);
+                        self.a.jmp(next);
+                        self.a.bind(same);
+                        self.a.mov_rr(RAX, RCX);
+                        self.a.bind(next);
+                    }
                     for (r, slot) in &parked {
                         self.a.load(*r, *slot);
                     }
@@ -2123,6 +2148,24 @@ impl Native<'_> {
                 let limit = self.decl_loc[&(var_span.start, LIMIT)];
                 self.eval_into(iter, counter, false)?;
                 self.eval_into(end, limit, false)?;
+                // A loop that only pushes onto a list adds exactly one item
+                // per round: make room for all of them at once.
+                if let [Stmt::Assign { target, value }] = &body.stmts[..] {
+                    if let (ExprKind::Ident(list), ExprKind::MethodCall { recv, name, args, .. }) = (&target.kind, &value.kind) {
+                        let itself = matches!(&recv.kind, ExprKind::Ident(n) if n == list);
+                        let local = self.list_var(target).filter(|local| !local.borrowed);
+                        if let (true, "push", 1, Some(local)) = (itself, name.as_str(), args.len(), local) {
+                            self.load_loc(RDX, limit);
+                            match counter {
+                                Loc::Reg(r) => self.a.alu_rr(0x29, RDX, r),
+                                Loc::Stack(off) => self.a.alu_m(0x2B, RDX, M(RSP, off)),
+                            }
+                            self.load_loc(RCX, local.loc);
+                            self.call_rt("list_reserve");
+                            self.store_loc(local.loc, RAX);
+                        }
+                    }
+                }
                 let (top, next, exit) = (self.a.label(), self.a.label(), self.a.label());
                 self.a.bind(top);
                 self.load_loc(RAX, counter);
@@ -2286,54 +2329,124 @@ impl Native<'_> {
             return unsupported("assigning into a value that is only borrowed", target.span);
         }
 
-        // The usual case, `xs[i] = v` with plain items, without leaving the registers.
-        if let ([Step::Index(index, span)], Ty::List(_)) = (&steps[..], var.ty) {
-            if !self.item_ty(var.ty).heap() {
-                let t = self.take_temp(index.span)?;
-                if self.eval(index, t)? != Ty::Int {
-                    return unsupported("an index that is not an Int", index.span);
+        // The usual cases without leaving the registers: a plain value stored
+        // in an item or a field that is reached through fields only
+        // (`xs[i] = v`, `p.x = v`, `state.cells[i] = v`).
+        let mut fields = Vec::new();
+        let mut holder = var.ty;
+        let mut quick = true;
+        for step in &steps[..steps.len() - 1] {
+            let found = match step {
+                Step::Field(name, _) => self.fields(holder).into_iter().position(|(field, _)| field == *name),
+                Step::Index(..) => None,
+            };
+            match found {
+                Some(i) => {
+                    let inner = self.fields(holder)[i].1;
+                    fields.push((8 + 8 * i as i32, inner));
+                    holder = inner;
                 }
-                let (a, b, _, temp, spilled) = self.operands(t, value)?;
-                let saves = [self.push_spill(), self.push_spill()];
-                let (unshare, back) = (self.a.label(), self.a.label());
-                self.stubs.push(Stub::Unshare { label: unshare, back, variable: var.loc, list: var.ty, a, b, saves });
-                self.a.bind(back);
-                let l = self.reg(var.loc, RCX);
+                None => {
+                    quick = false;
+                    break;
+                }
+            }
+        }
+        // Where the value goes in the last holder: an item, or a field at an offset.
+        let place = match steps.last() {
+            Some(Step::Index(index, span)) if quick && matches!(holder, Ty::List(_)) => {
+                Some((self.item_ty(holder), Some((*index, *span)), 0))
+            }
+            Some(Step::Field(name, _)) if quick => self
+                .fields(holder)
+                .iter()
+                .position(|(field, _)| field == *name)
+                .map(|i| (self.fields(holder)[i].1, None, 8 + 8 * i as i32)),
+            _ => None,
+        };
+        if let Some((place_ty, index, offset)) = place.filter(|(ty, ..)| !ty.heap() && *ty != Ty::Unit) {
+            let _ = place_ty;
+            let t = self.take_temp(target.span)?;
+            let (a, b, temp, spilled) = match index {
+                Some((index, _)) => {
+                    if self.eval(index, t)? != Ty::Int {
+                        return unsupported("an index that is not an Int", index.span);
+                    }
+                    let (a, b, _, temp, spilled) = self.operands(t, value)?;
+                    (a, b, temp, spilled)
+                }
+                None => {
+                    self.eval(value, t)?;
+                    (Opnd::Imm(0), Opnd::Reg(t), None, false)
+                }
+            };
+            let saves = [self.push_spill(), self.push_spill(), self.push_spill()];
+            let (unshare, back) = (self.a.label(), self.a.label());
+            self.stubs.push(Stub::Unshare {
+                label: unshare,
+                back,
+                variable: var.loc,
+                root: var.ty,
+                fields: fields.clone(),
+                a,
+                b,
+                saves,
+            });
+            self.a.bind(back);
+            // Every value on the way must be the variable's alone.
+            let mut l = self.reg(var.loc, RCX);
+            self.a.cmp_imm(M(l, 0), 1);
+            self.a.jcc(CC_NE, unshare);
+            for (offset, _) in &fields {
+                self.a.load(RCX, M(l, *offset));
+                l = RCX;
                 self.a.cmp_imm(M(l, 0), 1);
                 self.a.jcc(CC_NE, unshare);
-                // The index and the value are used from where they are when
-                // they are already in registers.
-                let at = match a {
-                    Opnd::Reg(r) => r,
-                    _ => {
-                        self.load_opnd(RAX, a);
-                        RAX
-                    }
-                };
-                let stub = self.bounds_stub(l, at, *span);
-                self.a.alu_m(0x3B, at, M(l, LENGTH));
-                self.a.jcc(CC_AE, stub);
-                match b {
-                    Opnd::Reg(r) => self.element(0x89, r, l, at),
-                    Opnd::Imm(n) => {
-                        // mov qword [l + at * 8 + ELEMENTS], n
-                        self.a.b(0x48 | (at >> 3) << 1 | (l >> 3));
-                        self.a.b(0xC7);
-                        self.a.b(0x44);
-                        self.a.b(0xC0 | (at & 7) << 3 | (l & 7));
-                        self.a.b(ELEMENTS as u8);
-                        self.a.d32(n);
-                    }
-                    Opnd::Mem(_) => {
-                        self.load_opnd(RDX, b);
-                        self.element(0x89, RDX, l, at);
+            }
+            match index {
+                Some((_, span)) => {
+                    // The index and the value are used from where they are
+                    // when they are already in registers.
+                    let at = match a {
+                        Opnd::Reg(r) => r,
+                        _ => {
+                            self.load_opnd(RAX, a);
+                            RAX
+                        }
+                    };
+                    let stub = self.bounds_stub(l, at, span);
+                    self.a.alu_m(0x3B, at, M(l, LENGTH));
+                    self.a.jcc(CC_AE, stub);
+                    match b {
+                        Opnd::Reg(r) => self.element(0x89, r, l, at),
+                        Opnd::Imm(n) => {
+                            // mov qword [l + at * 8 + ELEMENTS], n
+                            self.a.b(0x48 | (at >> 3) << 1 | (l >> 3));
+                            self.a.b(0xC7);
+                            self.a.b(0x44);
+                            self.a.b(0xC0 | (at & 7) << 3 | (l & 7));
+                            self.a.b(ELEMENTS as u8);
+                            self.a.d32(n);
+                        }
+                        Opnd::Mem(_) => {
+                            self.load_opnd(RDX, b);
+                            self.element(0x89, RDX, l, at);
+                        }
                     }
                 }
-                self.spill_depth -= 2;
-                self.release(temp, spilled);
-                self.free.push(t);
-                return Ok(());
+                None => match b {
+                    Opnd::Reg(r) => self.a.store(M(l, offset), r),
+                    Opnd::Imm(n) => self.a.store_imm(M(l, offset), n),
+                    Opnd::Mem(_) => {
+                        self.load_opnd(RDX, b);
+                        self.a.store(M(l, offset), RDX);
+                    }
+                },
             }
+            self.spill_depth -= 3;
+            self.release(temp, spilled);
+            self.free.push(t);
+            return Ok(());
         }
 
         // In general: the indexes and the value are computed and parked,

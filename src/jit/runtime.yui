@@ -60,6 +60,18 @@ fn list_push(list: Int, value: Int) -> Int {
   copy
 }
 
+// あと extra 個入るように容量を広げて返す（移動するかもしれない）。
+// 持ち主が 1 人のときだけ。共有されているリストは、追加のときに複製されるのでそのまま返す
+fn list_reserve(list: Int, extra: Int) -> Int {
+  if extra <= 0 { return list }
+  if __load(list) != 1 { return list }
+  let needed = __load(list + 8) + extra
+  if needed <= __load(list + 16) { return list }
+  let grown = __realloc(list, 24 + needed * 8)
+  __store(grown + 16, needed)
+  grown
+}
+
 // 文字列の形: 先頭から [参照カウント][バイト数][容量][UTF-8 のバイト列]。
 // 参照カウントが負のものはプログラムに埋め込まれた定数で、解放も書き換えもしない
 
