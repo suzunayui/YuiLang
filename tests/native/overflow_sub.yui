@@ -1,0 +1,7 @@
+fn lower(a: Int, b: Int) -> Int {
+  a - b
+}
+
+fn main() uses io {
+  print("{lower(0 - 9223372036854775807, 5)}")
+}

@@ -1,0 +1,8 @@
+fn remainder(a: Int, b: Int) -> Int {
+  a % b
+}
+
+fn main() uses io {
+  let smallest = 0 - 9223372036854775807 - 1
+  print("{remainder(smallest, 0 - 1)}")
+}

@@ -305,3 +305,47 @@ fn selfhosted_parser_matches_the_rust_parser() {
         assert!(errors >= 3, "only {errors} files with syntax errors were compared");
     });
 }
+
+/// `yui build --native` must produce executables that behave exactly like
+/// `yui run`: same output, same error text, same exit code.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn native_executables_match_yui_run() {
+    use std::process::Command;
+    let yui = env!("CARGO_BIN_EXE_yui");
+    let dir = root().join("tests/native");
+    let out_dir = std::env::temp_dir().join(format!("yuilang_native_{}", std::process::id()));
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let mut failures = 0;
+    for path in yui_files("tests/native") {
+        let name = path.file_name().unwrap();
+        let exe = out_dir.join(path.file_stem().unwrap()).with_extension("exe");
+        // Both run from the program's directory, so error messages name the file the same way.
+        let expected = Command::new(yui).current_dir(&dir).arg("run").arg(name).output().unwrap();
+        let built = Command::new(yui).current_dir(&dir).args(["build", "--native"]).arg(name).arg("-o").arg(&exe).output().unwrap();
+        assert!(built.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&built.stderr));
+        let actual = Command::new(&exe).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout), "{}", path.display());
+        assert_eq!(String::from_utf8_lossy(&actual.stderr), String::from_utf8_lossy(&expected.stderr), "{}", path.display());
+        assert_eq!(actual.status.code(), expected.status.code(), "{}", path.display());
+        // No interpreter inside: these programs are a few kilobytes, most of it
+        // the text of error messages.
+        assert!(std::fs::metadata(&exe).unwrap().len() < 64 * 1024, "{}", path.display());
+        failures += (expected.status.code() != Some(0)) as usize;
+    }
+    assert!(failures >= 5, "only {failures} failing programs were compared");
+
+    // A program outside the supported part of the language is refused, not miscompiled.
+    let refused = out_dir.join("refused.exe");
+    let result = Command::new(yui)
+        .args(["build", "--native"])
+        .arg(root().join("examples/hello.yui"))
+        .arg("-o")
+        .arg(&refused)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("E0902"));
+    assert!(!refused.exists());
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

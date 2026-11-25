@@ -26,6 +26,8 @@ Usage:
   yui test    <file> [--json]         run the `test` blocks of a file
   yui fmt     <file> [--check]        format a file in place (--check: only report)
   yui build   <file> [-o <output>]    make a stand-alone executable of the program
+              [--native]              (experimental) compile to machine code, without
+                                      the interpreter; Windows x64, Int and Bool only
   yui outline <file>                  print declarations without bodies
   yui --version                       print the version
 
@@ -57,6 +59,7 @@ struct Options {
     check: bool,
     root: Option<String>,
     out: Option<String>,
+    native: bool,
     program_args: Vec<String>,
 }
 
@@ -154,9 +157,52 @@ fn run_embedded(units: Vec<SourceUnit>) -> i32 {
     }
 }
 
+/// `yui build --native`: compiles the program to machine code and writes an
+/// executable that contains no interpreter. Only part of the language is
+/// supported so far; see `docs/native-backend.md`.
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
+    let source = Path::new(&opts.file);
+    let name = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "main.yui".to_string());
+    // Runtime errors name the file relative to the program, as in a bundled build.
+    let sources = SourceMap::single(&name, &loaded.units[0].text);
+    let bytes = match yuilang::jit::native::build(&loaded.program, &sources) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            let d = Diagnostic::new(
+                "E0902",
+                format!("the native compiler does not support {} yet", reason.what),
+                reason.span,
+            )
+            .hint("build without `--native` to bundle the interpreter instead");
+            eprintln!("{}", render_human(&d, &loaded.sources));
+            return 1;
+        }
+    };
+    let out = match &opts.out {
+        Some(out) => out.clone(),
+        None => source.with_extension(std::env::consts::EXE_EXTENSION).to_string_lossy().to_string(),
+    };
+    if let Err(e) = std::fs::write(&out, &bytes) {
+        eprintln!("cannot write `{}`: {e}", out.replace('\\', "/"));
+        return 2;
+    }
+    println!("built: {} ({} bytes, native)", out.replace('\\', "/"), bytes.len());
+    0
+}
+
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+fn build_native(_loaded: &yuilang::Loaded, _opts: &Options) -> i32 {
+    eprintln!("`--native` is only available on Windows x64 so far");
+    1
+}
+
 /// Writes a copy of this executable with the program appended.
 fn build(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
     use std::io::Write;
+    if opts.native {
+        return build_native(loaded, opts);
+    }
     let source = Path::new(&opts.file);
     // Store file names relative to the program, not as paths on this machine.
     let units: Vec<SourceUnit> = loaded
@@ -203,6 +249,7 @@ fn parse_args() -> Option<Options> {
         check: false,
         root: None,
         out: None,
+        native: false,
         program_args: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -211,6 +258,7 @@ fn parse_args() -> Option<Options> {
             "--check" => opts.check = true,
             "--root" => opts.root = Some(args.next()?),
             "-o" | "--output" => opts.out = Some(args.next()?),
+            "--native" => opts.native = true,
             "--" => {
                 opts.program_args = args.collect();
                 break;

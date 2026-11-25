@@ -1,0 +1,10 @@
+fn main() uses io {
+  let mut x = 9223372036854775800
+  let mut i = 0
+  print("start")
+  while i < 100 {
+    x = x + i
+    i = i + 1
+  }
+  print("{x}")
+}

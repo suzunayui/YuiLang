@@ -32,6 +32,10 @@
 use crate::ast::BinOp;
 use crate::bytecode::{Func, InPlace, Op, NONE};
 
+/// Ahead-of-time compilation to an executable file, built on the same assembler.
+#[cfg(windows)]
+pub mod native;
+
 /// Size of a `Value` in bytes.
 pub const VALUE_SIZE: usize = 24;
 /// Discriminants of the plain values the generated code handles itself.

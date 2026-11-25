@@ -1,0 +1,7 @@
+fn main() uses io {
+  let mut x = 3
+  for i in 0..100 {
+    x = x * 3 + i
+  }
+  print("{x}")
+}

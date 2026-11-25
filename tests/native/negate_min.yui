@@ -1,0 +1,5 @@
+fn main() uses io {
+  let smallest = 0 - 9223372036854775807 - 1
+  print("{smallest}")
+  print("{-smallest}")
+}

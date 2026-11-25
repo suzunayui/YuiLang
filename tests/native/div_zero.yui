@@ -1,0 +1,8 @@
+fn divide(a: Int, b: Int) -> Int {
+  a / b
+}
+
+fn main() uses io {
+  print("{divide(6, 3)}")
+  print("{divide(1, 0)}")
+}
