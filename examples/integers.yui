@@ -195,3 +195,17 @@ test "bits and character codes" {
   assert 12354.to_char() == "あ"
   assert "abc".codes().map(|c| (c + 1).to_char()).join("") == "bcd"
 }
+
+test "character literals" {
+  assert 'a' == 97
+  assert '\n' == 10
+  assert '\'' == 39
+  assert '"' == 34
+  assert 'あ' == 12354
+  assert "az".codes() == ['a', 'z']
+  let kind = match "x".codes()[0] {
+    'x' => "ex"
+    _ => "other"
+  }
+  assert kind == "ex"
+}

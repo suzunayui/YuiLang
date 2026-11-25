@@ -250,6 +250,34 @@ pub fn lex_full(src: &str, base: usize) -> Result<(Vec<Token>, Vec<Span>), Diagn
             let (parts, next) = lex_string(src, i, base)?;
             i = next;
             Tok::Str(parts)
+        } else if c == b'\'' {
+            // A character literal is an Int: the code of the character.
+            let invalid = || {
+                Diagnostic::new("E0006", "invalid character literal", Span::new(base + i, base + i + 1))
+                    .hint("write one character between single quotes, e.g. 'a', '\\n' or '\\''")
+            };
+            let mut rest = src[i + 1..].chars();
+            let (value, len) = match rest.next() {
+                Some('\\') => {
+                    let value = match rest.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some('\\') => '\\',
+                        Some('\'') => '\'',
+                        Some('"') => '"',
+                        _ => return Err(invalid()),
+                    };
+                    (value, 2)
+                }
+                Some(ch) if ch != '\'' && ch != '\n' => (ch, ch.len_utf8()),
+                _ => return Err(invalid()),
+            };
+            if !src[i + 1 + len..].starts_with('\'') {
+                return Err(invalid());
+            }
+            i += len + 2;
+            Tok::Int(value as i64)
         } else {
             let two = if i + 1 < b.len() { &b[i..i + 2] } else { &b[i..i + 1] };
             let (tok, len) = match two {
@@ -336,6 +364,7 @@ pub fn dump(src: &str) -> Vec<String> {
         let mark = if t.nl_before { '+' } else { ' ' };
         let raw = &src[t.span.start..t.span.end];
         let body = match &t.tok {
+            Tok::Int(_) if raw.starts_with('\'') => format!("int {raw}"),
             Tok::Int(_) => format!("int {}", raw.replace('_', "")),
             Tok::Float(_) => format!("float {}", raw.replace('_', "")),
             Tok::Ident(name) => format!("ident {name}"),
