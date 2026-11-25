@@ -21,3 +21,6 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+# An internal error ends the process at once instead of unwinding. This drops
+# the unwinding tables, about a third of the executable, at no cost in speed.
+panic = "abort"

@@ -80,7 +80,7 @@ x86-64（Windows / Linux / Intel Mac）では、プログラムを機械語に�
 
 ```
 $ yui build examples/hello.yui -o hello
-built: hello (1330 KB)
+built: hello (914 KB)
 
 $ ./hello
 result: 5
