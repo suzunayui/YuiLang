@@ -1,0 +1,24 @@
+// YuiLang の基本: 関数、Result、match、テスト、副作用の宣言
+
+fn divide(a: Int, b: Int) -> Result<Int, String> {
+  if b == 0 {
+    return Err("division by zero")
+  }
+  Ok(a / b)
+}
+
+test "divide" {
+  assert divide(6, 2) == Ok(3)
+  assert divide(1, 0) == Err("division by zero")
+}
+
+fn main() uses io {
+  match divide(10, 2) {
+    Ok(v) => print("result: {v}")
+    Err(e) => print("error: {e}")
+  }
+  match divide(1, 0) {
+    Ok(v) => print("result: {v}")
+    Err(e) => print("error: {e}")
+  }
+}

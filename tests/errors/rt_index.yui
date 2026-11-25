@@ -1,0 +1,5 @@
+// expect: E0505
+test "index" {
+  let xs = [1, 2, 3]
+  assert xs[3] == 0
+}

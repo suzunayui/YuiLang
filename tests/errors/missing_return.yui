@@ -1,0 +1,4 @@
+// expect: E0301
+fn f(n: Int) -> Int {
+  let x = n + 1
+}

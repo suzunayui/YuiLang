@@ -1,0 +1,4 @@
+// expect: E0310
+fn f(s: String) -> Int {
+  s.to_int()?
+}

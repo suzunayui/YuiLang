@@ -1,0 +1,17 @@
+[package]
+name = "yuilang"
+version = "0.1.0"
+edition = "2021"
+description = "YuiLang: a programming language designed for AI-driven development"
+license = "MIT"
+repository = "https://github.com/suzunayui/YuiLang"
+
+[lib]
+name = "yuilang"
+path = "src/lib.rs"
+
+[[bin]]
+name = "yui"
+path = "src/main.rs"
+
+[dependencies]

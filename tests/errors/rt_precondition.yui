@@ -1,0 +1,9 @@
+// expect: E0502
+fn half(n: Int) -> Int
+  requires n % 2 == 0
+{
+  n / 2
+}
+test "odd" {
+  assert half(3) == 1
+}

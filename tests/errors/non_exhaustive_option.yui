@@ -1,0 +1,7 @@
+// expect: E0308
+fn f(x: Option<Bool>) -> Int {
+  match x {
+    Some(true) => 1
+    None => 0
+  }
+}

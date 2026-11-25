@@ -1,0 +1,4 @@
+// expect: E0501
+test "fails" {
+  assert 1 + 1 == 3
+}

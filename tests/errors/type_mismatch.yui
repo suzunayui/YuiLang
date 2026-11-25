@@ -1,0 +1,5 @@
+// expect: E0301
+fn f() -> Int {
+  let x: Int = 1.5
+  x
+}

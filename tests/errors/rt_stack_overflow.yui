@@ -1,0 +1,7 @@
+// expect: E0506
+fn forever(n: Int) -> Int {
+  forever(n + 1)
+}
+test "recursion" {
+  assert forever(0) == 0
+}

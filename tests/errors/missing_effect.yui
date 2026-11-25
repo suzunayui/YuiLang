@@ -1,0 +1,4 @@
+// expect: E0401
+fn greet() {
+  print("hi")
+}

@@ -1,0 +1,5 @@
+// expect: E0312
+struct Point { x: Int, y: Int }
+fn f() -> Point {
+  Point { x: 1 }
+}

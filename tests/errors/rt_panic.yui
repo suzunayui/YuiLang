@@ -1,0 +1,4 @@
+// expect: E0500
+fn main() {
+  panic("boom")
+}

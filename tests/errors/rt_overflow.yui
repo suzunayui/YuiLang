@@ -1,0 +1,5 @@
+// expect: E0503
+test "overflow" {
+  let big = 9223372036854775807
+  assert big + 1 > 0
+}

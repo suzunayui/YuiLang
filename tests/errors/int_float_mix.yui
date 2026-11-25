@@ -1,0 +1,4 @@
+// expect: E0301
+fn f(a: Int, b: Float) -> Float {
+  a + b
+}

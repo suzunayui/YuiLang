@@ -1,0 +1,5 @@
+// expect: E0305
+fn main() {
+  let xs = [1]
+  xs.push(2)
+}

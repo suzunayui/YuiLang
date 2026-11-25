@@ -1,0 +1,4 @@
+// expect: E0302
+fn f(a: String, b: String) -> String {
+  a + b
+}

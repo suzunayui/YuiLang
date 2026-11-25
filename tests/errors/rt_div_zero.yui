@@ -1,0 +1,7 @@
+// expect: E0504
+fn div(a: Int, b: Int) -> Int {
+  a / b
+}
+test "zero" {
+  assert div(1, 0) == 0
+}

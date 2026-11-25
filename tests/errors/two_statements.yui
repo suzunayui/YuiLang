@@ -1,0 +1,4 @@
+// expect: E0103
+fn f() {
+  let x = 1 let y = 2
+}

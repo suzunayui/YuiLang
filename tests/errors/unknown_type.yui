@@ -1,0 +1,3 @@
+// expect: E0202
+fn f(x: Strng) {
+}

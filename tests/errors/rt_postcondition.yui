@@ -1,0 +1,9 @@
+// expect: E0502
+fn abs(n: Int) -> Int
+  ensures result >= 0
+{
+  n
+}
+test "negative" {
+  assert abs(-1) == 1
+}

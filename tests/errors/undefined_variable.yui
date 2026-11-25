@@ -1,0 +1,5 @@
+// expect: E0203
+fn f() -> Int {
+  let total = 1
+  totl
+}
