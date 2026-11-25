@@ -54,6 +54,7 @@ yui check   <file> [--json]              型チェック（import したモジ�
 yui run     <file> [--json] [-- 引数...]  main を実行
 yui test    <file> [--json]              test ブロックを実行
 yui fmt     <file> [--check]             整形して上書き
+yui build   <file> [-o <出力>]            単体の実行ファイルを作る
 yui outline <file>                       宣言のシグネチャだけを表示
 vvv
 
@@ -74,6 +75,17 @@ vvv
 x86-64（Windows / Linux / Intel Mac）では、プログラムを機械語に変換して実行します（JIT）。
 コード生成は自前で、外部のコンパイラやライブラリは使いません。それ以外の CPU ではバイトコードの
 仮想マシンで実行します。環境変数 `YUI_JIT=0` を設定すると、x86-64 でも仮想マシンで実行します。
+
+プログラムは単体の実行ファイルにできます。`yui` を入れていない環境にも、この1ファイルだけで配れます。
+
+```
+$ yui build examples/hello.yui -o hello
+built: hello (1330 KB)
+
+$ ./hello
+result: 5
+error: division by zero
+```
 
 エラーは修正のヒント付きで表示されます。
 

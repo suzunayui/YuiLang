@@ -19,6 +19,18 @@ use std::path::{Path, PathBuf};
 pub struct Loaded {
     pub program: ast::Program,
     pub sources: SourceMap,
+    /// Every source file of the program, the entry file first.
+    pub units: Vec<SourceUnit>,
+}
+
+/// One source file of a program.
+#[derive(Clone)]
+pub struct SourceUnit {
+    /// Dotted module path; empty for the entry file.
+    pub module: String,
+    /// File name shown in diagnostics.
+    pub name: String,
+    pub text: String,
 }
 
 pub type LoadError = (Vec<Diagnostic>, SourceMap);
@@ -34,47 +46,78 @@ pub fn load_path(path: &Path, root: Option<&Path>) -> Result<Loaded, LoadError> 
             return Err((vec![d], SourceMap::single(&name, "")));
         }
     };
-    let root = match root {
+    let root: PathBuf = match root {
         Some(r) => r.to_path_buf(),
         None => path.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
-    load(&name, &src, &root, Some(path))
+    let entry = path.canonicalize().ok();
+    load(&name, &src, &|module, span| read_module(&root, entry.as_deref(), module, span))
 }
 
 /// Loads a program from a string. Imports are resolved relative to the current directory.
 pub fn load_str(src: &str) -> Result<Loaded, LoadError> {
-    load("main.yui", src, Path::new("."), None)
+    load("main.yui", src, &|module, span| read_module(Path::new("."), None, module, span))
 }
 
-fn load(name: &str, src: &str, root: &Path, entry: Option<&Path>) -> Result<Loaded, LoadError> {
+/// Loads a program from source files held in memory, as stored in an
+/// executable made by `yui build`. The first unit is the entry file.
+pub fn load_units(units: &[SourceUnit]) -> Result<Loaded, LoadError> {
+    let Some(entry) = units.first() else {
+        let d = Diagnostic::new("E0208", "the program contains no source files", Span::new(0, 0));
+        return Err((vec![d], SourceMap::default()));
+    };
+    load(&entry.name, &entry.text, &|module, span| {
+        units
+            .iter()
+            .find(|u| u.module == module)
+            .map(|u| (u.name.clone(), u.text.clone()))
+            .ok_or_else(|| Diagnostic::new("E0208", format!("cannot find module `{module}`"), span))
+    })
+}
+
+/// Reads the file of a module below `root`. Returns its display name and text.
+fn read_module(root: &Path, entry: Option<&Path>, module: &str, span: Span) -> Result<(String, String), Diagnostic> {
+    let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("yui");
+    let file = root.join(&relative);
+    let display = file.to_string_lossy().to_string();
+    if entry.is_some() && file.canonicalize().ok().as_deref() == entry {
+        return Err(Diagnostic::new(
+            "E0208",
+            format!("module `{module}` is the entry file and cannot be imported"),
+            span,
+        ));
+    }
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Ok((display, text)),
+        Err(_) => Err(Diagnostic::new("E0208", format!("cannot find module `{module}`"), span)
+            .hint(format!("expected the file `{}`", display.replace('\\', "/")))),
+    }
+}
+
+/// Parses the entry file and, through `read`, every module it imports
+/// (directly or not), then type-checks the whole program.
+fn load(
+    name: &str,
+    src: &str,
+    read: &dyn Fn(&str, Span) -> Result<(String, String), Diagnostic>,
+) -> Result<Loaded, LoadError> {
     let mut sources = SourceMap::default();
     let base = sources.add(name, src);
+    let mut units = vec![SourceUnit { module: String::new(), name: name.to_string(), text: src.to_string() }];
     let mut program = match parser::parse_file(src, base, "", true) {
         Ok(p) => p,
         Err(d) => return Err((vec![d], sources)),
     };
 
-    let entry = entry.and_then(|p| p.canonicalize().ok());
     let mut loaded: HashSet<String> = HashSet::new();
     let mut queue: Vec<(String, Span)> = program.imports.iter().map(|i| (i.path.clone(), i.span)).collect();
     while let Some((module, span)) = queue.pop() {
         if !loaded.insert(module.clone()) {
             continue;
         }
-        let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("yui");
-        let file = root.join(&relative);
-        let display = file.to_string_lossy().to_string();
-        if entry.is_some() && file.canonicalize().ok() == entry {
-            let d = Diagnostic::new("E0208", format!("module `{module}` is the entry file and cannot be imported"), span);
-            return Err((vec![d], sources));
-        }
-        let text = match std::fs::read_to_string(&file) {
-            Ok(t) => t,
-            Err(_) => {
-                let d = Diagnostic::new("E0208", format!("cannot find module `{module}`"), span)
-                    .hint(format!("expected the file `{}`", display.replace('\\', "/")));
-                return Err((vec![d], sources));
-            }
+        let (display, text) = match read(&module, span) {
+            Ok(found) => found,
+            Err(d) => return Err((vec![d], sources)),
         };
         let base = sources.add(&display, &text);
         match parser::parse_file(&text, base, &module, true) {
@@ -84,17 +127,17 @@ fn load(name: &str, src: &str, root: &Path, entry: Option<&Path>) -> Result<Load
             }
             Err(d) => return Err((vec![d], sources)),
         }
+        units.push(SourceUnit { module, name: display, text });
     }
 
     let (diags, types) = checker::check(&program);
     program.types = types;
     if diags.is_empty() {
-        Ok(Loaded { program, sources })
+        Ok(Loaded { program, sources, units })
     } else {
         Err((diags, sources))
     }
 }
-
 /// Checks that the program has a `main` function that `yui run` can call.
 pub fn check_main(program: &ast::Program) -> Result<(), Diagnostic> {
     for item in &program.items {

@@ -4,6 +4,7 @@ use std::path::Path;
 use yuilang::ast::Item;
 use yuilang::diag::{json_str, render_human, render_json, Diagnostic, SourceMap};
 use yuilang::interp::Interp;
+use yuilang::SourceUnit;
 
 /// Version as `YYYY.MMDD.N`: release year, month and day, and a serial number
 /// for that day. Cargo does not allow leading zeros, so the month-day part is
@@ -24,6 +25,7 @@ Usage:
                                       run `main`; arguments after `--` are returned by args()
   yui test    <file> [--json]         run the `test` blocks of a file
   yui fmt     <file> [--check]        format a file in place (--check: only report)
+  yui build   <file> [-o <output>]    make a stand-alone executable of the program
   yui outline <file>                  print declarations without bodies
   yui --version                       print the version
 
@@ -54,7 +56,141 @@ struct Options {
     json: bool,
     check: bool,
     root: Option<String>,
+    out: Option<String>,
     program_args: Vec<String>,
+}
+
+/// Marks the end of an executable made by `yui build`. Such a file is a copy
+/// of `yui` followed by the program's sources, their length and this marker.
+const BUNDLE_MAGIC: &[u8; 8] = b"YUIBNDL1";
+
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    out.extend((s.len() as u32).to_le_bytes());
+    out.extend(s.as_bytes());
+}
+
+fn encode_units(units: &[SourceUnit]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend((units.len() as u32).to_le_bytes());
+    for unit in units {
+        put_str(&mut out, &unit.module);
+        put_str(&mut out, &unit.name);
+        put_str(&mut out, &unit.text);
+    }
+    let len = out.len() as u64;
+    out.extend(len.to_le_bytes());
+    out.extend(BUNDLE_MAGIC);
+    out
+}
+
+fn decode_units(mut bytes: &[u8]) -> Option<Vec<SourceUnit>> {
+    fn take<'b>(bytes: &mut &'b [u8], n: usize) -> Option<&'b [u8]> {
+        if bytes.len() < n {
+            return None;
+        }
+        let (head, rest) = bytes.split_at(n);
+        *bytes = rest;
+        Some(head)
+    }
+    fn number(bytes: &mut &[u8]) -> Option<usize> {
+        Some(u32::from_le_bytes(take(bytes, 4)?.try_into().ok()?) as usize)
+    }
+    fn text(bytes: &mut &[u8]) -> Option<String> {
+        let len = number(bytes)?;
+        String::from_utf8(take(bytes, len)?.to_vec()).ok()
+    }
+    let count = number(&mut bytes)?;
+    let mut units = Vec::new();
+    for _ in 0..count {
+        units.push(SourceUnit { module: text(&mut bytes)?, name: text(&mut bytes)?, text: text(&mut bytes)? });
+    }
+    Some(units)
+}
+
+/// The program stored at the end of this executable, if it was made by `yui build`.
+fn embedded_units() -> Option<Vec<SourceUnit>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
+    let size = file.metadata().ok()?.len();
+    if size < 16 {
+        return None;
+    }
+    let mut trailer = [0u8; 16];
+    file.seek(SeekFrom::Start(size - 16)).ok()?;
+    file.read_exact(&mut trailer).ok()?;
+    if &trailer[8..] != BUNDLE_MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(trailer[..8].try_into().ok()?);
+    if len > size - 16 {
+        return None;
+    }
+    let mut payload = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(size - 16 - len)).ok()?;
+    file.read_exact(&mut payload).ok()?;
+    decode_units(&payload)
+}
+
+/// Runs the program stored in this executable. Every command line argument
+/// belongs to the program.
+fn run_embedded(units: Vec<SourceUnit>) -> i32 {
+    let loaded = match yuilang::load_units(&units) {
+        Ok(l) => l,
+        Err((diags, sources)) => {
+            for d in &diags {
+                eprintln!("{}", render_human(d, &sources));
+            }
+            return 1;
+        }
+    };
+    let mut interp = Interp::new(&loaded.program, &loaded.sources.text);
+    interp.args = std::env::args().skip(1).collect();
+    match interp.run_main() {
+        Ok(()) => 0,
+        Err(d) => {
+            eprintln!("{}", render_human(&d, &loaded.sources));
+            1
+        }
+    }
+}
+
+/// Writes a copy of this executable with the program appended.
+fn build(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
+    use std::io::Write;
+    let source = Path::new(&opts.file);
+    // Store file names relative to the program, not as paths on this machine.
+    let units: Vec<SourceUnit> = loaded
+        .units
+        .iter()
+        .map(|unit| SourceUnit {
+            module: unit.module.clone(),
+            name: if unit.module.is_empty() {
+                source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "main.yui".to_string())
+            } else {
+                format!("{}.yui", unit.module.replace('.', "/"))
+            },
+            text: unit.text.clone(),
+        })
+        .collect();
+    let out = match &opts.out {
+        Some(out) => out.clone(),
+        None => source.with_extension(std::env::consts::EXE_EXTENSION).to_string_lossy().to_string(),
+    };
+    let written = std::env::current_exe()
+        .and_then(|exe| std::fs::copy(exe, &out))
+        .and_then(|_| std::fs::OpenOptions::new().append(true).open(&out))
+        .and_then(|mut file| file.write_all(&encode_units(&units)));
+    if let Err(e) = written {
+        eprintln!("cannot write `{}`: {e}", out.replace('\\', "/"));
+        return 2;
+    }
+    // Apple Silicon only runs signed code, and appending data invalidates the
+    // signature the linker made. Re-sign ad hoc; ignore a missing `codesign`.
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("codesign").args(["--force", "--sign", "-", &out]).output();
+    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!("built: {} ({} KB)", out.replace('\\', "/"), size / 1024);
+    0
 }
 
 fn parse_args() -> Option<Options> {
@@ -66,6 +202,7 @@ fn parse_args() -> Option<Options> {
         json: false,
         check: false,
         root: None,
+        out: None,
         program_args: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -73,6 +210,7 @@ fn parse_args() -> Option<Options> {
             "--json" => opts.json = true,
             "--check" => opts.check = true,
             "--root" => opts.root = Some(args.next()?),
+            "-o" | "--output" => opts.out = Some(args.next()?),
             "--" => {
                 opts.program_args = args.collect();
                 break;
@@ -93,6 +231,9 @@ fn parse_args() -> Option<Options> {
 }
 
 fn real_main() -> i32 {
+    if let Some(units) = embedded_units() {
+        return run_embedded(units);
+    }
     if std::env::args().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("yui {}", version());
         return 0;
@@ -103,7 +244,7 @@ fn real_main() -> i32 {
     };
     let json = opts.json;
     match opts.cmd.as_str() {
-        "check" | "run" | "test" | "outline" => {}
+        "check" | "run" | "test" | "outline" | "build" => {}
         "fmt" => return format_file(&opts),
         other => {
             eprintln!("unknown command `{other}`\n");
@@ -154,6 +295,13 @@ fn real_main() -> i32 {
         "outline" => {
             print!("{}", yuilang::outline(&loaded));
             0
+        }
+        "build" => {
+            if let Err(d) = yuilang::check_main(&loaded.program) {
+                report(&[d], sources, true);
+                return 1;
+            }
+            build(&loaded, &opts)
         }
         "run" => {
             if let Err(d) = yuilang::check_main(&loaded.program) {

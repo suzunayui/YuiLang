@@ -194,3 +194,38 @@ fn jit_is_used_on_x86_64() {
     let interp = Interp::new(&loaded.program, &loaded.sources.text);
     assert!(interp.jit, "machine code generation is unavailable");
 }
+
+/// `yui build` makes one file that runs anywhere, with no source files or
+/// `yui` beside it.
+#[test]
+fn build_makes_a_standalone_executable() {
+    use std::process::Command;
+    let yui = env!("CARGO_BIN_EXE_yui");
+    let source = root().join("examples/modules/main.yui");
+    let dir = std::env::temp_dir().join(format!("yuilang_build_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join(format!("shapes{}", std::env::consts::EXE_SUFFIX));
+
+    let built = Command::new(yui).arg("build").arg(&source).arg("-o").arg(&out).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let expected = Command::new(yui).arg("run").arg(&source).output().unwrap();
+    assert!(expected.status.success() && !expected.stdout.is_empty());
+
+    // Run it from another directory, where no source file can be found.
+    let actual = Command::new(&out).current_dir(&dir).output().unwrap();
+    assert!(actual.status.success(), "{}", String::from_utf8_lossy(&actual.stderr));
+    assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout));
+
+    // A program that does not type-check produces no executable.
+    let bad = dir.join(format!("bad{}", std::env::consts::EXE_SUFFIX));
+    let failed = Command::new(yui)
+        .arg("build")
+        .arg(root().join("tests/errors/type_mismatch.yui"))
+        .arg("-o")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(!bad.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
