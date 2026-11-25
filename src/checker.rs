@@ -1453,6 +1453,7 @@ impl Checker {
             (Type::Str, "replace") => Some((vec![Type::Str, Type::Str], Type::Str)),
             (Type::Str, "split") => Some((vec![Type::Str], list(&Type::Str))),
             (Type::Str, "chars") => Some((vec![], list(&Type::Str))),
+            (Type::Str, "codes") => Some((vec![], list(&Type::Int))),
             (Type::Str, "slice") => Some((vec![Type::Int, Type::Int], Type::Str)),
             (Type::Str, "to_int") => Some((vec![], option(&Type::Int))),
             (Type::Str, "to_float") => Some((vec![], option(&Type::Float))),
@@ -1502,6 +1503,8 @@ impl Checker {
             (Type::Int, "to_float") => Some((vec![], Type::Float)),
             (Type::Int, "abs") => Some((vec![], Type::Int)),
             (Type::Int, "min" | "max") => Some((vec![Type::Int], Type::Int)),
+            (Type::Int, "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr") => Some((vec![Type::Int], Type::Int)),
+            (Type::Int, "to_char") => Some((vec![], Type::Str)),
             (Type::Float, "to_int") => Some((vec![], Type::Int)),
             (Type::Float, "abs" | "sqrt" | "floor" | "ceil" | "round") => Some((vec![], Type::Float)),
             (Type::Float, "min" | "max") => Some((vec![Type::Float], Type::Float)),
@@ -1521,13 +1524,13 @@ impl Checker {
             None => {
                 let available = match &recv {
                     Type::Str => {
-                        "len, is_empty, contains, starts_with, ends_with, trim, to_upper, to_lower, replace, split, chars, slice, to_int, to_float, to_string"
+                        "len, is_empty, contains, starts_with, ends_with, trim, to_upper, to_lower, replace, split, chars, codes, slice, to_int, to_float, to_string"
                     }
                     Type::List(_) => {
                         "len, is_empty, push, get, contains, first, last, concat, reverse, slice, sort, join, map, filter, fold, any, all, to_string"
                     }
                     Type::Map(_, _) => "len, is_empty, get, has, set, remove, keys, values, to_string",
-                    Type::Int => "to_float, abs, min, max, to_string",
+                    Type::Int => "to_float, abs, min, max, bit_and, bit_or, bit_xor, shl, shr, to_char, to_string",
                     Type::Float => "to_int, abs, sqrt, floor, ceil, round, min, max, to_string",
                     Type::Option(_) => "unwrap_or, is_some, is_none, to_string",
                     Type::Result(_, _) => "unwrap_or, is_ok, is_err, to_string",

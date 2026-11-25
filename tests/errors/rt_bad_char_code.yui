@@ -1,0 +1,5 @@
+// expect: E0509
+test "character code" {
+  let code = 0 - 1
+  assert code.to_char() == ""
+}

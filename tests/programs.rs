@@ -72,7 +72,20 @@ fn first_error(path: &Path, jit: bool) -> Option<&'static str> {
 fn example_files() -> Vec<PathBuf> {
     let mut files = yui_files("examples");
     files.push(root().join("examples/modules/main.yui"));
+    files.extend(yui_files("selfhost"));
     files
+}
+
+/// Every `.yui` file below `dir`.
+fn all_yui_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            all_yui_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "yui") {
+            out.push(path);
+        }
+    }
 }
 
 #[test]
@@ -132,6 +145,7 @@ fn examples_are_formatted() {
     let mut files = yui_files("examples");
     files.extend(yui_files("examples/modules"));
     files.extend(yui_files("examples/modules/geometry"));
+    files.extend(yui_files("selfhost"));
     for path in files {
         let src = read(&path);
         let formatted = yuilang::fmt::format_source(&src).unwrap_or_else(|d| panic!("{}: {}", path.display(), d.message));
@@ -228,4 +242,35 @@ fn build_makes_a_standalone_executable() {
     assert!(!failed.status.success());
     assert!(!bad.exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The lexer written in YuiLang must produce exactly the tokens of the Rust
+/// lexer, for every YuiLang file in the repository (including itself and the
+/// files that are expected to fail).
+#[test]
+fn selfhosted_lexer_matches_the_rust_lexer() {
+    with_big_stack(|| {
+        let loaded = yuilang::load_path(&root().join("selfhost/lexer.yui"), None)
+            .map_err(|(d, _)| d)
+            .expect("the lexer loads");
+        let mut files = Vec::new();
+        for dir in ["examples", "tests", "selfhost"] {
+            all_yui_files(&root().join(dir), &mut files);
+        }
+        files.sort();
+        assert!(files.len() > 60, "found only {} files", files.len());
+        let mut tokens = 0;
+        for path in &files {
+            let src = std::fs::read_to_string(path).unwrap();
+            let expected = yuilang::lexer::dump(&src);
+            let mut interp = Interp::new(&loaded.program, &loaded.sources.text);
+            interp.captured = Some(String::new());
+            interp.args = vec![path.to_string_lossy().to_string()];
+            interp.run_main().unwrap_or_else(|d| panic!("{}: {}", path.display(), d.message));
+            let actual: Vec<String> = interp.captured.unwrap_or_default().lines().map(String::from).collect();
+            assert_eq!(actual, expected, "{}", path.display());
+            tokens += expected.len();
+        }
+        assert!(tokens > 10_000, "compared only {tokens} tokens");
+    });
 }

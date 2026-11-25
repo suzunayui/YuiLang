@@ -315,6 +315,77 @@ pub fn lex_full(src: &str, base: usize) -> Result<(Vec<Token>, Vec<Span>), Diagn
     Ok((toks, comments))
 }
 
+/// The tokens of `src` as one line of text each, or up to the first error.
+/// This is the format the lexer written in YuiLang (`selfhost/lexer.yui`)
+/// prints, so that the two can be compared token by token.
+///
+/// A line starts with `+` when the token is the first on its source line,
+/// otherwise with a space. Then: `int 42`, `float 1.5`, `ident name`,
+/// `kw fn`, `sym ->`, `eof`, or `str` followed by tab-separated parts,
+/// `L:text` for literal text and `C:code` for an interpolation.
+pub fn dump(src: &str) -> Vec<String> {
+    fn escape(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r")
+    }
+    let (tokens, error) = match lex(src, 0) {
+        Ok(tokens) => (tokens, None),
+        Err(d) => (lex_prefix(src, d.span.start), Some(d.code)),
+    };
+    let mut lines = Vec::new();
+    for t in &tokens {
+        let mark = if t.nl_before { '+' } else { ' ' };
+        let raw = &src[t.span.start..t.span.end];
+        let body = match &t.tok {
+            Tok::Int(_) => format!("int {}", raw.replace('_', "")),
+            Tok::Float(_) => format!("float {}", raw.replace('_', "")),
+            Tok::Ident(name) => format!("ident {name}"),
+            Tok::Str(parts) => {
+                let mut out = String::from("str");
+                for part in parts {
+                    match part {
+                        StrPart::Lit(s) => out.push_str(&format!("\tL:{}", escape(s))),
+                        StrPart::Code(code, _) => out.push_str(&format!("\tC:{}", escape(code))),
+                    }
+                }
+                out
+            }
+            Tok::Eof => {
+                if error.is_some() {
+                    continue;
+                }
+                "eof".to_string()
+            }
+            other => {
+                let text = other.text();
+                let kind = if text.starts_with(|c: char| c.is_ascii_alphabetic()) { "kw" } else { "sym" };
+                format!("{kind} {text}")
+            }
+        };
+        lines.push(format!("{mark}{body}"));
+    }
+    if let Some(code) = error {
+        lines.push(format!("error {code}"));
+    }
+    lines
+}
+
+/// The tokens that end before byte `end`: everything lexed before an error there.
+fn lex_prefix(src: &str, end: usize) -> Vec<Token> {
+    let mut cut = end.min(src.len());
+    while !src.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    // The text before the error lexes cleanly unless it ends inside a token,
+    // which only a string can do; then drop back to the start of that line.
+    loop {
+        match lex(&src[..cut], 0) {
+            Ok(tokens) => return tokens,
+            Err(d) if d.span.start < cut => cut = d.span.start,
+            Err(_) => return Vec::new(),
+        }
+    }
+}
+
 /// Lex a string literal starting at the opening quote. Returns its parts and
 /// the index just past the closing quote.
 fn lex_string(src: &str, open: usize, base: usize) -> Result<(Vec<StrPart>, usize), Diagnostic> {

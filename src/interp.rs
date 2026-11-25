@@ -1467,6 +1467,26 @@ impl<'a> Interp<'a> {
             (Value::Map(entries), "keys", []) => Ok(Value::list(entries.keys().map(|k| k.to_value()).collect())),
             (Value::Map(entries), "values", []) => Ok(Value::list(entries.values().cloned().collect())),
 
+            (Value::Str(s), "codes", []) => Ok(Value::list(s.chars().map(|c| Value::Int(c as i64)).collect())),
+            (Value::Int(a), "bit_and", [Value::Int(b)]) => Ok(Value::Int(a & b)),
+            (Value::Int(a), "bit_or", [Value::Int(b)]) => Ok(Value::Int(a | b)),
+            (Value::Int(a), "bit_xor", [Value::Int(b)]) => Ok(Value::Int(a ^ b)),
+            (Value::Int(a), "shl" | "shr", [Value::Int(b)]) => {
+                if !(0..64).contains(b) {
+                    return Err(panic_hint(
+                        "E0509",
+                        format!("shift amount {b} is out of range"),
+                        span,
+                        "the amount must be between 0 and 63",
+                    ));
+                }
+                // Bits shifted out are lost; `shr` keeps the sign.
+                Ok(Value::Int(if name == "shl" { a.wrapping_shl(*b as u32) } else { a >> b }))
+            }
+            (Value::Int(n), "to_char", []) => match u32::try_from(*n).ok().and_then(char::from_u32) {
+                Some(c) => Ok(Value::str(c.to_string())),
+                None => Err(panic("E0509", format!("{n} is not a character code"), span)),
+            },
             (Value::Int(n), "to_float", []) => Ok(Value::Float(*n as f64)),
             (Value::Int(n), "abs", []) => {
                 n.checked_abs().map(Value::Int).ok_or_else(|| panic("E0503", "integer overflow in `abs`", span))

@@ -181,3 +181,17 @@ fn main() uses io {
   print("collatz(97) takes {collatz_steps(97)} steps")
   print("2^40 = {power(2, 40)}")
 }
+
+test "bits and character codes" {
+  assert 12.bit_and(10) == 8
+  assert 12.bit_or(10) == 14
+  assert 12.bit_xor(10) == 6
+  assert 1.shl(10) == 1024
+  assert 1024.shr(3) == 128
+  assert (0 - 8).shr(1) == 0 - 4
+  assert 1.shl(63).shr(63) == 0 - 1
+  assert "Aあ".codes() == [65, 12354]
+  assert 65.to_char() == "A"
+  assert 12354.to_char() == "あ"
+  assert "abc".codes().map(|c| (c + 1).to_char()).join("") == "bcd"
+}

@@ -1,0 +1,5 @@
+// expect: E0509
+test "shift amount" {
+  let n = 64
+  assert 1.shl(n) == 0
+}

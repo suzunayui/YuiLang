@@ -112,6 +112,20 @@ v--jsonv を付けると同じ内容がJSONになります。
 - vListv / vMapv / vStringv の標準メソッド
 - 値セマンティクス（参照の共有が起きない）
 
+## YuiLang で YuiLang を書く
+
+処理系を少しずつ YuiLang 自身で書き直しています。最初の部品として、字句解析を
+[selfhost/lexer.yui](selfhost/lexer.yui) に置きました。`cargo test` は、このリポジトリのすべての
+`.yui` ファイルについて、Rust 版の字句解析と同じトークン列になることを確かめます。
+
+```
+$ yui run selfhost/lexer.yui -- examples/hello.yui
++kw fn
+ ident divide
+ sym (
+ ...
+```
+
 ## ソースからビルド
 
 [Rust](https://www.rust-lang.org/) が必要です。外部クレートへの依存はありません。

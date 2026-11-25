@@ -289,6 +289,7 @@ fn parse_pair(a: String, b: String) -> Option<Int> {
 | `trim()`, `to_upper()`, `to_lower()`, `replace(from, to)` | `String` |
 | `slice(start, end)`（文字単位、end は含まない） | `String` |
 | `split(sep)`, `chars()` | `List<String>` |
+| `codes()`（各文字の文字コード） | `List<Int>` |
 | `to_int()`, `to_float()` | `Option<Int>`, `Option<Float>` |
 
 **List\<T\>**
@@ -318,7 +319,8 @@ fn parse_pair(a: String, b: String) -> Option<Int> {
 
 | 対象 | メソッド |
 | --- | --- |
-| `Int` | `to_float()`, `abs()`, `min(x)`, `max(x)` |
+| `Int` | `to_float()`, `abs()`, `min(x)`, `max(x)`, `to_char()`（文字コードから1文字の String） |
+| `Int`（ビット演算） | `bit_and(x)`, `bit_or(x)`, `bit_xor(x)`, `shl(n)`, `shr(n)`（`n` は 0〜63。`shr` は符号を保つ） |
 | `Float` | `to_int()`（切り捨て）, `abs()`, `sqrt()`, `floor()`, `ceil()`, `round()`, `min(x)`, `max(x)` |
 
 **Option / Result**
