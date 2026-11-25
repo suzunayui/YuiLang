@@ -410,11 +410,123 @@ impl Asm {
         }
     }
 
+    /// Divides rax by the constant `n` (not 0 or -1), leaving the quotient or
+    /// the remainder in rax. For `n >= 2` the division is done by multiplying
+    /// with a precomputed reciprocal, which is several times faster than `idiv`.
+    fn divide_by(&mut self, op: BinOp, n: i32) {
+        if n == 1 {
+            if op == BinOp::Rem {
+                self.mov_imm64(RAX, 0);
+            }
+            return;
+        }
+        if n < 2 {
+            self.mov_imm64(RCX, n as i64);
+            self.divide(op);
+            return;
+        }
+        let (multiplier, shift) = reciprocal(n as i64);
+        self.mov_rr(RCX, RAX);
+        self.mov_imm64(RDX, multiplier);
+        self.buf.extend_from_slice(&[0x48, 0xF7, 0xEA]); // imul rdx: rdx:rax = rax * rdx
+        if multiplier < 0 {
+            self.alu_rr(0x01, RDX, RCX);
+        }
+        if shift > 0 {
+            self.buf.extend_from_slice(&[0x48, 0xC1, 0xFA, shift as u8]); // sar rdx, shift
+        }
+        // Round toward zero: add one when the quotient is negative.
+        self.mov_rr(RAX, RDX);
+        self.buf.extend_from_slice(&[0x48, 0xC1, 0xE8, 63]); // shr rax, 63
+        self.alu_rr(0x01, RAX, RDX);
+        if op == BinOp::Rem {
+            // remainder = dividend - quotient * n
+            self.imul_imm(RAX, n);
+            self.alu_rr(0x29, RCX, RAX);
+            self.mov_rr(RAX, RCX);
+        }
+    }
+
     fn int_op_imm(&mut self, op: BinOp, imm: i32) {
         match op {
             BinOp::Add => self.alu_imm(0, RAX, imm),
             BinOp::Sub => self.alu_imm(5, RAX, imm),
             _ => self.imul_imm(RAX, imm),
+        }
+    }
+}
+
+/// The multiplier and shift that turn a signed 64-bit division by `d >= 2`
+/// into a multiplication: with `hi` the upper half of `n * multiplier`,
+/// `n / d = ((hi + n if multiplier < 0) >> shift) + (1 if that is negative)`.
+/// (Hacker's Delight, chapter 10.)
+fn reciprocal(d: i64) -> (i64, u32) {
+    const TWO_63: u64 = 1 << 63;
+    let ad = d as u64;
+    let anc = TWO_63 - 1 - (TWO_63 % ad);
+    let mut p = 63;
+    let mut q1 = TWO_63 / anc;
+    let mut r1 = TWO_63 - q1 * anc;
+    let mut q2 = TWO_63 / ad;
+    let mut r2 = TWO_63 - q2 * ad;
+    loop {
+        p += 1;
+        q1 = q1.wrapping_mul(2);
+        r1 = r1.wrapping_mul(2);
+        if r1 >= anc {
+            q1 = q1.wrapping_add(1);
+            r1 -= anc;
+        }
+        q2 = q2.wrapping_mul(2);
+        r2 = r2.wrapping_mul(2);
+        if r2 >= ad {
+            q2 = q2.wrapping_add(1);
+            r2 -= ad;
+        }
+        let delta = ad - r2;
+        if !(q1 < delta || (q1 == delta && r1 == 0)) {
+            break;
+        }
+    }
+    (q2.wrapping_add(1) as i64, p - 64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reciprocal;
+
+    /// The steps `Asm::divide_by` emits, in plain Rust.
+    fn divide(n: i64, d: i64) -> i64 {
+        let (multiplier, shift) = reciprocal(d);
+        let mut hi = ((n as i128 * multiplier as i128) >> 64) as i64;
+        if multiplier < 0 {
+            hi = hi.wrapping_add(n);
+        }
+        hi >>= shift;
+        hi + ((hi as u64) >> 63) as i64
+    }
+
+    #[test]
+    fn reciprocal_division_matches_idiv() {
+        let divisors = [2, 3, 4, 5, 7, 8, 10, 16, 24, 100, 641, 1000, 65536, 1_000_000_007, i32::MAX as i64];
+        let mut values: Vec<i64> = (-2000..=2000).collect();
+        for edge in [i64::MAX, i64::MIN, i64::MAX / 2, i64::MIN / 2, 1 << 40, -(1 << 40), 123_456_789_012_345] {
+            for delta in -3..=3i64 {
+                values.push(edge.wrapping_add(delta));
+            }
+        }
+        // A cheap pseudo-random sweep over the whole range.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push(x as i64);
+        }
+        for d in divisors {
+            for &n in &values {
+                assert_eq!(divide(n, d), n / d, "{n} / {d}");
+            }
         }
     }
 }
@@ -909,8 +1021,7 @@ impl Gen<'_> {
                 self.expect_int(slot(s), slow);
                 let a = &mut self.a;
                 a.load(RAX, slot(s).at(8));
-                a.mov_imm64(RCX, n as i64);
-                a.divide(op);
+                a.divide_by(op, n);
                 a.store_imm(top(0), TAG_INT as i32);
                 a.store(top(0).at(8), RAX);
                 a.alu_imm(0, R13, V);
@@ -941,8 +1052,7 @@ impl Gen<'_> {
                 self.expect_int(top(1), slow);
                 let a = &mut self.a;
                 a.load(RAX, top(1).at(8));
-                a.mov_imm64(RCX, n as i64);
-                a.divide(op);
+                a.divide_by(op, n);
                 a.store(top(1).at(8), RAX);
                 a.bind(resume);
             }

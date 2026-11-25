@@ -1,0 +1,100 @@
+// 定数での割り算と剰余。JIT は掛け算に置き換えるので、結果が通常の割り算と一致することを確かめる
+
+// 商と余りが「0 に向かって切り捨てる割り算」の定義を満たすか
+fn consistent(n: Int, d: Int, q: Int, r: Int) -> Bool {
+  let size = r.abs() < d
+  let sign = r == 0 || (r > 0) == (n > 0)
+  q * d + r == n && size && sign
+}
+
+fn check(n: Int) -> Bool {
+  let two = consistent(n, 2, n / 2, n % 2)
+  let three = consistent(n, 3, n / 3, n % 3)
+  let seven = consistent(n, 7, n / 7, n % 7)
+  let ten = consistent(n, 10, n / 10, n % 10)
+  let sixteen = consistent(n, 16, n / 16, n % 16)
+  let thousand = consistent(n, 1000, n / 1000, n % 1000)
+  let prime = consistent(n, 1000003, n / 1000003, n % 1000003)
+  let one = n / 1 == n && n % 1 == 0
+  two && three && seven && ten && sixteen && thousand && prime && one
+}
+
+// 式の途中の値を割る場合
+fn digits(n: Int) -> Int {
+  let mut rest = n
+  let mut count = 0
+  while rest != 0 {
+    rest = rest / 10
+    count = count + 1
+  }
+  count
+}
+
+fn digit_sum(n: Int) -> Int {
+  let mut rest = n
+  let mut total = 0
+  while rest > 0 {
+    total = total + (rest + 0) % 10
+    rest = (rest + 0) / 10
+  }
+  total
+}
+
+test "small numbers" {
+  for n in 0 - 3000..3000 {
+    assert check(n)
+  }
+}
+
+test "known answers" {
+  assert 7 / 2 == 3
+  assert (0 - 7) / 2 == 0 - 3
+  assert (0 - 7) % 2 == 0 - 1
+  assert 100 / 3 == 33
+  assert (0 - 100) / 3 == 0 - 33
+  assert (0 - 100) % 3 == 0 - 1
+  assert (0 - 9) / 4 == 0 - 2
+  assert (0 - 9) % 4 == 0 - 1
+  assert 1000000007 % 1000 == 7
+}
+
+test "large numbers" {
+  let max = 9223372036854775807
+  let min = 0 - max - 1
+  assert max / 7 == 1317624576693539401
+  assert max % 7 == 0
+  assert max / 2147483647 == 4294967298
+  assert max % 2147483647 == 1
+  assert (0 - max) / 10 == 0 - 922337203685477580
+  assert (0 - max) % 10 == 0 - 7
+  assert min / 2 == 0 - 4611686018427387904
+  assert min % 2 == 0
+  assert min % 10 == 0 - 8
+  assert check(max)
+  assert check(max - 1)
+  assert check(min)
+  assert check(min + 1)
+  assert check(4611686018427387904)
+  assert check(0 - 4611686018427387904)
+}
+
+test "pseudo-random numbers" {
+  // 線形合同法で広い範囲の値を作る
+  let mut x = 88172645463325252
+  for i in 0..20000 {
+    x = x % 1000000007 * 48271 + i
+    assert check(x)
+    assert check(0 - x)
+    assert check(x * 100003)
+  }
+}
+
+test "loops" {
+  assert digits(1234567) == 7
+  assert digits(0 - 1234567) == 7
+  assert digit_sum(987654321) == 45
+}
+
+fn main() uses io {
+  print("{digits(9223372036854775807)} digits, digit sum {digit_sum(9223372036854775807)}")
+}
