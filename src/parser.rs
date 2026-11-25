@@ -38,6 +38,218 @@ pub fn parse_file(src: &str, base: usize, module: &str, resolve: bool) -> P<Prog
     Ok(Program { imports, items, types: TypeInfo::default() })
 }
 
+/// The syntax tree of `src` as text, or `error E0xxx` for the first error.
+/// Names are kept as written. This is the format the parser written in
+/// YuiLang (`selfhost/parser.yui`) prints, so that the two can be compared.
+///
+/// Every node is `(kind "text" child child ...)`; the text is left out when
+/// empty. A local variable and a global name are both `name`: telling them
+/// apart is a later step of the self-hosted parser.
+pub fn dump(src: &str) -> String {
+    match parse_file(src, 0, "", false) {
+        Ok(program) => Dumper { src }.program(&program),
+        Err(d) => format!("error {}", d.code),
+    }
+}
+
+struct Dumper<'a> {
+    src: &'a str,
+}
+
+fn node(kind: &str, text: &str, kids: &[String]) -> String {
+    let mut out = format!("({kind}");
+    if !text.is_empty() {
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t")
+            .replace('\r', "\\r");
+        out.push_str(&format!(" \"{escaped}\""));
+    }
+    for kid in kids {
+        out.push(' ');
+        out.push_str(kid);
+    }
+    out.push(')');
+    out
+}
+
+impl Dumper<'_> {
+    fn program(&self, p: &Program) -> String {
+        let mut kids: Vec<String> = p.imports.iter().map(|i| node("import", &i.path, &[])).collect();
+        kids.extend(p.items.iter().map(|i| self.item(i)));
+        node("program", "", &kids)
+    }
+
+    fn names(&self, kind: &str, names: impl Iterator<Item = String>) -> String {
+        let kids: Vec<String> = names.map(|n| node("n", &n, &[])).collect();
+        node(kind, "", &kids)
+    }
+
+    fn params(&self, params: &[Param]) -> String {
+        let kids: Vec<String> = params.iter().map(|p| node("param", &p.name, &[self.ty(&p.ty)])).collect();
+        node("params", "", &kids)
+    }
+
+    fn effects(&self, effects: &[(String, Span)]) -> String {
+        self.names("effects", effects.iter().map(|(e, _)| e.clone()))
+    }
+
+    fn item(&self, item: &Item) -> String {
+        match item {
+            Item::Fn(f) => {
+                let ret: Vec<String> = f.ret.iter().map(|t| self.ty(t)).collect();
+                let kids = [
+                    self.names("tparams", f.type_params.iter().cloned()),
+                    self.params(&f.params),
+                    node("ret", "", &ret),
+                    self.effects(&f.effects),
+                    node("requires", "", &f.requires.iter().map(|e| self.expr(e)).collect::<Vec<_>>()),
+                    node("ensures", "", &f.ensures.iter().map(|e| self.expr(e)).collect::<Vec<_>>()),
+                    self.block(&f.body),
+                ];
+                node("fn", &f.name, &kids)
+            }
+            Item::Struct(s) => {
+                node("struct", &s.name, &[self.names("tparams", s.type_params.iter().cloned()), self.params(&s.fields)])
+            }
+            Item::Enum(e) => {
+                let variants: Vec<String> = e
+                    .variants
+                    .iter()
+                    .map(|v| node("variant", &v.name, &v.fields.iter().map(|t| self.ty(t)).collect::<Vec<_>>()))
+                    .collect();
+                let kids = [self.names("tparams", e.type_params.iter().cloned()), node("variants", "", &variants)];
+                node("enum", &e.name, &kids)
+            }
+            Item::Test(t) => node("test", &t.name, &[self.effects(&t.effects), self.block(&t.body)]),
+        }
+    }
+
+    fn ty(&self, t: &TypeExpr) -> String {
+        match &t.kind {
+            TypeKind::Named(name, args) => node("type", name, &args.iter().map(|a| self.ty(a)).collect::<Vec<_>>()),
+            TypeKind::Fn(params, ret, effects) => {
+                let ret: Vec<String> = ret.iter().map(|t| self.ty(t)).collect();
+                let kids = [
+                    node("params", "", &params.iter().map(|p| self.ty(p)).collect::<Vec<_>>()),
+                    node("ret", "", &ret),
+                    self.names("effects", effects.iter().cloned()),
+                ];
+                node("fntype", "", &kids)
+            }
+        }
+    }
+
+    fn block(&self, b: &Block) -> String {
+        node("block", "", &b.stmts.iter().map(|s| self.stmt(s)).collect::<Vec<_>>())
+    }
+
+    fn stmt(&self, s: &Stmt) -> String {
+        match s {
+            Stmt::Let { name, mutable, ty, value, .. } => {
+                let mut kids: Vec<String> = ty.iter().map(|t| node("ann", "", &[self.ty(t)])).collect();
+                kids.push(self.expr(value));
+                node(if *mutable { "letmut" } else { "let" }, name, &kids)
+            }
+            Stmt::Assign { target, value } => node("assign", "", &[self.expr(target), self.expr(value)]),
+            Stmt::While { cond, body, .. } => node("while", "", &[self.expr(cond), self.block(body)]),
+            Stmt::For { var, iter, end, body, .. } => {
+                let mut kids = vec![self.expr(iter)];
+                kids.extend(end.iter().map(|e| node("to", "", &[self.expr(e)])));
+                kids.push(self.block(body));
+                node("for", var, &kids)
+            }
+            Stmt::Assert { cond, .. } => node("assert", "", &[self.expr(cond)]),
+            Stmt::Expr(e) => self.expr(e),
+        }
+    }
+
+    fn exprs(&self, es: &[Expr]) -> Vec<String> {
+        es.iter().map(|e| self.expr(e)).collect()
+    }
+
+    fn expr(&self, e: &Expr) -> String {
+        match &e.kind {
+            ExprKind::Int(n) => node("int", &n.to_string(), &[]),
+            ExprKind::Float(_) => node("float", &self.src[e.span.start..e.span.end].replace('_', ""), &[]),
+            ExprKind::Bool(b) => node("bool", &b.to_string(), &[]),
+            ExprKind::Unit => node("unit", "", &[]),
+            ExprKind::Str(parts) => {
+                let kids: Vec<String> = parts
+                    .iter()
+                    .map(|part| match part {
+                        StrPart::Lit(s) => node("lit", s, &[]),
+                        StrPart::Expr(inner) => node("interp", "", &[self.expr(inner)]),
+                    })
+                    .collect();
+                node("str", "", &kids)
+            }
+            ExprKind::Ident(name) | ExprKind::FnRef(name) => node("name", name, &[]),
+            ExprKind::List(items) => node("list", "", &self.exprs(items)),
+            ExprKind::MapLit(entries) => {
+                let kids: Vec<String> =
+                    entries.iter().map(|(k, v)| node("entry", "", &[self.expr(k), self.expr(v)])).collect();
+                node("map", "", &kids)
+            }
+            ExprKind::Unary(UnOp::Neg, x) => node("neg", "", &[self.expr(x)]),
+            ExprKind::Unary(UnOp::Not, x) => node("not", "", &[self.expr(x)]),
+            ExprKind::Binary(op, l, r) => node("bin", op.symbol(), &[self.expr(l), self.expr(r)]),
+            ExprKind::Call { name, args, .. } => node("call", name, &self.exprs(args)),
+            ExprKind::MethodCall { recv, name, args, .. } => {
+                let mut kids = vec![self.expr(recv)];
+                kids.extend(self.exprs(args));
+                node("method", name, &kids)
+            }
+            ExprKind::Field(base, name, _) => node("field", name, &[self.expr(base)]),
+            ExprKind::Index(base, index) => node("index", "", &[self.expr(base), self.expr(index)]),
+            ExprKind::StructLit { name, fields } => {
+                let kids: Vec<String> = fields.iter().map(|(f, _, v)| node("init", f, &[self.expr(v)])).collect();
+                node("new", name, &kids)
+            }
+            ExprKind::Ctor { enum_name, variant, args } => {
+                node("ctor", &format!("{enum_name}.{variant}"), &self.exprs(args))
+            }
+            ExprKind::If { cond, then, els } => {
+                let mut kids = vec![self.expr(cond), self.block(then)];
+                kids.extend(els.iter().map(|e| self.expr(e)));
+                node("if", "", &kids)
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let mut kids = vec![self.expr(scrutinee)];
+                kids.extend(arms.iter().map(|a| node("arm", "", &[self.pattern(&a.pat), self.expr(&a.body)])));
+                node("match", "", &kids)
+            }
+            ExprKind::Block(b) => self.block(b),
+            ExprKind::Closure { params, body, .. } => {
+                let params: Vec<String> = params
+                    .iter()
+                    .map(|p| node("cparam", &p.name, &p.ty.iter().map(|t| self.ty(t)).collect::<Vec<_>>()))
+                    .collect();
+                node("closure", "", &[node("cparams", "", &params), self.expr(body)])
+            }
+            ExprKind::Return(value) => node("return", "", &value.iter().map(|v| self.expr(v)).collect::<Vec<_>>()),
+            ExprKind::Break => node("break", "", &[]),
+            ExprKind::Continue => node("continue", "", &[]),
+            ExprKind::Try(inner) => node("try", "", &[self.expr(inner)]),
+        }
+    }
+
+    fn pattern(&self, p: &Pattern) -> String {
+        match &p.kind {
+            PatKind::Wildcard => node("pwild", "", &[]),
+            PatKind::Bind(name) => node("pbind", name, &[]),
+            PatKind::Int(n) => node("pint", &n.to_string(), &[]),
+            PatKind::Str(s) => node("pstr", s, &[]),
+            PatKind::Bool(b) => node("pbool", &b.to_string(), &[]),
+            PatKind::Ctor { enum_name, variant, args } => {
+                let kids: Vec<String> = args.iter().map(|a| self.pattern(a)).collect();
+                node("pctor", &format!("{enum_name}.{variant}"), &kids)
+            }
+        }
+    }
+}
 struct Parser {
     toks: Vec<Token>,
     pos: usize,

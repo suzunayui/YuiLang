@@ -1,0 +1,896 @@
+// YuiLang の構文解析を YuiLang で書いたもの。
+// Rust 版（src/parser.rs）と同じ構文木になることを、テストで全サンプルについて確かめている。
+//
+// 構文木は Node 1種類で表す: 種類、文字列、子の並び。
+// 出力は `(種類 "文字列" 子 子 ...)` の形（文字列が空なら省く）。エラーなら `error E0101` のような1行。
+// 状態（トークン列と位置）は書き換えず、各関数が「進んだあとの状態」を結果と一緒に返す。
+//
+// まだやっていないこと: ローカル変数とトップレベルの名前の区別（どちらも `name` として出す）。
+import lexer
+
+struct Node {
+  kind: String,
+  text: String,
+  kids: List<Node>,
+}
+
+// 文字列リテラルの部品。code が true なら `{...}` の中身
+struct Part {
+  code: Bool,
+  text: String,
+}
+
+struct Tok {
+  kind: String,
+  text: String,
+  // ソースの行の先頭にあるか
+  nl: Bool,
+  parts: List<Part>,
+}
+
+// 構文解析の状態
+struct P {
+  toks: List<Tok>,
+  pos: Int,
+  // import したモジュールの名前
+  aliases: List<String>,
+}
+
+// 解析結果: ノード1個 / ノードの並び / 名前1個 / 名前の並び
+struct R {
+  p: P,
+  node: Node,
+}
+
+struct Rs {
+  p: P,
+  nodes: List<Node>,
+}
+
+struct Named {
+  p: P,
+  name: String,
+}
+
+struct Names {
+  p: P,
+  names: List<String>,
+}
+
+fn node(kind: String, text: String, kids: List<Node>) -> Node {
+  Node { kind: kind, text: text, kids: kids }
+}
+
+fn leaf(kind: String, text: String) -> Node {
+  Node { kind: kind, text: text, kids: [] }
+}
+
+fn names_node(kind: String, names: List<String>) -> Node {
+  node(kind, "", names.map(|n| leaf("n", n)))
+}
+
+// ---- トークン ----
+
+// lexer.escape の逆
+fn unescape(s: String) -> String {
+  let chars = s.chars()
+  let n = chars.len()
+  let mut out = ""
+  let mut i = 0
+  while i < n {
+    let c = chars[i]
+    if c == "\\" && i + 1 < n {
+      let e = chars[i + 1]
+      let real = if e == "n" { "\n" } else if e == "t" { "\t" } else if e == "r" { "\r" } else { e }
+      out = "{out}{real}"
+      i = i + 2
+    } else {
+      out = "{out}{c}"
+      i = i + 1
+    }
+  }
+  out
+}
+
+// lexer.lex の1行をトークンに戻す
+fn to_tok(line: String) -> Tok {
+  let nl = line.starts_with("+")
+  let rest = line.slice(1, line.len())
+  if rest.starts_with("str") {
+    let fields = rest.split("\t")
+    let mut parts = []
+    for i in 1..fields.len() {
+      let field = fields[i]
+      parts = parts.push(Part { code: field.starts_with("C:"), text: unescape(field.slice(2, field.len())) })
+    }
+    return Tok { kind: "str", text: "", nl: nl, parts: parts }
+  }
+  let kind = rest.split(" ")[0]
+  let text = if rest.len() > kind.len() { rest.slice(kind.len() + 1, rest.len()) } else { "" }
+  Tok { kind: kind, text: text, nl: nl, parts: [] }
+}
+
+fn tokens(src: String) -> Result<List<Tok>, String> {
+  let mut out = []
+  for line in lexer.lex(src) {
+    if line.starts_with("error ") { return Err(line.slice(6, line.len())) }
+    out = out.push(to_tok(line))
+  }
+  Ok(out)
+}
+
+// 整数トークン（数字の並びか文字リテラル）の値
+fn int_value(text: String) -> Int {
+  let codes = text.codes()
+  if codes[0] != '\'' { return text.to_int().unwrap_or(0) }
+  if codes[1] != '\\' { return codes[1] }
+  let e = codes[2]
+  if e == 'n' { '\n' } else if e == 't' { '\t' } else if e == 'r' { '\r' } else { e }
+}
+
+fn peek(p: P) -> Tok {
+  p.toks[p.pos]
+}
+
+fn peek_at(p: P, ahead: Int) -> Tok {
+  let last = p.toks.len() - 1
+  p.toks[(p.pos + ahead).min(last)]
+}
+
+fn bump(p: P) -> P {
+  if p.pos >= p.toks.len() - 1 { return p }
+  P { toks: p.toks, pos: p.pos + 1, aliases: p.aliases }
+}
+
+fn sym(p: P, s: String) -> Bool {
+  let t = peek(p)
+  t.kind == "sym" && t.text == s
+}
+
+fn kw(p: P, s: String) -> Bool {
+  let t = peek(p)
+  t.kind == "kw" && t.text == s
+}
+
+fn expect_sym(p: P, s: String) -> Result<P, String> {
+  if sym(p, s) { Ok(bump(p)) } else { Err("E0101") }
+}
+
+fn is_upper(name: String) -> Bool {
+  let c = name.codes()[0]
+  c >= 'A' && c <= 'Z'
+}
+
+fn ident(p: P) -> Result<Named, String> {
+  let t = peek(p)
+  if t.kind == "ident" { Ok(Named { p: bump(p), name: t.text }) } else { Err("E0101") }
+}
+
+fn lower_ident(p: P) -> Result<Named, String> {
+  let r = ident(p)?
+  if is_upper(r.name) { Err("E0104") } else { Ok(r) }
+}
+
+fn upper_ident(p: P) -> Result<Named, String> {
+  let r = ident(p)?
+  if is_upper(r.name) { Ok(r) } else { Err("E0104") }
+}
+
+// ---- 宣言 ----
+
+fn parse(src: String) -> Result<Node, String> {
+  let toks = tokens(src)?
+  let mut p = P { toks: toks, pos: 0, aliases: [] }
+  let mut kids = []
+  while kw(p, "import") {
+    let first = lower_ident(bump(p))?
+    p = first.p
+    let mut path = first.name
+    let mut alias = first.name
+    while sym(p, ".") {
+      let segment = lower_ident(bump(p))?
+      p = segment.p
+      path = "{path}.{segment.name}"
+      alias = segment.name
+    }
+    if p.aliases.contains(alias) { return Err("E0106") }
+    p.aliases = p.aliases.push(alias)
+    kids = kids.push(leaf("import", path))
+  }
+  while peek(p).kind != "eof" {
+    let r = item(p)?
+    p = r.p
+    kids = kids.push(r.node)
+  }
+  Ok(node("program", "", kids))
+}
+
+fn item(p: P) -> Result<R, String> {
+  if kw(p, "fn") { return fn_decl(bump(p)) }
+  if kw(p, "struct") { return struct_decl(bump(p)) }
+  if kw(p, "enum") { return enum_decl(bump(p)) }
+  if kw(p, "test") { return test_decl(bump(p)) }
+  Err("E0101")
+}
+
+fn type_param_list(p: P) -> Result<Names, String> {
+  let mut q = p
+  let mut names = []
+  if sym(q, "<") {
+    q = bump(q)
+    while true {
+      let r = upper_ident(q)?
+      q = r.p
+      names = names.push(r.name)
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    q = expect_sym(q, ">")?
+  }
+  Ok(Names { p: q, names: names })
+}
+
+fn effects(p: P) -> Result<Names, String> {
+  let mut q = p
+  let mut names = []
+  if kw(q, "uses") {
+    q = bump(q)
+    while true {
+      let r = lower_ident(q)?
+      q = r.p
+      names = names.push(r.name)
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+  }
+  Ok(Names { p: q, names: names })
+}
+
+// `name: Type, ...` を close まで読む
+fn params(p: P, close: String) -> Result<R, String> {
+  let mut q = p
+  let mut kids = []
+  while !sym(q, close) {
+    let name = lower_ident(q)?
+    q = expect_sym(name.p, ":")?
+    let ty = type_expr(q)?
+    q = ty.p
+    kids = kids.push(node("param", name.name, [ty.node]))
+    if !sym(q, ",") { break }
+    q = bump(q)
+  }
+  q = expect_sym(q, close)?
+  Ok(R { p: q, node: node("params", "", kids) })
+}
+
+fn fn_decl(p: P) -> Result<R, String> {
+  let name = lower_ident(p)?
+  let tps = type_param_list(name.p)?
+  let ps = params(expect_sym(tps.p, "(")?, ")")?
+  let mut q = ps.p
+  let mut ret = []
+  if sym(q, "->") {
+    let ty = type_expr(bump(q))?
+    q = ty.p
+    ret = ret.push(ty.node)
+  }
+  let effs = effects(q)?
+  q = effs.p
+  let mut requires_list = []
+  let mut ensures_list = []
+  while true {
+    if kw(q, "requires") {
+      let e = expr(bump(q))?
+      q = e.p
+      requires_list = requires_list.push(e.node)
+    } else if kw(q, "ensures") {
+      let e = expr(bump(q))?
+      q = e.p
+      ensures_list = ensures_list.push(e.node)
+    } else {
+      break
+    }
+  }
+  let body = block(q)?
+  let kids = [
+    names_node("tparams", tps.names),
+    ps.node,
+    node("ret", "", ret),
+    names_node("effects", effs.names),
+    node("requires", "", requires_list),
+    node("ensures", "", ensures_list),
+    body.node,
+  ]
+  Ok(R { p: body.p, node: node("fn", name.name, kids) })
+}
+
+fn struct_decl(p: P) -> Result<R, String> {
+  let name = upper_ident(p)?
+  let tps = type_param_list(name.p)?
+  let fields = params(expect_sym(tps.p, "\{")?, "\}")?
+  Ok(R {
+    p: fields.p,
+    node: node("struct", name.name, [names_node("tparams", tps.names), fields.node]),
+  })
+}
+
+fn enum_decl(p: P) -> Result<R, String> {
+  let name = upper_ident(p)?
+  let tps = type_param_list(name.p)?
+  let mut q = expect_sym(tps.p, "\{")?
+  let mut variants = []
+  while !sym(q, "\}") {
+    let variant = upper_ident(q)?
+    q = variant.p
+    let mut fields = []
+    if sym(q, "(") {
+      q = bump(q)
+      while !sym(q, ")") {
+        let ty = type_expr(q)?
+        q = ty.p
+        fields = fields.push(ty.node)
+        if !sym(q, ",") { break }
+        q = bump(q)
+      }
+      q = expect_sym(q, ")")?
+    }
+    variants = variants.push(node("variant", variant.name, fields))
+    if !sym(q, ",") { break }
+    q = bump(q)
+  }
+  q = expect_sym(q, "\}")?
+  let kids = [names_node("tparams", tps.names), node("variants", "", variants)]
+  Ok(R { p: q, node: node("enum", name.name, kids) })
+}
+
+fn test_decl(p: P) -> Result<R, String> {
+  let t = peek(p)
+  if t.kind != "str" || t.parts.len() != 1 || t.parts[0].code { return Err("E0101") }
+  let effs = effects(bump(p))?
+  let body = block(effs.p)?
+  Ok(R {
+    p: body.p,
+    node: node("test", t.parts[0].text, [names_node("effects", effs.names), body.node]),
+  })
+}
+
+// ---- 型 ----
+
+fn type_expr(p: P) -> Result<R, String> {
+  let t = peek(p)
+  if kw(p, "fn") {
+    let mut q = expect_sym(bump(p), "(")?
+    let mut ps = []
+    while !sym(q, ")") {
+      let ty = type_expr(q)?
+      q = ty.p
+      ps = ps.push(ty.node)
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    q = expect_sym(q, ")")?
+    let mut ret = []
+    if sym(q, "->") {
+      let ty = type_expr(bump(q))?
+      q = ty.p
+      ret = ret.push(ty.node)
+    }
+    let mut effs = []
+    if kw(q, "uses") {
+      q = bump(q)
+      while true {
+        let name = lower_ident(q)?
+        q = name.p
+        effs = effs.push(name.name)
+        // カンマが効果の並びを続けるのは、次が効果の名前のときだけ。そうでなければ次の引数
+        let next = peek_at(q, 1)
+        let known = next.kind == "ident" && ["io", "fs"].contains(next.text)
+        let more = sym(q, ",") && known && !sym(bump(bump(q)), ":")
+        if !more { break }
+        q = bump(q)
+      }
+    }
+    let kids = [node("params", "", ps), node("ret", "", ret), names_node("effects", effs)]
+    return Ok(R { p: q, node: node("fntype", "", kids) })
+  }
+  if sym(p, "(") {
+    let inner = type_expr(bump(p))?
+    return Ok(R { p: expect_sym(inner.p, ")")?, node: inner.node })
+  }
+  if t.kind == "ident" && !is_upper(t.text) {
+    // `モジュール.Type`
+    let q = bump(p)
+    if !sym(q, ".") || !p.aliases.contains(t.text) { return Err("E0101") }
+    let member = ident(bump(q))?
+    if !is_upper(member.name) { return Err("E0101") }
+    return type_args(member.p, "{t.text}.{member.name}")
+  }
+  let name = upper_ident(p)?
+  type_args(name.p, name.name)
+}
+
+fn type_args(p: P, name: String) -> Result<R, String> {
+  let mut q = p
+  let mut targs = []
+  if sym(q, "<") {
+    q = bump(q)
+    while true {
+      let ty = type_expr(q)?
+      q = ty.p
+      targs = targs.push(ty.node)
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    q = expect_sym(q, ">")?
+  }
+  Ok(R { p: q, node: node("type", name, targs) })
+}
+
+// ---- 文 ----
+
+fn block(p: P) -> Result<R, String> {
+  let mut q = expect_sym(p, "\{")?
+  let mut stmts = []
+  while !sym(q, "\}") {
+    if peek(q).kind == "eof" { return Err("E0101") }
+    let s = stmt(q)?
+    q = s.p
+    stmts = stmts.push(s.node)
+    // 文は1行に1つ
+    if !sym(q, "\}") && !peek(q).nl { return Err("E0103") }
+  }
+  Ok(R { p: bump(q), node: node("block", "", stmts) })
+}
+
+fn is_place(n: Node) -> Bool {
+  if n.kind == "name" { return true }
+  if n.kind == "field" || n.kind == "index" { return is_place(n.kids[0]) }
+  false
+}
+
+fn stmt(p: P) -> Result<R, String> {
+  if kw(p, "let") {
+    let mut q = bump(p)
+    let mutable = kw(q, "mut")
+    if mutable {
+      q = bump(q)
+    }
+    let name = lower_ident(q)?
+    q = name.p
+    let mut kids = []
+    if sym(q, ":") {
+      let ty = type_expr(bump(q))?
+      q = ty.p
+      kids = kids.push(node("ann", "", [ty.node]))
+    }
+    let value = expr(expect_sym(q, "=")?)?
+    let kind = if mutable { "letmut" } else { "let" }
+    return Ok(R { p: value.p, node: node(kind, name.name, kids.push(value.node)) })
+  }
+  if kw(p, "while") {
+    let cond = expr(bump(p))?
+    let body = block(cond.p)?
+    return Ok(R { p: body.p, node: node("while", "", [cond.node, body.node]) })
+  }
+  if kw(p, "for") {
+    let name = lower_ident(bump(p))?
+    if !kw(name.p, "in") { return Err("E0101") }
+    let iter = expr(bump(name.p))?
+    let mut q = iter.p
+    let mut kids = [iter.node]
+    if sym(q, "..") {
+      let end = expr(bump(q))?
+      q = end.p
+      kids = kids.push(node("to", "", [end.node]))
+    }
+    let body = block(q)?
+    return Ok(R { p: body.p, node: node("for", name.name, kids.push(body.node)) })
+  }
+  if kw(p, "assert") {
+    let cond = expr(bump(p))?
+    return Ok(R { p: cond.p, node: node("assert", "", [cond.node]) })
+  }
+  let e = expr(p)?
+  if !sym(e.p, "=") { return Ok(e) }
+  if !is_place(e.node) { return Err("E0102") }
+  let value = expr(bump(e.p))?
+  Ok(R { p: value.p, node: node("assign", "", [e.node, value.node]) })
+}
+
+// ---- 式 ----
+
+fn expr(p: P) -> Result<R, String> {
+  or_expr(p)
+}
+
+// 今の位置にある二項演算子。行の先頭にある演算子は式を続けない
+fn binop(p: P, ops: List<String>) -> String {
+  let t = peek(p)
+  if !t.nl && t.kind == "sym" && ops.contains(t.text) { t.text } else { "" }
+}
+
+fn binary(op: String, lhs: Node, rhs: Node) -> Node {
+  node("bin", op, [lhs, rhs])
+}
+
+fn or_expr(p: P) -> Result<R, String> {
+  let mut lhs = and_expr(p)?
+  while binop(lhs.p, ["||"]) != "" {
+    let rhs = and_expr(bump(lhs.p))?
+    lhs = R { p: rhs.p, node: binary("||", lhs.node, rhs.node) }
+  }
+  Ok(lhs)
+}
+
+fn and_expr(p: P) -> Result<R, String> {
+  let mut lhs = cmp_expr(p)?
+  while binop(lhs.p, ["&&"]) != "" {
+    let rhs = cmp_expr(bump(lhs.p))?
+    lhs = R { p: rhs.p, node: binary("&&", lhs.node, rhs.node) }
+  }
+  Ok(lhs)
+}
+
+fn cmp_expr(p: P) -> Result<R, String> {
+  let ops = ["==", "!=", "<", "<=", ">", ">="]
+  let lhs = add_expr(p)?
+  let op = binop(lhs.p, ops)
+  if op == "" { return Ok(lhs) }
+  let rhs = add_expr(bump(lhs.p))?
+  // 比較はつなげられない
+  if binop(rhs.p, ops) != "" { return Err("E0105") }
+  Ok(R { p: rhs.p, node: binary(op, lhs.node, rhs.node) })
+}
+
+fn add_expr(p: P) -> Result<R, String> {
+  let mut lhs = mul_expr(p)?
+  while true {
+    let op = binop(lhs.p, ["+", "-"])
+    if op == "" { break }
+    let rhs = mul_expr(bump(lhs.p))?
+    lhs = R { p: rhs.p, node: binary(op, lhs.node, rhs.node) }
+  }
+  Ok(lhs)
+}
+
+fn mul_expr(p: P) -> Result<R, String> {
+  let mut lhs = unary_expr(p)?
+  while true {
+    let op = binop(lhs.p, ["*", "/", "%"])
+    if op == "" { break }
+    let rhs = unary_expr(bump(lhs.p))?
+    lhs = R { p: rhs.p, node: binary(op, lhs.node, rhs.node) }
+  }
+  Ok(lhs)
+}
+
+fn unary_expr(p: P) -> Result<R, String> {
+  if sym(p, "-") {
+    let operand = unary_expr(bump(p))?
+    return Ok(R { p: operand.p, node: node("neg", "", [operand.node]) })
+  }
+  if sym(p, "!") {
+    let operand = unary_expr(bump(p))?
+    return Ok(R { p: operand.p, node: node("not", "", [operand.node]) })
+  }
+  postfix_expr(p)
+}
+
+fn postfix_expr(p: P) -> Result<R, String> {
+  let mut e = primary(p)?
+  while true {
+    let q = e.p
+    if sym(q, ".") {
+      // `.` は次の行に続けて書ける
+      let name = lower_ident(bump(q))?
+      if sym(name.p, "(") && !peek(name.p).nl {
+        let found = arg_list(bump(name.p), ")")?
+        e = R { p: found.p, node: node("method", name.name, [e.node].concat(found.nodes)) }
+      } else {
+        e = R { p: name.p, node: node("field", name.name, [e.node]) }
+      }
+    } else if sym(q, "[") && !peek(q).nl {
+      let index = expr(bump(q))?
+      e = R { p: expect_sym(index.p, "]")?, node: node("index", "", [e.node, index.node]) }
+    } else if sym(q, "?") && !peek(q).nl {
+      e = R { p: bump(q), node: node("try", "", [e.node]) }
+    } else {
+      break
+    }
+  }
+  Ok(e)
+}
+
+// カンマ区切りの式を close まで読む
+fn arg_list(p: P, close: String) -> Result<Rs, String> {
+  let mut q = p
+  let mut nodes = []
+  while !sym(q, close) {
+    let e = expr(q)?
+    q = e.p
+    nodes = nodes.push(e.node)
+    if !sym(q, ",") { break }
+    q = bump(q)
+  }
+  q = expect_sym(q, close)?
+  Ok(Rs { p: q, nodes: nodes })
+}
+
+// 文字列リテラル。`{...}` の中身は、その場で字句解析と構文解析をする
+fn string_lit(p: P) -> Result<R, String> {
+  let mut kids = []
+  for part in peek(p).parts {
+    if part.code {
+      let sub = P { toks: tokens(part.text)?, pos: 0, aliases: p.aliases }
+      let inner = expr(sub)?
+      if peek(inner.p).kind != "eof" { return Err("E0101") }
+      kids = kids.push(node("interp", "", [inner.node]))
+    } else {
+      kids = kids.push(leaf("lit", part.text))
+    }
+  }
+  Ok(R { p: bump(p), node: node("str", "", kids) })
+}
+
+// トップレベルの関数の呼び出しか、名前そのもの
+fn global_ref(p: P, name: String) -> Result<R, String> {
+  if sym(p, "(") && !peek(p).nl {
+    let found = arg_list(bump(p), ")")?
+    return Ok(R { p: found.p, node: node("call", name, found.nodes) })
+  }
+  Ok(R { p: p, node: leaf("name", name) })
+}
+
+fn primary(p: P) -> Result<R, String> {
+  let t = peek(p)
+  if t.kind == "int" { return Ok(R { p: bump(p), node: leaf("int", "{int_value(t.text)}") }) }
+  if t.kind == "float" { return Ok(R { p: bump(p), node: leaf("float", t.text) }) }
+  if kw(p, "true") || kw(p, "false") { return Ok(R { p: bump(p), node: leaf("bool", t.text) }) }
+  if t.kind == "str" { return string_lit(p) }
+  if t.kind == "ident" {
+    let q = bump(p)
+    if is_upper(t.text) { return upper_primary(q, t.text) }
+    if sym(q, ".") && p.aliases.contains(t.text) {
+      // `モジュール.名前`
+      let member = ident(bump(q))?
+      let full = "{t.text}.{member.name}"
+      if is_upper(member.name) { return upper_rest(member.p, full) }
+      return global_ref(member.p, full)
+    }
+    return global_ref(q, t.text)
+  }
+  if sym(p, "(") {
+    let q = bump(p)
+    if sym(q, ")") { return Ok(R { p: bump(q), node: leaf("unit", "") }) }
+    let inner = expr(q)?
+    return Ok(R { p: expect_sym(inner.p, ")")?, node: inner.node })
+  }
+  if sym(p, "[") {
+    let found = arg_list(bump(p), "]")?
+    return Ok(R { p: found.p, node: node("list", "", found.nodes) })
+  }
+  if sym(p, "|") || sym(p, "||") { return closure(p) }
+  if kw(p, "if") { return if_expr(p) }
+  if kw(p, "match") { return match_expr(p) }
+  if sym(p, "\{") { return block(p) }
+  if kw(p, "return") {
+    let q = bump(p)
+    let next = peek(q)
+    let closes = sym(q, "\}") || sym(q, ")") || sym(q, ",") || next.kind == "eof"
+    if next.nl || closes { return Ok(R { p: q, node: node("return", "", []) }) }
+    let value = expr(q)?
+    return Ok(R { p: value.p, node: node("return", "", [value.node]) })
+  }
+  if kw(p, "break") { return Ok(R { p: bump(p), node: leaf("break", "") }) }
+  if kw(p, "continue") { return Ok(R { p: bump(p), node: leaf("continue", "") }) }
+  Err("E0101")
+}
+
+fn closure(p: P) -> Result<R, String> {
+  let mut q = p
+  let mut ps = []
+  if sym(q, "||") {
+    q = bump(q)
+  } else {
+    q = expect_sym(q, "|")?
+    while !sym(q, "|") {
+      let name = lower_ident(q)?
+      q = name.p
+      let mut ann = []
+      if sym(q, ":") {
+        let ty = type_expr(bump(q))?
+        q = ty.p
+        ann = ann.push(ty.node)
+      }
+      ps = ps.push(node("cparam", name.name, ann))
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    q = expect_sym(q, "|")?
+  }
+  let body = expr(q)?
+  Ok(R { p: body.p, node: node("closure", "", [node("cparams", "", ps), body.node]) })
+}
+
+// 大文字で始まる名前から始まる式。p は名前の直後
+fn upper_primary(p: P, name: String) -> Result<R, String> {
+  if name == "Some" || name == "Ok" || name == "Err" {
+    let value = expr(expect_sym(p, "(")?)?
+    let mut q = value.p
+    if sym(q, ",") {
+      q = bump(q)
+    }
+    let owner = if name == "Some" { "Option" } else { "Result" }
+    return Ok(R { p: expect_sym(q, ")")?, node: node("ctor", "{owner}.{name}", [value.node]) })
+  }
+  if name == "None" { return Ok(R { p: p, node: leaf("ctor", "Option.None") }) }
+  if name == "Map" && sym(p, "\{") {
+    let mut q = bump(p)
+    let mut entries = []
+    while !sym(q, "\}") {
+      let key = expr(q)?
+      let value = expr(expect_sym(key.p, ":")?)?
+      q = value.p
+      entries = entries.push(node("entry", "", [key.node, value.node]))
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    return Ok(R { p: expect_sym(q, "\}")?, node: node("map", "", entries) })
+  }
+  upper_rest(p, name)
+}
+
+// 構造体リテラルか enum の値。p は型名の直後
+fn upper_rest(p: P, name: String) -> Result<R, String> {
+  if sym(p, "\{") {
+    let mut q = bump(p)
+    let mut fields = []
+    while !sym(q, "\}") {
+      let field = lower_ident(q)?
+      let value = expr(expect_sym(field.p, ":")?)?
+      q = value.p
+      fields = fields.push(node("init", field.name, [value.node]))
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    return Ok(R { p: expect_sym(q, "\}")?, node: node("new", name, fields) })
+  }
+  if sym(p, ".") {
+    let variant = upper_ident(bump(p))?
+    let full = "{name}.{variant.name}"
+    if sym(variant.p, "(") && !peek(variant.p).nl {
+      let found = arg_list(bump(variant.p), ")")?
+      return Ok(R { p: found.p, node: node("ctor", full, found.nodes) })
+    }
+    return Ok(R { p: variant.p, node: leaf("ctor", full) })
+  }
+  Err("E0101")
+}
+
+fn if_expr(p: P) -> Result<R, String> {
+  let cond = expr(bump(p))?
+  let then = block(cond.p)?
+  if !kw(then.p, "else") {
+    return Ok(R { p: then.p, node: node("if", "", [cond.node, then.node]) })
+  }
+  let q = bump(then.p)
+  let other = if kw(q, "if") { if_expr(q)? } else { block(q)? }
+  Ok(R { p: other.p, node: node("if", "", [cond.node, then.node, other.node]) })
+}
+
+fn match_expr(p: P) -> Result<R, String> {
+  let scrutinee = expr(bump(p))?
+  let mut q = expect_sym(scrutinee.p, "\{")?
+  let mut kids = [scrutinee.node]
+  while !sym(q, "\}") {
+    let pat = pattern(q)?
+    let body = expr(expect_sym(pat.p, "=>")?)?
+    q = body.p
+    kids = kids.push(node("arm", "", [pat.node, body.node]))
+    let comma = sym(q, ",")
+    if comma {
+      q = bump(q)
+    }
+    if !comma && !sym(q, "\}") && !peek(q).nl { return Err("E0101") }
+  }
+  Ok(R { p: expect_sym(q, "\}")?, node: node("match", "", kids) })
+}
+
+fn pattern(p: P) -> Result<R, String> {
+  let t = peek(p)
+  if t.kind == "int" { return Ok(R { p: bump(p), node: leaf("pint", "{int_value(t.text)}") }) }
+  if sym(p, "-") {
+    let q = bump(p)
+    let number = peek(q)
+    if number.kind != "int" { return Err("E0101") }
+    return Ok(R { p: bump(q), node: leaf("pint", "{0 - int_value(number.text)}") })
+  }
+  if kw(p, "true") || kw(p, "false") { return Ok(R { p: bump(p), node: leaf("pbool", t.text) }) }
+  if t.kind == "str" {
+    if t.parts.len() != 1 || t.parts[0].code { return Err("E0101") }
+    return Ok(R { p: bump(p), node: leaf("pstr", t.parts[0].text) })
+  }
+  if t.kind != "ident" { return Err("E0101") }
+  let q = bump(p)
+  if t.text == "_" { return Ok(R { p: q, node: leaf("pwild", "") }) }
+  if is_upper(t.text) {
+    if t.text == "Some" || t.text == "None" { return ctor_pattern(q, "Option", t.text) }
+    if t.text == "Ok" || t.text == "Err" { return ctor_pattern(q, "Result", t.text) }
+    let variant = upper_ident(expect_sym(q, ".")?)?
+    return ctor_pattern(variant.p, t.text, variant.name)
+  }
+  if !sym(q, ".") || !p.aliases.contains(t.text) {
+    return Ok(R { p: q, node: leaf("pbind", t.text) })
+  }
+  // `モジュール.Enum.Variant`
+  let owner = ident(bump(q))?
+  if !is_upper(owner.name) { return Err("E0101") }
+  let variant = upper_ident(expect_sym(owner.p, ".")?)?
+  ctor_pattern(variant.p, "{t.text}.{owner.name}", variant.name)
+}
+
+fn ctor_pattern(p: P, owner: String, variant: String) -> Result<R, String> {
+  let mut q = p
+  let mut subs = []
+  if sym(q, "(") {
+    q = bump(q)
+    while !sym(q, ")") {
+      let sub = pattern(q)?
+      q = sub.p
+      subs = subs.push(sub.node)
+      if !sym(q, ",") { break }
+      q = bump(q)
+    }
+    q = expect_sym(q, ")")?
+  }
+  Ok(R { p: q, node: node("pctor", "{owner}.{variant}", subs) })
+}
+
+// ---- 出力 ----
+
+fn quote(s: String) -> String {
+  s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\t", "\\t").replace(
+    "\r",
+    "\\r",
+  )
+}
+
+fn dump(n: Node) -> String {
+  let head = if n.text.is_empty() { "({n.kind}" } else { "({n.kind} \"{quote(n.text)}\"" }
+  if n.kids.is_empty() { return "{head})" }
+  let kids = n.kids.map(dump).join(" ")
+  "{head} {kids})"
+}
+
+// ソースを構文解析して、構文木かエラーを1行の文字列にする
+fn parse_text(src: String) -> String {
+  match parse(src) {
+    Ok(tree) => dump(tree)
+    Err(code) => "error {code}"
+  }
+}
+
+test "expressions" {
+  let src = "fn f() \{\n  1 + 2 * 3\n\}\n"
+  let body = "(block (bin \"+\" (int \"1\") (bin \"*\" (int \"2\") (int \"3\"))))"
+  let head = "(tparams) (params) (ret) (effects) (requires) (ensures)"
+  assert parse_text(src) == "(program (fn \"f\" {head} {body}))"
+}
+
+test "errors" {
+  assert parse_text("fn f() \{\n  let x = 1 let y = 2\n\}\n") == "error E0103"
+  assert parse_text("struct point \{ x: Int \}\n") == "error E0104"
+  assert parse_text("fn f() \{\n  a < b < c\n\}\n") == "error E0105"
+  assert parse_text("fn f() \{\n  1 = 2\n\}\n") == "error E0102"
+  assert parse_text("fn f() \{\n  let x = 1;\n\}\n") == "error E0001"
+  assert parse_text("let x = 1\n") == "error E0101"
+}
+
+fn main() uses io, fs {
+  for path in args() {
+    match read_file(path) {
+      Ok(src) => print(parse_text(src))
+      Err(message) => print("error {message}")
+    }
+  }
+}

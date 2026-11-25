@@ -114,9 +114,10 @@ v--jsonv を付けると同じ内容がJSONになります。
 
 ## YuiLang で YuiLang を書く
 
-処理系を少しずつ YuiLang 自身で書き直しています。最初の部品として、字句解析を
-[selfhost/lexer.yui](selfhost/lexer.yui) に置きました。`cargo test` は、このリポジトリのすべての
-`.yui` ファイルについて、Rust 版の字句解析と同じトークン列になることを確かめます。
+処理系を少しずつ YuiLang 自身で書き直しています。いまあるのは字句解析
+（[selfhost/lexer.yui](selfhost/lexer.yui)）と構文解析（[selfhost/parser.yui](selfhost/parser.yui)）です。
+`cargo test` は、このリポジトリのすべての `.yui` ファイルについて、Rust 版と同じトークン列・
+同じ構文木（構文エラーなら同じエラーコード）になることを確かめます。
 
 ```
 $ yui run selfhost/lexer.yui -- examples/hello.yui

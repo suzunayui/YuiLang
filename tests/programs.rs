@@ -274,3 +274,34 @@ fn selfhosted_lexer_matches_the_rust_lexer() {
         assert!(tokens > 10_000, "compared only {tokens} tokens");
     });
 }
+
+/// The parser written in YuiLang must build exactly the syntax tree of the
+/// Rust parser, or stop with the same error code, for every YuiLang file in
+/// the repository.
+#[test]
+fn selfhosted_parser_matches_the_rust_parser() {
+    with_big_stack(|| {
+        let loaded = yuilang::load_path(&root().join("selfhost/parser.yui"), None)
+            .map_err(|(d, _)| d)
+            .expect("the parser loads");
+        let mut files = Vec::new();
+        for dir in ["examples", "tests", "selfhost"] {
+            all_yui_files(&root().join(dir), &mut files);
+        }
+        files.sort();
+        let mut errors = 0;
+        for path in &files {
+            let src = std::fs::read_to_string(path).unwrap();
+            let expected = yuilang::parser::dump(&src);
+            let mut interp = Interp::new(&loaded.program, &loaded.sources.text);
+            interp.captured = Some(String::new());
+            interp.args = vec![path.to_string_lossy().to_string()];
+            interp.run_main().unwrap_or_else(|d| panic!("{}: {}", path.display(), d.message));
+            let actual = interp.captured.unwrap_or_default();
+            assert_eq!(actual.trim_end(), expected, "{}", path.display());
+            errors += expected.starts_with("error") as usize;
+        }
+        // The files that are expected to fail to parse are part of the comparison.
+        assert!(errors >= 3, "only {errors} files with syntax errors were compared");
+    });
+}
