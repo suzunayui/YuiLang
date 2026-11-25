@@ -61,7 +61,12 @@ pub const FRAME_SPAN: i32 = 24;
 
 /// A call or a return is generated inline only for functions with at most
 /// this many local slots to set up or check.
-const MAX_INLINE_LOCALS: usize = 16;
+pub const MAX_INLINE_LOCALS: usize = 16;
+
+/// Number of entries in a function's result cache. An entry holds a "filled"
+/// word, the arguments and the result. The cache is direct-mapped: a new
+/// result simply replaces whatever shared its entry, so it never grows.
+pub const MEMO_ENTRIES: usize = 1024;
 
 /// What the generated code needs to know about a function it calls.
 pub struct Callee {
@@ -498,6 +503,32 @@ impl Asm {
             self.inc_mem(M(RAX, 0));
             self.bind(done);
         }
+    }
+
+    /// Leaves in rcx the address of the cache entry for the arguments in the
+    /// first `n` slots. Uses rax.
+    fn memo_entry(&mut self, n: usize, table: usize) {
+        self.load(RAX, slot(0).at(8));
+        for i in 1..n as u32 {
+            self.imul_imm(RAX, 1_000_003);
+            self.alu_m(0x03, RAX, slot(i).at(8));
+        }
+        self.alu_imm(4, RAX, MEMO_ENTRIES as i32 - 1); // and
+        self.imul_imm(RAX, (n as i32 + 2) * 8);
+        self.mov_imm64(RCX, table as i64);
+        self.alu_rr(0x01, RCX, RAX);
+    }
+
+    /// Records the result in rdx for the arguments in the first `n` slots.
+    /// Parameters are never assigned to, so the slots still hold the arguments.
+    fn memo_store(&mut self, n: usize, table: usize) {
+        self.memo_entry(n, table);
+        self.store_imm(M(RCX, 0), 1);
+        for i in 0..n as u32 {
+            self.load(RAX, slot(i).at(8));
+            self.store(M(RCX, 8 + 8 * i as i32), RAX);
+        }
+        self.store(M(RCX, 8 + 8 * n as i32), RDX);
     }
 
     /// `mov qword [m], value`, using `scratch` when the value needs 64 bits.
@@ -994,6 +1025,9 @@ impl Gen<'_> {
             VItem::Imm(n) => a.mov_imm64(RDX, n),
             VItem::Cond(_) => {}
         }
+        if self.func.memo.get() != 0 {
+            a.memo_store(self.func.nparams, self.func.memo.get());
+        }
         a.store(slot(0).at(8), RDX);
         a.lea(R13, slot(1));
         a.alu_imm(5, R14, FRAME_SIZE);
@@ -1024,6 +1058,10 @@ impl Gen<'_> {
             }
             a.cmp_byte(slot(i), FIRST_HEAP_TAG);
             a.jcc(CC_AE, slow);
+        }
+        if self.func.memo.get() != 0 {
+            a.load(RDX, top(1).at(8));
+            a.memo_store(self.func.nparams, self.func.memo.get());
         }
         if unit_ret {
             // The result is discarded, so it must not need dropping either.
@@ -1731,6 +1769,31 @@ pub fn compile(func: &Func, helpers: &Helpers, callee: &dyn Fn(u32) -> Option<Ca
         if let Some(reg) = reg {
             g.a.load(reg, slot(s as u32).at(8));
         }
+    }
+
+    // A memoized function first looks its arguments up in the result cache.
+    // On a hit the call is over at once: the stack holds only the arguments
+    // and empty locals, so the result simply replaces them.
+    let memo = func.memo.get();
+    if memo != 0 {
+        let n = func.nparams;
+        let miss = g.a.label();
+        g.a.memo_entry(n, memo);
+        g.a.cmp_imm(M(RCX, 0), 1);
+        g.a.jcc(CC_NE, miss);
+        for i in 0..n as u32 {
+            g.a.load(RAX, slot(i).at(8));
+            g.a.alu_m(0x3B, RAX, M(RCX, 8 + 8 * i as i32));
+            g.a.jcc(CC_NE, miss);
+        }
+        g.a.load(RDX, M(RCX, 8 + 8 * n as i32));
+        g.a.store_imm(slot(0), TAG_INT as i32);
+        g.a.store(slot(0).at(8), RDX);
+        g.a.lea(R13, slot(1));
+        g.a.alu_imm(5, R14, FRAME_SIZE);
+        g.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+        g.a.jmp(exit);
+        g.a.bind(miss);
     }
 
     for (pc, op) in func.code.iter().enumerate() {

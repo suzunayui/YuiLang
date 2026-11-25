@@ -616,6 +616,9 @@ pub struct Interp<'a> {
     fault: Option<Fault>,
     #[cfg(target_arch = "x86_64")]
     code: crate::jit::CodeArena,
+    /// Result caches of memoized functions; generated code holds their addresses.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    memo_tables: Vec<Box<[u64]>>,
     /// Run generated machine code instead of interpreting the bytecode.
     /// Only available on x86-64; set `YUI_JIT=0` to turn it off.
     pub jit: bool,
@@ -660,6 +663,7 @@ impl<'a> Interp<'a> {
             g,
             main,
             stack: Stack::new(),
+            memo_tables: Vec::new(),
             fault: None,
             #[cfg(target_arch = "x86_64")]
             code: Default::default(),
@@ -1559,6 +1563,24 @@ mod native {
         }
     }
 
+    /// Whether calls to `func` may reuse earlier results. That is sound for a
+    /// function without effects: nothing but its arguments can influence it.
+    /// It pays off when the function calls itself more than once per call,
+    /// which is where the same arguments come up again and again.
+    fn memoizable(func: &Func, funcs: &[Rc<Func>]) -> bool {
+        let n = func.nparams;
+        let calls_itself = |op: &Op| match op {
+            Op::Call(index, _) => funcs.get(*index as usize).is_some_and(|f| std::ptr::eq(Rc::as_ptr(f), func)),
+            _ => false,
+        };
+        func.pure_fn
+            && func.int_ret
+            && (1..=3).contains(&n)
+            && (0..n).all(|s| func.int_slots.get(s).copied().unwrap_or(false))
+            && func.nlocals <= jit::MAX_INLINE_LOCALS
+            && func.code.iter().filter(|op| calls_itself(op)).count() >= 2
+    }
+
     /// Offsets of the pointer, length and capacity inside a `Vec<Value>`.
     /// Rust does not promise an order, so it is measured on a sample.
     fn vec_layout() -> Option<(i32, i32, i32)> {
@@ -1649,6 +1671,11 @@ mod native {
             }
             let span = frame.call_span();
             func.need.set(func.nlocals + func.code.len() + 64);
+            if func.memo.get() == 0 && memoizable(func, &self.g.funcs) {
+                let table = vec![0u64; jit::MEMO_ENTRIES * (func.nparams + 2)].into_boxed_slice();
+                func.memo.set(table.as_ptr() as usize);
+                self.memo_tables.push(table);
+            }
             let funcs = &self.g.funcs;
             let callee = |index: u32| {
                 funcs.get(index as usize).map(|f| jit::Callee {

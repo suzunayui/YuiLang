@@ -1,0 +1,95 @@
+// 副作用のない関数は、同じ引数なら必ず同じ結果になる。
+// JIT は、自分を2回以上呼ぶ整数の関数にこれを利用して、計算済みの結果を再利用する。
+// ここでは、再利用される関数と、同じ計算をする再利用されない関数（引数が4個）を比べる。
+
+fn fib(n: Int) -> Int {
+  if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+}
+
+fn fib_plain(n: Int, a: Int, b: Int, c: Int) -> Int {
+  if n < 2 { n } else { fib_plain(n - 1, a, b, c) + fib_plain(n - 2, a, b, c) }
+}
+
+// 引数が大きく離れていても、キャッシュの同じ場所を取り合うだけで結果は変わらない
+fn spread(n: Int) -> Int {
+  if n < 2000 { n } else { spread(n - 1024) + spread(n - 2048) }
+}
+
+fn spread_plain(n: Int, a: Int, b: Int, c: Int) -> Int {
+  if n < 2000 { n } else { spread_plain(n - 1024, a, b, c) + spread_plain(n - 2048, a, b, c) }
+}
+
+fn binomial(n: Int, k: Int) -> Int
+  requires n >= 0 && k >= 0
+{
+  if k == 0 || k == n { 1 } else { binomial(n - 1, k - 1) + binomial(n - 1, k) }
+}
+
+fn paths(a: Int, b: Int, c: Int) -> Int {
+  if a == 0 || b == 0 || c == 0 {
+    1
+  } else {
+    paths(a - 1, b, c) + paths(a, b - 1, c) + paths(a, b, c - 1)
+  }
+}
+
+fn paths_plain(a: Int, b: Int, c: Int, d: Int) -> Int {
+  if a == 0 || b == 0 || c == 0 {
+    1
+  } else {
+    paths_plain(a - 1, b, c, d) + paths_plain(a, b - 1, c, d) + paths_plain(a, b, c - 1, d)
+  }
+}
+
+// 負の数と大きな数
+fn halves(n: Int) -> Int {
+  if n > 0 - 3 && n < 3 { n } else { halves(n / 2) + halves(n / 3) }
+}
+
+fn halves_plain(n: Int, a: Int, b: Int, c: Int) -> Int {
+  if n > 0 - 3 && n < 3 { n } else { halves_plain(n / 2, a, b, c) + halves_plain(n / 3, a, b, c) }
+}
+
+test "fibonacci" {
+  assert fib(0) == 0
+  assert fib(1) == 1
+  assert fib(20) == 6765
+  for n in 0..18 {
+    assert fib(n) == fib_plain(n, 0, 0, 0)
+  }
+  // 同じ呼び出しを繰り返しても変わらない
+  assert fib(20) == 6765
+}
+
+test "arguments that share a cache entry" {
+  let mut n = 7000
+  while n > 0 {
+    assert spread(n) == spread_plain(n, 0, 0, 0)
+    n = n - 337
+  }
+}
+
+test "two and three arguments" {
+  assert binomial(10, 3) == 120
+  assert binomial(16, 8) == 12870
+  assert binomial(3, 10 - 7) == 1
+  for a in 0..4 {
+    for b in 0..4 {
+      assert paths(a, b, 2) == paths_plain(a, b, 2, 0)
+      assert paths(2, a, b) == paths_plain(2, a, b, 0)
+    }
+  }
+}
+
+test "negative and large arguments" {
+  let values = [0, 1, 0 - 1, 7, 0 - 7, 1000, 0 - 1000, 100003, 0 - 99991]
+  for v in values {
+    assert halves(v) == halves_plain(v, 0, 0, 0)
+  }
+  assert halves(1000) == halves(1000)
+}
+
+fn main() uses io {
+  print("fib(25) = {fib(25)}")
+  print("binomial(16, 8) = {binomial(16, 8)}")
+}

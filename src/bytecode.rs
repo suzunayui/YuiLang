@@ -156,6 +156,12 @@ pub struct Func {
     pub need: Cell<usize>,
     /// The function is declared to return `Int`.
     pub int_ret: bool,
+    /// Number of declared parameters (0 for closures and tests).
+    pub nparams: usize,
+    /// The function declares no effects, so its result depends only on its arguments.
+    pub pure_fn: bool,
+    /// Address of the function's result cache, or 0 (see `jit`).
+    pub memo: Cell<usize>,
     /// For each local slot: it only ever holds an `Int`.
     pub int_slots: Vec<bool>,
     /// For each op: it is an `Arith` or `Cmp` whose operands are `Int`.
@@ -175,6 +181,8 @@ pub fn compile_fn(g: &mut Globals, f: &FnDecl) -> Func {
     let mut c = Compiler::new(g, &f.name);
     c.func.unit_ret = f.ret.is_none();
     c.func.int_ret = c.g.types.int_fns.contains(&f.name);
+    c.func.nparams = f.params.len();
+    c.func.pure_fn = f.effects.is_empty();
     c.push_scope();
     for p in &f.params {
         let slot = c.alloc_var(p.span);
