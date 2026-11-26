@@ -20,7 +20,7 @@ fn model() -> String {
 
 // どのくらい深く考えさせるか: "low" / "medium" / "high"。深いほど返事が遅く、高くなる
 fn effort() -> String {
-  "low"
+  "medium"
 }
 
 // 送る本文（JSON）を組み立てる

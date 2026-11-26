@@ -28,16 +28,38 @@ struct Plan {
   // 集めるブロックの種類と数（集めないなら 0 個）
   collect_kind: Int,
   collect_count: Int,
-  // 建てるもの。箱 1 つにつき 7 個の数: 種類, x1, y1, z1, x2, y2, z2（種類 0 は「空ける」）
+  // 建てるもの。部品 1 つにつき 8 個の数: 形, 種類, x1, y1, z1, x2, y2, z2（種類 0 は「空ける」）
   boxes: List<Int>,
 }
 
+// ブロックの種類の名前（番号は blocks_gpu.kind_color と同じ）
+fn kind_names() -> List<String> {
+  [
+    "air", "dirt", "stone", "wood", "leaves", "planks", "red", "white", "glass", "pink",
+    "yellow", "brick", "dark_stone", "sandstone", "dark_wood", "roof_blue", "blue", "purple", "orange", "green",
+    "black", "gray", "gold", "snow", "teal", "cream", "lavender", "mint", "rose", "lantern",
+  ]
+}
+
 fn kind_of(name: String) -> Int {
-  let names = ["air", "dirt", "stone", "wood", "leaves", "planks", "red", "white", "glass", "pink", "yellow"]
+  let names = kind_names()
   for i in 0..names.len() {
     if names[i] == name { return i }
   }
   -1
+}
+
+// 部品の形の名前
+fn shape_names() -> List<String> {
+  ["box", "walls", "cylinder", "tube", "pyramid", "gable_x", "gable_z", "cone", "checker", "dome"]
+}
+
+fn shape_of(name: String) -> Int {
+  let names = shape_names()
+  for i in 0..names.len() {
+    if names[i] == name { return i }
+  }
+  0
 }
 
 fn kind_label(kind: Int) -> String {
@@ -51,24 +73,49 @@ fn system_prompt() -> String {
   let lines = [
     "あなたは、ブロックでできた 3 次元の世界で遊ぶゲームの中の仲間「ユイ」です。",
     "プレイヤーのお願いを聞いて、木を集めたり、建物を建てたりして手伝います。明るく、親しみやすく、短く話します。",
+    "建築がとても得意で、頼まれたものを、見ごたえのある凝った作りに仕上げます。",
     "",
     "返事は JSON で、次の項目を持ちます。",
     "- say: プレイヤーへのひとこと（プレイヤーと同じ言語で、40 文字以内）。",
     "- collect_kind と collect_count: 集めてくるブロックの種類と数。集めないときは \"none\" と 0。",
     "  集められるのは dirt（土）、stone（石）、wood（木の幹）、leaves（葉）。数は 1 から 40 まで。",
-    "- build: 建てるものを、箱の並びで表します。建てないときは空の並び。",
+    "- build: 建てるものを、部品の並びで表します。建てないときは空の並び。",
     "",
-    "箱の決まり:",
-    "- 箱は kind と、2 つの角 (x1, y1, z1)・(x2, y2, z2) で表し、その間（両端を含む）を kind のブロックで埋めます。",
-    "- 座標は建てる場所の中での位置で、どれも 0 から 15 までの整数。x は横、z は奥行き、y は高さで、y = 0 が地面のすぐ上の段です。",
-    "- 箱は並べた順に置かれ、後の箱が前の箱を上書きします。",
-    "- kind が \"air\" の箱は、その範囲を空けます。壁の箱を置いてから中を air でくり抜くと部屋になり、入口や窓の穴も air で開けます。",
-    "- 使える kind: dirt（土。上の面は草）、stone（灰色の石）、wood（茶色の幹）、leaves（緑の葉）、planks（明るい板）、",
-    "  red（赤）、white（白）、glass（水色。窓に使う）、pink（ピンク）、yellow（黄）、air（空ける）。",
-    "- プレイヤーは高さ 2 マス弱なので、入口は幅 1・高さ 2 以上、部屋の中の高さは 3 以上にします。",
-    "- 屋根は、1 段上がるごとに一回り小さい箱を重ねると、三角の屋根になります。",
-    "- 形と色を工夫して、お願いに合った見た目にしてください（かわいい家なら、屋根や窓、色の組み合わせ、煙突や花壇などの飾り）。",
-    "- 箱の数は 40 個までにします。",
+    "建てる場所:",
+    "- 横 x は 0 から 23、奥行き z は 0 から 23、高さ y は 0 から 19 の整数。y = 0 が地面のすぐ上の段です。",
+    "- 地面は建てる前に平らにならされます。プレイヤーは z の小さい側から建物を見るので、正面（入口）は z の小さい側に向けます。",
+    "",
+    "部品の決まり:",
+    "- 部品は shape（形）、kind（ブロックの種類）、2 つの角 (x1, y1, z1)・(x2, y2, z2) で表し、その 2 つの角が作る箱の中に形を作ります（両端を含む）。",
+    "- 部品は並べた順に置かれ、後の部品が前の部品を上書きします。",
+    "- kind が \"air\" の部品は、その形の範囲を空けます。部屋の中、入口、窓の穴、アーチは air でくり抜きます。",
+    "",
+    "shape（形）:",
+    "- box: 箱を全部埋める。",
+    "- walls: 箱の四方の壁だけ（床と天井なし、中は空のまま）。部屋や城壁に。",
+    "- cylinder: 縦の円柱（中まで埋まる）。 tube: 縦の円筒（壁だけ）。丸い塔に。",
+    "- pyramid: 1 段上がるごとに四方から 1 マスずつ縮む。四角い屋根や尖塔に。",
+    "- gable_x: 棟が x の向きに走る三角屋根（1 段ごとに z の両側から 1 マス縮む）。 gable_z: 棟が z の向きの三角屋根。",
+    "- cone: 上に向かって細くなる円すい。丸い塔のとんがり屋根に。",
+    "- dome: 半球の丸屋根。",
+    "- checker: 1 マスおきに置く市松模様。高さ 1 の walls の上に重ねて城壁のでこぼこ（狭間）にしたり、柵や模様にしたりします。",
+    "",
+    "kind（ブロックの種類）:",
+    "- 自然: dirt（土。上の面は草）、stone（灰色の石）、wood（茶色の幹）、leaves（緑の葉）、snow（雪の白）、sandstone（砂色の石）。",
+    "- 建材: planks（明るい板）、dark_wood（こげ茶の木）、brick（赤茶のれんが）、dark_stone（濃い灰色の石）、gray（明るい灰色）、white（白い壁）、cream（クリーム色の壁）、black（黒）。",
+    "- 屋根や飾り: red（赤）、roof_blue（紺）、blue（青）、teal（青緑）、green（緑）、purple（紫）、lavender（薄紫）、pink（ピンク）、rose（濃いピンク）、orange（オレンジ）、yellow（黄）、mint（ミント）、gold（金）。",
+    "- glass（水色。窓）、lantern（明かりの色。ランプや窓の灯り）、air（空ける）。",
+    "",
+    "見ごたえのある建物にするために:",
+    "- 範囲を広く使い、頼まれたものにふさわしい大きさにします（家なら横 9〜13、城や塔や神殿なら範囲いっぱい）。",
+    "- 1 つの箱で済ませず、母屋・張り出し・塔・玄関・煙突など、大きさと高さの違うかたまりを組み合わせます。",
+    "- 壁は 1 色にせず、土台・柱・壁・窓枠・軒・屋根で種類を変えます（例: 土台は stone、角の柱は dark_wood、壁は cream、屋根は red）。",
+    "- 窓は並べて付け、glass と枠を使います。入口には段、ひさし、両脇の柱や明かりを付けます。",
+    "- 屋根は建物より 1 マス張り出させ、gable や pyramid、cone、dome を使い分けます。棟や先端に飾りを付けます。",
+    "- 城なら、四隅に丸い塔（tube と cone）、城壁の上に checker のでこぼこ、門、中央に高い主塔、旗（細い柱と色のブロック）。",
+    "- 中は air でくり抜いて入れるようにし、床を張ります。プレイヤーは高さ 2 マス弱なので、入口は幅 1〜2・高さ 2 以上、部屋の高さは 3 以上。",
+    "- まわりに、花壇（色のブロック）、生け垣（leaves）、小道（sandstone や gray）、街灯（柱と lantern）などを添えます。",
+    "- 部品は 150 個まで使えます。凝った建物なら 60〜150 個を目安にします。",
     "",
     "集めることと建てることを同時に頼まれたら、両方を入れてかまいません。",
     "どちらでもないお願い（あいさつ、質問など）には、say だけで答えます。",
@@ -76,17 +123,24 @@ fn system_prompt() -> String {
   lines.join("\n")
 }
 
+// 名前の並びを、JSON の文字列の並びにする
+fn quoted(names: List<String>) -> String {
+  names.map(|name| json.quote(name)).join(",")
+}
+
 // 返事の形（JSON スキーマ）
 fn schema() -> String {
-  let kinds = "\"dirt\",\"stone\",\"wood\",\"leaves\""
+  let kinds = quoted(kind_names())
+  let shapes = quoted(shape_names())
   let number = "\{\"type\":\"integer\"}"
   let parts = [
     "\{\"type\":\"object\",\"properties\":\{\"say\":\{\"type\":\"string\"}",
-    "\"collect_kind\":\{\"type\":\"string\",\"enum\":[\"none\",{kinds}]}",
+    "\"collect_kind\":\{\"type\":\"string\",\"enum\":[\"none\",\"dirt\",\"stone\",\"wood\",\"leaves\"]}",
     "\"collect_count\":{number}",
-    "\"build\":\{\"type\":\"array\",\"items\":\{\"type\":\"object\",\"properties\":\{\"kind\":\{\"type\":\"string\",\"enum\":[\"air\",{kinds},\"planks\",\"red\",\"white\",\"glass\",\"pink\",\"yellow\"]}",
+    "\"build\":\{\"type\":\"array\",\"items\":\{\"type\":\"object\",\"properties\":\{\"shape\":\{\"type\":\"string\",\"enum\":[{shapes}]}",
+    "\"kind\":\{\"type\":\"string\",\"enum\":[{kinds}]}",
     "\"x1\":{number},\"y1\":{number},\"z1\":{number},\"x2\":{number},\"y2\":{number},\"z2\":{number}}",
-    "\"required\":[\"kind\",\"x1\",\"y1\",\"z1\",\"x2\",\"y2\",\"z2\"],\"additionalProperties\":false}}}",
+    "\"required\":[\"shape\",\"kind\",\"x1\",\"y1\",\"z1\",\"x2\",\"y2\",\"z2\"],\"additionalProperties\":false}}}",
     "\"required\":[\"say\",\"collect_kind\",\"collect_count\",\"build\"],\"additionalProperties\":false}",
   ]
   parts.join(",")
@@ -98,10 +152,11 @@ fn plan_from(reply: String) -> Result<Plan, String> {
   let mut boxes: List<Int> = []
   for item in json.items(json.get(v, "build")) {
     let kind = kind_of(json.text_of(json.get(item, "kind")))
-    if kind >= 0 && boxes.len() < 7 * 60 {
-      boxes = boxes.push(kind)
+    if kind >= 0 && boxes.len() < 8 * 200 {
+      boxes = boxes.push(shape_of(json.text_of(json.get(item, "shape")))).push(kind)
       for name in ["x1", "y1", "z1", "x2", "y2", "z2"] {
-        boxes = boxes.push(json.int_of(json.get(item, name)).max(0).min(15))
+        let limit = if name == "y1" || name == "y2" { 19 } else { 23 }
+        boxes = boxes.push(json.int_of(json.get(item, name)).max(0).min(limit))
       }
     }
   }
@@ -116,11 +171,67 @@ fn plan_from(reply: String) -> Result<Plan, String> {
 }
 
 fn box_text(kind: String, x1: Int, y1: Int, z1: Int, x2: Int, y2: Int, z2: Int) -> String {
-  "\{\"kind\":\"{kind}\",\"x1\":{x1},\"y1\":{y1},\"z1\":{z1},\"x2\":{x2},\"y2\":{y2},\"z2\":{z2}}"
+  "\{\"shape\":\"box\",\"kind\":\"{kind}\",\"x1\":{x1},\"y1\":{y1},\"z1\":{z1},\"x2\":{x2},\"y2\":{y2},\"z2\":{z2}}"
+}
+
+fn part_text(shape: String, kind: String, x1: Int, y1: Int, z1: Int, x2: Int, y2: Int, z2: Int) -> String {
+  "\{\"shape\":\"{shape}\",\"kind\":\"{kind}\",\"x1\":{x1},\"y1\":{y1},\"z1\":{z1},\"x2\":{x2},\"y2\":{y2},\"z2\":{z2}}"
+}
+
+// 決まった返事のお城: 城壁、四隅の丸い塔、門、主塔、旗
+fn canned_castle() -> String {
+  let mut parts = [
+    // 城壁と、その上のでこぼこ
+    part_text("walls", "dark_stone", 2, 0, 2, 21, 5, 21),
+    part_text("walls", "gray", 2, 6, 2, 21, 6, 21),
+    part_text("checker", "air", 2, 6, 2, 21, 6, 21),
+    // 門と、両脇の明かり
+    part_text("box", "air", 11, 0, 2, 12, 3, 2),
+    part_text("box", "dark_wood", 10, 4, 2, 13, 4, 2),
+    part_text("box", "lantern", 10, 3, 1, 10, 3, 1),
+    part_text("box", "lantern", 13, 3, 1, 13, 3, 1),
+    // 主塔: 石の土台、クリーム色の壁、角の柱、窓、赤い屋根
+    part_text("box", "stone", 7, 0, 8, 16, 1, 17),
+    part_text("box", "cream", 8, 2, 9, 15, 10, 16),
+    part_text("box", "air", 9, 1, 10, 14, 9, 15),
+    part_text("box", "planks", 9, 0, 10, 14, 0, 15),
+    part_text("box", "planks", 9, 5, 10, 14, 5, 15),
+    part_text("box", "dark_wood", 8, 2, 9, 8, 10, 9),
+    part_text("box", "dark_wood", 15, 2, 9, 15, 10, 9),
+    part_text("box", "dark_wood", 8, 2, 16, 8, 10, 16),
+    part_text("box", "dark_wood", 15, 2, 16, 15, 10, 16),
+    part_text("box", "air", 11, 1, 8, 12, 3, 9),
+    part_text("box", "glass", 10, 7, 9, 10, 8, 9),
+    part_text("box", "glass", 13, 7, 9, 13, 8, 9),
+    part_text("box", "glass", 8, 7, 12, 8, 8, 13),
+    part_text("box", "glass", 15, 7, 12, 15, 8, 13),
+    part_text("box", "glass", 8, 3, 12, 8, 4, 13),
+    part_text("box", "glass", 15, 3, 12, 15, 4, 13),
+    part_text("pyramid", "red", 7, 11, 8, 16, 15, 17),
+    part_text("box", "gold", 11, 16, 12, 12, 16, 13),
+    // 旗
+    part_text("box", "dark_wood", 11, 17, 12, 11, 19, 12),
+    part_text("box", "rose", 12, 18, 12, 13, 19, 12),
+  ]
+  // 四隅の丸い塔: 筒、窓、とんがり屋根
+  for corner in 0..4 {
+    let x = if corner % 2 == 0 { 0 } else { 19 }
+    let z = if corner < 2 { 0 } else { 19 }
+    parts = parts.push(part_text("tube", "stone", x, 0, z, x + 4, 9, z + 4))
+    parts = parts.push(part_text("tube", "gray", x, 10, z, x + 4, 10, z + 4))
+    parts = parts.push(part_text("box", "lantern", x + 2, 7, z, x + 2, 7, z + 4))
+    parts = parts.push(part_text("box", "lantern", x, 7, z + 2, x + 4, 7, z + 2))
+    parts = parts.push(part_text("box", "air", x + 2, 7, z + 1, x + 2, 7, z + 3))
+    parts = parts.push(part_text("box", "air", x + 1, 7, z + 2, x + 3, 7, z + 2))
+    parts = parts.push(part_text("cone", "roof_blue", x, 11, z, x + 4, 15, z + 4))
+  }
+  let joined = parts.join(",")
+  "\{\"say\":\"りっぱなお城、建てるね！\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
 }
 
 // API キーがないときの、決まった返事
 fn canned(request: String) -> String {
+  if request.contains("城") || request.contains("castle") { return canned_castle() }
   if request.contains("家") || request.contains("うち") || request.contains("house") {
     let boxes = [
       box_text("planks", 1, 0, 1, 7, 0, 6),
@@ -147,7 +258,7 @@ fn canned(request: String) -> String {
   if request.contains("木") || request.contains("wood") {
     return "\{\"say\":\"木を集めてくるね！\",\"collect_kind\":\"wood\",\"collect_count\":12,\"build\":[]}"
   }
-  "\{\"say\":\"API キーがないから、木集めとおうち作りだけ手伝えるよ\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
+  "\{\"say\":\"API キーがないから、木集めと、おうち・お城作りだけ手伝えるよ\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
 }
 
 // ---- してもらうことを、ブロック 1 つずつの作業に直す ----
@@ -195,41 +306,93 @@ fn ground_at(world: List<Int>, x: Int, z: Int) -> Int {
   top
 }
 
-// 箱の並びを、(ox, oz) を角とする場所に建てる作業にする
+// 箱 (x1..x2, z1..z2) にちょうど収まる円（だ円）を scale 倍に縮めたものの中に、マス (x, z) があるか
+fn in_round(scale: Float, x: Int, z: Int, x1: Int, z1: Int, x2: Int, z2: Int) -> Bool {
+  let rx = (x2 - x1 + 1).to_float() / 2.0 * scale
+  let rz = (z2 - z1 + 1).to_float() / 2.0 * scale
+  if rx <= 0.0 || rz <= 0.0 { return false }
+  let dx = (x.to_float() + 0.5 - (x1 + x2 + 1).to_float() / 2.0) / rx
+  let dz = (z.to_float() + 0.5 - (z1 + z2 + 1).to_float() / 2.0) / rz
+  dx * dx + dz * dz <= 1.0
+}
+
+// 箱 (x1, y1, z1)〜(x2, y2, z2) の中に作る形 shape に、マス (x, y, z) が入るか。形の番号は shape_names の順
+fn in_shape(
+  shape: Int,
+  x: Int,
+  y: Int,
+  z: Int,
+  x1: Int,
+  y1: Int,
+  z1: Int,
+  x2: Int,
+  y2: Int,
+  z2: Int,
+) -> Bool {
+  let level = y - y1
+  let levels = y2 - y1 + 1
+  if shape == 1 { return x == x1 || x == x2 || z == z1 || z == z2 }
+  if shape == 2 { return in_round(1.0, x, z, x1, z1, x2, z2) }
+  if shape == 3 {
+    // 円柱のうち、となりが円柱の外にあるマスだけ
+    if !in_round(1.0, x, z, x1, z1, x2, z2) { return false }
+    return !(in_round(1.0, x - 1, z, x1, z1, x2, z2) && in_round(1.0, x + 1, z, x1, z1, x2, z2) && in_round(1.0, x, z - 1, x1, z1, x2, z2) && in_round(1.0, x, z + 1, x1, z1, x2, z2))
+  }
+  if shape == 4 { return x >= x1 + level && x <= x2 - level && z >= z1 + level && z <= z2 - level }
+  if shape == 5 { return z >= z1 + level && z <= z2 - level }
+  if shape == 6 { return x >= x1 + level && x <= x2 - level }
+  if shape == 7 { return in_round(1.0 - level.to_float() / levels.to_float(), x, z, x1, z1, x2, z2) }
+  if shape == 8 { return (x - x1 + y - y1 + z - z1) % 2 == 0 }
+  if shape == 9 {
+    // 半球: 高さの分だけ、円を小さくしていく
+    let t = (level.to_float() + 0.5) / levels.to_float()
+    let rx = (x2 - x1 + 1).to_float() / 2.0
+    let rz = (z2 - z1 + 1).to_float() / 2.0
+    let dx = (x.to_float() + 0.5 - (x1 + x2 + 1).to_float() / 2.0) / rx
+    let dz = (z.to_float() + 0.5 - (z1 + z2 + 1).to_float() / 2.0) / rz
+    return dx * dx + dz * dz + t * t <= 1.0
+  }
+  true
+}
+
+// 部品の並びを、(ox, oz) を角とする場所に建てる作業にする
 fn build_jobs(world: List<Int>, boxes: List<Int>, ox: Int, oz: Int) -> List<Int> {
-  // 建てる場所の中の 16 × 16 × 16 マス。-1 = 何も決まっていない、0 = 空ける、1 以上 = その種類
+  // 建てる場所の中の 横 24 × 奥行き 24 × 高さ 20 マス。-1 = 何も決まっていない、0 = 空ける、1 以上 = その種類
   let mut grid: List<Int> = []
-  for i in 0..4096 {
+  for i in 0..11520 {
     grid = grid.push(-1)
   }
   let mut b = 0
-  while b + 7 <= boxes.len() {
-    let kind = boxes[b]
-    let x1 = boxes[b + 1].min(boxes[b + 4])
-    let x2 = boxes[b + 1].max(boxes[b + 4])
-    let y1 = boxes[b + 2].min(boxes[b + 5])
-    let y2 = boxes[b + 2].max(boxes[b + 5])
-    let z1 = boxes[b + 3].min(boxes[b + 6])
-    let z2 = boxes[b + 3].max(boxes[b + 6])
+  while b + 8 <= boxes.len() {
+    let shape = boxes[b]
+    let kind = boxes[b + 1]
+    let x1 = boxes[b + 2].min(boxes[b + 5])
+    let x2 = boxes[b + 2].max(boxes[b + 5])
+    let y1 = boxes[b + 3].min(boxes[b + 6])
+    let y2 = boxes[b + 3].max(boxes[b + 6])
+    let z1 = boxes[b + 4].min(boxes[b + 7])
+    let z2 = boxes[b + 4].max(boxes[b + 7])
     for y in y1..y2 + 1 {
       for z in z1..z2 + 1 {
         for x in x1..x2 + 1 {
-          grid[(y * 16 + z) * 16 + x] = kind
+          if shape == 0 || in_shape(shape, x, y, z, x1, y1, z1, x2, y2, z2) {
+            grid[(y * 24 + z) * 24 + x] = kind
+          }
         }
       }
     }
-    b = b + 7
+    b = b + 8
   }
   // 建物が使う範囲（横・奥行き）と高さ
-  let mut x_lo = 16
+  let mut x_lo = 24
   let mut x_hi = -1
-  let mut z_lo = 16
+  let mut z_lo = 24
   let mut z_hi = -1
   let mut height = 0
-  for z in 0..16 {
-    for x in 0..16 {
-      for y in 0..16 {
-        if grid[(y * 16 + z) * 16 + x] > 0 {
+  for z in 0..24 {
+    for x in 0..24 {
+      for y in 0..20 {
+        if grid[(y * 24 + z) * 24 + x] > 0 {
           x_lo = x_lo.min(x)
           x_hi = x_hi.max(x)
           z_lo = z_lo.min(z)
@@ -268,11 +431,11 @@ fn build_jobs(world: List<Int>, boxes: List<Int>, ox: Int, oz: Int) -> List<Int>
   }
   // 下の段から順に。じゃまな木と葉はどける
   for y in 0..height {
-    for z in 0..16 {
-      for x in 0..16 {
+    for z in 0..24 {
+      for x in 0..24 {
         let wy = base + y
         if wy < 32 {
-          let wanted = grid[(y * 16 + z) * 16 + x]
+          let wanted = grid[(y * 24 + z) * 24 + x]
           // ならす作業で削られることになっている所は、空いているものとして考える
           let leveled = wy < ground_at(world, ox + x, oz + z)
           let now = if leveled { 0 } else { world[(wy * 128 + oz + z) * 128 + ox + x] }
@@ -294,12 +457,12 @@ fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
   let ahead = 5.0 + w.max(d).to_float() / 2.0
   let cx = blocks_gpu.whole(p.x + blocks_gpu.sine(p.turn) * ahead) - w / 2
   let cz = blocks_gpu.whole(p.z + blocks_gpu.cosine(p.turn) * ahead) - d / 2
-  // まわり 41 × 41 列の地面の高さを先に調べておく（世界の外は -1）
+  // まわり 51 × 51 列の地面の高さを先に調べておく（世界の外は -1）
   let x0 = cx - 12
   let z0 = cz - 12
   let mut heights: List<Int> = []
-  for z in 0..41 {
-    for x in 0..41 {
+  for z in 0..51 {
+    for x in 0..51 {
       let wx = x0 + x
       let wz = z0 + z
       heights = heights.push(if wx >= 1 && wx < 127 && wz >= 1 && wz < 127 { ground_at(world, wx, wz) } else { -1 })
@@ -307,7 +470,7 @@ fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
   }
   let px = blocks_gpu.whole(p.x)
   let pz = blocks_gpu.whole(p.z)
-  let mut best = cx.max(1).min(110) * 128 + cz.max(1).min(110)
+  let mut best = cx.max(2).min(100) * 128 + cz.max(2).min(100)
   let mut best_score = 1000000
   for dz in 0..25 {
     for dx in 0..25 {
@@ -319,7 +482,7 @@ fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
       let mut usable = !(px >= ox - 1 && px <= ox + w && pz >= oz - 1 && pz <= oz + d)
       for z in 0..d {
         for x in 0..w {
-          let h = heights[(dz + z) * 41 + dx + x]
+          let h = heights[(dz + z) * 51 + dx + x]
           if h < 0 {
             usable = false
           }
@@ -345,7 +508,7 @@ fn jobs_for(world: List<Int>, plan: Plan, p: blocks_gpu.Player, fx: Float, fz: F
   }
   if !plan.boxes.is_empty() {
     let size = footprint(plan.boxes)
-    let site = site_for(world, p, (size / 32).min(16), (size % 32).min(16))
+    let site = site_for(world, p, (size / 32).min(24), (size % 32).min(24))
     jobs = jobs.concat(build_jobs(world, plan.boxes, site / 128, site % 128))
   }
   jobs
@@ -356,12 +519,28 @@ fn footprint(boxes: List<Int>) -> Int {
   let mut w = 1
   let mut d = 1
   let mut b = 0
-  while b + 7 <= boxes.len() {
-    w = w.max(boxes[b + 1] + 1).max(boxes[b + 4] + 1)
-    d = d.max(boxes[b + 3] + 1).max(boxes[b + 6] + 1)
-    b = b + 7
+  while b + 8 <= boxes.len() {
+    w = w.max(boxes[b + 2] + 1).max(boxes[b + 5] + 1)
+    d = d.max(boxes[b + 4] + 1).max(boxes[b + 7] + 1)
+    b = b + 8
   }
   w * 32 + d
+}
+
+// マス (x, ?, z) が変わったときに作り直す区画（その区画と、境目なら隣の区画）を dirty に足す
+fn touched(dirty: List<Int>, x: Int, z: Int) -> List<Int> {
+  let mut out = dirty
+  for k in 0..5 {
+    let px = if k == 1 { x - 1 } else if k == 2 { x + 1 } else { x }
+    let pz = if k == 3 { z - 1 } else if k == 4 { z + 1 } else { z }
+    if px >= 0 && px < 128 && pz >= 0 && pz < 128 {
+      let chunk = pz / 16 * 8 + px / 16
+      if !out.contains(chunk) {
+        out = out.push(chunk)
+      }
+    }
+  }
+  out
 }
 
 // ---- ユイの姿 ----
@@ -493,11 +672,10 @@ fn main() uses io, net {
   // ユイの作業（5 個で 1 つ）と、次にやる位置
   let mut jobs: List<Int> = []
   let mut job = 0
-  let mut pause = 0
   // 集めたブロックの数（種類ごと）
   let mut bag = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   // 会話
-  let mut log = [if key.is_empty() { "ユイ: やっほー！ Enter でお願いを書いてね（API キーがないので、木集めとおうち作りだけ）" } else { "ユイ: やっほー！ Enter でお願いを書いてね" }]
+  let mut log = [if key.is_empty() { "ユイ: やっほー！ Enter でお願いを書いてね（API キーがないので、木集めと、おうち・お城作りだけ）" } else { "ユイ: やっほー！ Enter でお願いを書いてね" }]
   let mut typing = false
   let mut escape_held = false
   let mut draft = ""
@@ -705,38 +883,45 @@ fn main() uses io, net {
     fx = fx + (goal_x - fx).max(-pace).min(pace)
     fy = fy + (goal_y - fy).max(-pace).min(pace)
     fz = fz + (goal_z - fz).max(-pace).min(pace)
-    if pause > 0 {
-      pause = pause - 1
-    }
-    let near = (goal_x - fx).abs() < 2.5 && (goal_y - fy).abs() < 2.5 && (goal_z - fz).abs() < 2.5
-    if working && near && pause == 0 {
-      let x = jobs[job + 1]
-      let y = jobs[job + 2]
-      let z = jobs[job + 3]
-      let cell = (y * 128 + z) * 128 + x
-      if x >= 0 && x < 128 && z >= 0 && z < 128 && y >= 0 && y < 32 {
-        let now = world[cell]
-        if jobs[job] == 0 && now != 0 {
-          bag[now] = bag[now] + 1
-          world[cell] = 0
-          broken = broken + 1
-          meshes = blocks_gpu.rebuild(world, meshes, x, z)
-        } else if jobs[job] == 1 && now != jobs[job + 4] {
-          world[cell] = jobs[job + 4]
-          // プレイヤーに重なる場所には置かない
-          if blocks_gpu.blocked(world, p.x, p.y, p.z) {
-            world[cell] = now
-          } else {
-            placed = placed + 1
-            sum_x = sum_x + x
-            sum_z = sum_z + z
-            low_y = low_y.min(y)
-            meshes = blocks_gpu.rebuild(world, meshes, x, z)
+    // 建物の全体に手が届く所まで来たら、作業を進める。残りが多いほど 1 コマに進める数を増やす
+    let near = (goal_x - fx).abs() < 16.0 && (goal_y - fy).abs() < 16.0 && (goal_z - fz).abs() < 16.0
+    if working && near {
+      let mut budget = 1 + (jobs.len() - job) / 5 / 150
+      // 変わった区画は、最後にまとめて 1 回ずつ作り直す
+      let mut dirty: List<Int> = []
+      while budget > 0 && job < jobs.len() {
+        let x = jobs[job + 1]
+        let y = jobs[job + 2]
+        let z = jobs[job + 3]
+        let cell = (y * 128 + z) * 128 + x
+        if x >= 0 && x < 128 && z >= 0 && z < 128 && y >= 0 && y < 32 {
+          let now = world[cell]
+          if jobs[job] == 0 && now != 0 {
+            bag[now.min(10)] = bag[now.min(10)] + 1
+            world[cell] = 0
+            broken = broken + 1
+            dirty = touched(dirty, x, z)
+          } else if jobs[job] == 1 && now != jobs[job + 4] {
+            world[cell] = jobs[job + 4]
+            // プレイヤーに重なる場所には置かない
+            if blocks_gpu.blocked(world, p.x, p.y, p.z) {
+              world[cell] = now
+            } else {
+              placed = placed + 1
+              sum_x = sum_x + x
+              sum_z = sum_z + z
+              low_y = low_y.min(y)
+              dirty = touched(dirty, x, z)
+            }
           }
         }
+        job = job + 5
+        budget = budget - 1
       }
-      job = job + 5
-      pause = 1
+      for chunk in dirty {
+        gpu_free(meshes[chunk])
+        meshes[chunk] = blocks_gpu.build_chunk(world, chunk % 8, chunk / 8)
+      }
       if job >= jobs.len() {
         jobs = []
         job = 0
@@ -750,7 +935,8 @@ fn main() uses io, net {
       // 動作確認のとき: 建て終わったら、建てたものを少し離れた高い所から見る
       let mid_x = (sum_x / placed).to_float() + 0.5
       let mid_z = (sum_z / placed).to_float() + 0.5
-      gpu_camera(mid_x - st * 13.0, low_y.to_float() + 6.0, mid_z - ct * 13.0, p.turn * 57.29577951308232, -14.0)
+      let back = if placed > 800 { 30.0 } else { 13.0 }
+      gpu_camera(mid_x - st * back, low_y.to_float() + back * 0.45, mid_z - ct * back, p.turn * 57.29577951308232, -14.0)
     } else {
       gpu_camera(p.x, p.y + 1.6, p.z, p.turn * 57.29577951308232, p.tilt * 57.29577951308232)
     }

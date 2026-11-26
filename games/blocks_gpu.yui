@@ -18,7 +18,7 @@
 
 // 世界は 横 128 × 高さ 32 × 奥行き 128 マス。マス (x, y, z) は表の (y * 128 + z) * 128 + x 番目。
 // マスの中身: 0 = 空、1 = 土（上の面は草）、2 = 石、3 = 木、4 = 葉、
-//             5 = 板、6 = 赤、7 = 白、8 = 水色、9 = ピンク、10 = 黄（5 以降は blocks_ai.yui で使う）
+//             5 以降は色ちがいのブロック（kind_color にある。blocks_ai.yui で使う）
 // 三角形は 横 16 × 奥行き 16 マスの区画ごとにまとめる（8 × 8 = 64 区画）。
 // ブロックが変わったら、その区画だけ作り直す。
 
@@ -263,13 +263,39 @@ fn kind_color(kind: Int, top: Bool) -> Int {
     7 => rgb(238, 236, 228)
     8 => rgb(150, 205, 235)
     9 => rgb(244, 160, 190)
-    _ => rgb(246, 214, 92)
+    10 => rgb(246, 214, 92)
+    11 => rgb(168, 84, 62)
+    12 => rgb(84, 86, 96)
+    13 => rgb(222, 204, 150)
+    14 => rgb(78, 54, 34)
+    15 => rgb(58, 84, 150)
+    16 => rgb(72, 128, 220)
+    17 => rgb(150, 100, 200)
+    18 => rgb(240, 150, 60)
+    19 => rgb(80, 170, 90)
+    20 => rgb(40, 40, 48)
+    21 => rgb(170, 172, 178)
+    22 => rgb(240, 196, 60)
+    23 => rgb(250, 250, 255)
+    24 => rgb(60, 170, 170)
+    25 => rgb(250, 236, 200)
+    26 => rgb(200, 180, 240)
+    27 => rgb(170, 230, 200)
+    28 => rgb(220, 90, 130)
+    _ => rgb(255, 232, 160)
   }
 }
 
 // ブロックの面の色。上から見える面は明るく、横は少し暗く、下は暗く
 fn block_color(kind: Int, face: Int) -> Int {
-  let light = if face == 2 { 100 } else if face == 3 { 45 } else if face < 2 { 78 } else { 62 }
+  block_color_at(kind, face, 0, 0, 0)
+}
+
+// 場所ごとに明るさを少しだけ変えて、のっぺりしないようにする（ガラスは変えない）
+fn block_color_at(kind: Int, face: Int, x: Int, y: Int, z: Int) -> Int {
+  let base = if face == 2 { 100 } else if face == 3 { 45 } else if face < 2 { 78 } else { 62 }
+  let grain = if kind == 8 { 0 } else { (x * 73 + y * 179 + z * 283 + x * z % 7 * 31) % 9 - 4 }
+  let light = base + grain
   let color = kind_color(kind, face == 2)
   rgb(color / 65536 * light / 100, color / 256 % 256 * light / 100, color % 256 * light / 100)
 }
@@ -306,7 +332,7 @@ fn build_chunk(world: List<Int>, cx: Int, cz: Int) -> Int uses io {
               for value in face_points(fx, fy, fz, fx + 1.0, fy + 1.0, fz + 1.0, face) {
                 points = points.push(value)
               }
-              let color = block_color(kind, face)
+              let color = block_color_at(kind, face, x, y, z)
               colors = colors.push(color)
               colors = colors.push(color)
             }
