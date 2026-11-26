@@ -1,0 +1,14 @@
+// GPU で描く関数は、GPU のウィンドウを開いていなければ何もしない（三角形の番号は 0）
+
+fn main() uses io {
+  let points = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+  let colors = [rgb(255, 0, 0)]
+  gpu_clear(rgb(10, 20, 30))
+  gpu_camera(1.5, 2.5, 3.5, 45.0, -10.0)
+  gpu_fog(rgb(1, 2, 3), 10, 40)
+  let mesh = gpu_mesh(points, colors)
+  gpu_draw(mesh, 0.5, 0.0, -0.5)
+  gpu_rect(1, 2, 3, 4, 255)
+  gpu_free(mesh)
+  print("{mesh} {points.len()} {colors} {window_update()}")
+}

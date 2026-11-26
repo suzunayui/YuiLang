@@ -1437,6 +1437,10 @@ impl<'a> Interp<'a> {
                     Some(Value::Int(n)) => *n,
                     _ => 0,
                 };
+                let float = |i: usize| match args.get(i) {
+                    Some(Value::Float(f)) => *f,
+                    _ => 0.0,
+                };
                 let name_of = |i: usize| args.get(i).map(|v| v.display()).unwrap_or_default();
                 Ok(match name {
                     "window_open" => match window::open(&name_of(0), int(1), int(2), int(3)) {
@@ -1473,6 +1477,48 @@ impl<'a> Interp<'a> {
                     "random" => Value::Int(window::random(int(0))),
                     "random_seed" => {
                         window::random_seed(int(0));
+                        Value::Unit
+                    }
+                    "gpu_open" => match window::gpu_open(&name_of(0), int(1), int(2)) {
+                        Ok(()) => Value::Unit,
+                        Err(why) => return Err(panic("E0510", why, span)),
+                    },
+                    "gpu_clear" => {
+                        window::gpu_clear(int(0));
+                        Value::Unit
+                    }
+                    "gpu_camera" => {
+                        window::gpu_camera(float(0), float(1), float(2), float(3), float(4));
+                        Value::Unit
+                    }
+                    "gpu_fog" => {
+                        window::gpu_fog(int(0), int(1), int(2));
+                        Value::Unit
+                    }
+                    "gpu_mesh" => {
+                        let (mut points, mut colors) = (Vec::new(), Vec::new());
+                        if let Some(Value::List(ps)) = args.first() {
+                            points.extend(ps.iter().map(|v| if let Value::Float(f) = v { *f } else { 0.0 }));
+                        }
+                        match args.get(1) {
+                            Some(Value::Ints(cs)) => colors.extend(cs.iter()),
+                            Some(Value::List(cs)) => {
+                                colors.extend(cs.iter().map(|v| if let Value::Int(n) = v { *n } else { 0 }))
+                            }
+                            _ => {}
+                        }
+                        Value::Int(window::gpu_mesh(&points, &colors))
+                    }
+                    "gpu_draw" => {
+                        window::gpu_draw(int(0), float(1), float(2), float(3));
+                        Value::Unit
+                    }
+                    "gpu_free" => {
+                        window::gpu_free(int(0));
+                        Value::Unit
+                    }
+                    "gpu_rect" => {
+                        window::gpu_rect(int(0), int(1), int(2), int(3), int(4));
                         Value::Unit
                     }
                     _ => return Err(internal(span)),

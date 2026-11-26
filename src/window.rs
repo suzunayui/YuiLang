@@ -19,6 +19,10 @@ struct Window {
     scale: i64,
     /// One `0x00RRGGBB` per pixel, row by row from the top.
     pixels: Vec<u32>,
+    /// For a window the graphics card draws in: what it draws on, and its
+    /// OpenGL context.
+    #[cfg(windows)]
+    gpu: Option<(isize, isize)>,
 }
 
 thread_local! {
@@ -152,6 +156,18 @@ mod os {
     pub fn mouse_down(_button: i64) -> bool {
         false
     }
+    pub fn gpu_open(_title: &str, _width: i64, _height: i64) -> Result<(), &'static str> {
+        Err(super::UNSUPPORTED)
+    }
+    pub fn gpu_clear(_color: i64) {}
+    pub fn gpu_camera(_x: f64, _y: f64, _z: f64, _turn: f64, _tilt: f64) {}
+    pub fn gpu_fog(_color: i64, _start: i64, _end: i64) {}
+    pub fn gpu_mesh(_points: &[f64], _colors: &[i64]) -> i64 {
+        0
+    }
+    pub fn gpu_draw(_mesh: i64, _x: f64, _y: f64, _z: f64) {}
+    pub fn gpu_free(_mesh: i64) {}
+    pub fn gpu_rect(_x: i64, _y: i64, _width: i64, _height: i64, _color: i64) {}
 }
 
 #[cfg(windows)]
@@ -245,6 +261,7 @@ mod os {
         fn ScreenToClient(window: isize, point: *mut Point) -> i32;
         fn LoadCursorW(instance: isize, name: *const u16) -> isize;
         fn GetForegroundWindow() -> isize;
+        fn SetProcessDPIAware() -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -265,7 +282,65 @@ mod os {
             usage: u32,
             operation: u32,
         ) -> i32;
+        fn ChoosePixelFormat(dc: isize, format: *const PixelFormat) -> i32;
+        fn SetPixelFormat(dc: isize, index: i32, format: *const PixelFormat) -> i32;
+        fn SwapBuffers(dc: isize) -> i32;
     }
+
+    /// What kind of surface OpenGL is to draw on (PIXELFORMATDESCRIPTOR).
+    #[repr(C)]
+    struct PixelFormat {
+        size: u16,
+        version: u16,
+        flags: u32,
+        pixel_type: u8,
+        color_bits: u8,
+        unused: [u8; 13],
+        depth_bits: u8,
+        rest: [u8; 16],
+    }
+
+    // OpenGL as it was in 1997: in every Windows, and every call is a plain
+    // function, which is what `runtime.yui` can call too.
+    #[link(name = "opengl32")]
+    extern "system" {
+        fn wglCreateContext(dc: isize) -> isize;
+        fn wglMakeCurrent(dc: isize, context: isize) -> i32;
+        fn wglDeleteContext(context: isize) -> i32;
+        fn glClearColor(r: f32, g: f32, b: f32, a: f32);
+        fn glClear(mask: u32);
+        fn glEnable(what: u32);
+        fn glDisable(what: u32);
+        fn glMatrixMode(mode: u32);
+        fn glLoadIdentity();
+        fn glFrustum(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64);
+        fn glOrtho(left: f64, right: f64, bottom: f64, top: f64, near: f64, far: f64);
+        fn glRotated(angle: f64, x: f64, y: f64, z: f64);
+        fn glTranslated(x: f64, y: f64, z: f64);
+        fn glScaled(x: f64, y: f64, z: f64);
+        fn glViewport(x: i32, y: i32, width: i32, height: i32);
+        fn glBegin(mode: u32);
+        fn glEnd();
+        fn glColor3ub(r: u8, g: u8, b: u8);
+        fn glVertex3dv(point: *const f64);
+        fn glVertex2i(x: i32, y: i32);
+        fn glGenLists(count: i32) -> u32;
+        fn glNewList(list: u32, mode: u32);
+        fn glEndList();
+        fn glCallList(list: u32);
+        fn glDeleteLists(list: u32, count: i32);
+        fn glPushMatrix();
+        fn glPopMatrix();
+        fn glPushAttrib(mask: u32);
+        fn glPopAttrib();
+        fn glFogi(name: u32, value: i32);
+        fn glFogfv(name: u32, values: *const f32);
+    }
+
+    const DEPTH_TEST: u32 = 0x0B71;
+    const FOG: u32 = 0x0B60;
+    const PROJECTION: u32 = 0x1701;
+    const MODELVIEW: u32 = 0x1700;
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -283,6 +358,14 @@ mod os {
     pub fn open(title: &str, width: i64, height: i64, scale: i64) -> Result<(), &'static str> {
         close();
         let (width, height, scale) = (width.clamp(1, 4096), height.clamp(1, 4096), scale.clamp(1, 64));
+        let handle = create(title, width * scale, height * scale)?;
+        let pixels = vec![0u32; (width * height) as usize];
+        WINDOW.with(|w| *w.borrow_mut() = Some(Window { handle, width, height, scale, pixels, gpu: None }));
+        Ok(())
+    }
+
+    /// A window whose inside is `width` by `height` pixels of the screen.
+    fn create(title: &str, width: i64, height: i64) -> Result<isize, &'static str> {
         let class_name = wide("YuiLangWindow");
         let title = wide(title);
         // Safety: the structures are laid out as Windows expects, and the
@@ -292,7 +375,8 @@ mod os {
             let instance = GetModuleHandleW(std::ptr::null());
             let class = WndClass {
                 size: std::mem::size_of::<WndClass>() as u32,
-                style: 0,
+                // The window keeps what it is drawn on for itself (OpenGL wants that).
+                style: 0x20,
                 procedure: Some(DefWindowProcW),
                 class_extra: 0,
                 window_extra: 0,
@@ -306,7 +390,7 @@ mod os {
             };
             // Fails harmlessly if the class is registered already.
             RegisterClassExW(&class);
-            let mut rect = Rect { left: 0, top: 0, right: (width * scale) as i32, bottom: (height * scale) as i32 };
+            let mut rect = Rect { left: 0, top: 0, right: width as i32, bottom: height as i32 };
             AdjustWindowRect(&mut rect, STYLE, 0);
             let default = i32::MIN;
             CreateWindowExW(
@@ -327,9 +411,184 @@ mod os {
         if handle == 0 {
             return Err("the window could not be opened");
         }
-        let pixels = vec![0u32; (width * height) as usize];
-        WINDOW.with(|w| *w.borrow_mut() = Some(Window { handle, width, height, scale, pixels }));
+        Ok(handle)
+    }
+
+    /// A window the graphics card draws in, `width` by `height` pixels.
+    pub fn gpu_open(title: &str, width: i64, height: i64) -> Result<(), &'static str> {
+        close();
+        let (width, height) = (width.clamp(1, 4096), height.clamp(1, 4096));
+        // One pixel of the screen per pixel of the picture: the system is
+        // not to stretch the window.
+        // Safety: a plain setting of the process.
+        unsafe {
+            SetProcessDPIAware();
+        }
+        let handle = create(title, width, height)?;
+        // Safety: `PixelFormat` is laid out as Windows expects; the handles
+        // are the ones just made.
+        let gpu = unsafe {
+            let dc = GetDC(handle);
+            // Drawn in a window, by OpenGL, shown a whole picture at a time;
+            // 32 bits of color and 24 of depth per pixel.
+            let format = PixelFormat {
+                size: 40,
+                version: 1,
+                flags: 0x25,
+                pixel_type: 0,
+                color_bits: 32,
+                unused: [0; 13],
+                depth_bits: 24,
+                rest: [0; 16],
+            };
+            let index = ChoosePixelFormat(dc, &format);
+            SetPixelFormat(dc, index, &format);
+            let context = wglCreateContext(dc);
+            if context == 0 || wglMakeCurrent(dc, context) == 0 {
+                DestroyWindow(handle);
+                return Err("the graphics card could not be used (no OpenGL)");
+            }
+            glViewport(0, 0, width as i32, height as i32);
+            glEnable(DEPTH_TEST);
+            // What is seen: 70 degrees from top to bottom, from 0.1 to 1000
+            // away. (Whole numbers scaled back, as `runtime.yui` does it.)
+            let near = height * 10 / 7;
+            let unit = (near * 10) as f64;
+            glMatrixMode(PROJECTION);
+            glLoadIdentity();
+            glFrustum(-(width as f64), width as f64, -(height as f64), height as f64, near as f64, (near * 10000) as f64);
+            glScaled(unit, unit, unit);
+            glMatrixMode(MODELVIEW);
+            glLoadIdentity();
+            (dc, context)
+        };
+        let window = Window { handle, width, height, scale: 1, pixels: Vec::new(), gpu: Some(gpu) };
+        WINDOW.with(|w| *w.borrow_mut() = Some(window));
         Ok(())
+    }
+
+    /// Runs `draw` if the window is one the graphics card draws in.
+    fn with_gpu<T: Default>(draw: impl FnOnce(&Window) -> T) -> T {
+        WINDOW.with(|w| match w.borrow().as_ref() {
+            Some(window) if window.gpu.is_some() => draw(window),
+            _ => T::default(),
+        })
+    }
+
+    fn parts(color: i64) -> [u8; 3] {
+        [(color >> 16) as u8, (color >> 8) as u8, color as u8]
+    }
+
+    // Safety, for all of the below: plain OpenGL calls, made only while the
+    // window's context is the current one; pointers outlive the calls.
+
+    pub fn gpu_clear(color: i64) {
+        with_gpu(|_| unsafe {
+            let [r, g, b] = parts(color).map(|part| part as f32 / 255.0);
+            glClearColor(r, g, b, 0.0);
+            glClear(0x4100);
+        })
+    }
+
+    /// Looks from (x, y, z). `turn` 0 looks along +z and grows towards +x;
+    /// `tilt` grows upwards. Both in degrees.
+    pub fn gpu_camera(x: f64, y: f64, z: f64, turn: f64, tilt: f64) {
+        with_gpu(|_| unsafe {
+            glMatrixMode(MODELVIEW);
+            glLoadIdentity();
+            glScaled(1.0, 1.0, -1.0);
+            glRotated(tilt, 1.0, 0.0, 0.0);
+            glRotated(-turn, 0.0, 1.0, 0.0);
+            glTranslated(-x, -y, -z);
+        })
+    }
+
+    /// Things fade into `color` from `start` to `end` away; no fog if `end <= start`.
+    pub fn gpu_fog(color: i64, start: i64, end: i64) {
+        with_gpu(|_| unsafe {
+            if end <= start {
+                glDisable(FOG);
+                return;
+            }
+            let [r, g, b] = parts(color).map(|part| part as f32 / 255.0);
+            glEnable(FOG);
+            glFogi(0x0B65, 0x2601);
+            glFogi(0x0B63, start.clamp(0, 1 << 20) as i32);
+            glFogi(0x0B64, end.clamp(0, 1 << 20) as i32);
+            glFogfv(0x0B66, [r, g, b, 0.0].as_ptr());
+        })
+    }
+
+    /// Triangles for the card to keep: nine numbers and one color each.
+    pub fn gpu_mesh(points: &[f64], colors: &[i64]) -> i64 {
+        with_gpu(|_| unsafe {
+            let list = glGenLists(1);
+            if list == 0 {
+                return 0;
+            }
+            glNewList(list, 0x1300);
+            glBegin(4);
+            for (corners, color) in points.chunks_exact(9).zip(colors) {
+                let [r, g, b] = parts(*color);
+                glColor3ub(r, g, b);
+                for corner in corners.chunks_exact(3) {
+                    glVertex3dv(corner.as_ptr());
+                }
+            }
+            glEnd();
+            glEndList();
+            list as i64
+        })
+    }
+
+    pub fn gpu_draw(mesh: i64, x: f64, y: f64, z: f64) {
+        with_gpu(|_| unsafe {
+            if mesh > 0 {
+                glPushMatrix();
+                glTranslated(x, y, z);
+                glCallList(mesh as u32);
+                glPopMatrix();
+            }
+        })
+    }
+
+    pub fn gpu_free(mesh: i64) {
+        with_gpu(|_| unsafe {
+            if mesh > 0 {
+                glDeleteLists(mesh as u32, 1);
+            }
+        })
+    }
+
+    /// A rectangle on top of the picture, in pixels from the top left.
+    pub fn gpu_rect(x: i64, y: i64, width: i64, height: i64, color: i64) {
+        with_gpu(|window| unsafe {
+            let limit = |n: i64| n.clamp(-(1 << 20), 1 << 20) as i32;
+            let (left, top, right, bottom) = (limit(x), limit(y), limit(x) + limit(width), limit(y) + limit(height));
+            let [r, g, b] = parts(color);
+            glPushAttrib(0x2000);
+            glDisable(DEPTH_TEST);
+            glDisable(FOG);
+            glMatrixMode(PROJECTION);
+            glPushMatrix();
+            glLoadIdentity();
+            glOrtho(0.0, window.width as f64, window.height as f64, 0.0, -1.0, 1.0);
+            glMatrixMode(MODELVIEW);
+            glPushMatrix();
+            glLoadIdentity();
+            glColor3ub(r, g, b);
+            glBegin(7);
+            glVertex2i(left, top);
+            glVertex2i(right, top);
+            glVertex2i(right, bottom);
+            glVertex2i(left, bottom);
+            glEnd();
+            glPopMatrix();
+            glMatrixMode(PROJECTION);
+            glPopMatrix();
+            glMatrixMode(MODELVIEW);
+            glPopAttrib();
+        })
     }
 
     /// Lets the window react to what happened to it, and shows the pixels.
@@ -349,6 +608,10 @@ mod os {
                 if IsWindow(window.handle) == 0 {
                     *slot = None;
                     return false;
+                }
+                if let Some((dc, _)) = window.gpu {
+                    SwapBuffers(dc);
+                    return true;
                 }
                 let info = BitmapInfo {
                     size: 40,
@@ -388,6 +651,10 @@ mod os {
             if let Some(window) = w.borrow_mut().take() {
                 // Safety: the handle is one this module created.
                 unsafe {
+                    if let Some((_, context)) = window.gpu {
+                        wglMakeCurrent(0, 0);
+                        wglDeleteContext(context);
+                    }
                     DestroyWindow(window.handle);
                 }
             }
@@ -437,3 +704,4 @@ mod os {
 }
 
 pub use os::{close, key_down, mouse, mouse_down, open, update};
+pub use os::{gpu_camera, gpu_clear, gpu_draw, gpu_fog, gpu_free, gpu_mesh, gpu_open, gpu_rect};

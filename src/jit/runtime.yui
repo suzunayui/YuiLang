@@ -1362,12 +1362,31 @@ fn window_open(title: Int, width: Int, height: Int, scale: Int) {
   if size > 64 {
     size = 64
   }
+  let window = window_make(title, w * size, h * size)
+  if window == 0 { return }
+  let pixels = __alloc(w * h * 4)
+  let mut i = 0
+  while i < w * h {
+    __store32(pixels + i * 4, 0)
+    i = i + 1
+  }
+  __store(__global(0), window)
+  __store(__global(1), pixels)
+  __store(__global(2), w)
+  __store(__global(3), h)
+  __store(__global(4), size)
+}
+
+// 中身が 横 w × 縦 h（画面の点）のウィンドウを作る。作れなければ 0
+fn window_make(title: Int, w: Int, h: Int) -> Int {
   let instance = __os_GetModuleHandleW(0)
   let class_name = wide_copy("YuiLangWindow")
   // ウィンドウの種類の登録。届いた出来事は OS の標準の処理にまかせる
   let class = __alloc(80)
   zero_bytes(class, 80)
   __store(class, 80)
+  // 32 = 描く先をウィンドウが自分用に持ち続ける（GPU で描くときに要る）
+  __store32(class + 4, 32)
   __store(class + 8, __import_DefWindowProcW())
   __store(class + 24, instance)
   __store(class + 40, __os_LoadCursorW(0, 32512))
@@ -1379,8 +1398,8 @@ fn window_open(title: Int, width: Int, height: Int, scale: Int) {
   let rect = __alloc(16)
   __store32(rect, 0)
   __store32(rect + 4, 0)
-  __store32(rect + 8, w * size)
-  __store32(rect + 12, h * size)
+  __store32(rect + 8, w)
+  __store32(rect + 12, h)
   let adjusted = __os_AdjustWindowRect(rect, style, 0)
   let outer_width = __and(__load32(rect + 8) - __load32(rect), 4294967295)
   let outer_height = __and(__load32(rect + 12) - __load32(rect + 4), 4294967295)
@@ -1404,18 +1423,7 @@ fn window_open(title: Int, width: Int, height: Int, scale: Int) {
   __free(class)
   __free(wide_title)
   __free(class_name)
-  if window == 0 { return }
-  let pixels = __alloc(w * h * 4)
-  let mut i = 0
-  while i < w * h {
-    __store32(pixels + i * 4, 0)
-    i = i + 1
-  }
-  __store(__global(0), window)
-  __store(__global(1), pixels)
-  __store(__global(2), w)
-  __store(__global(3), h)
-  __store(__global(4), size)
+  window
 }
 
 fn window_forget() {
@@ -1449,6 +1457,11 @@ fn window_update() -> Int {
     window_forget()
     return 0
   }
+  // GPU で描くウィンドウなら、描きためた絵と表示中の絵を入れ替えるだけ
+  if __load(__global(1)) == 0 {
+    let swapped = __os_SwapBuffers(__load(__global(6)))
+    return 1
+  }
   let w = __load(__global(2))
   let h = __load(__global(3))
   let size = __load(__global(4))
@@ -1479,6 +1492,242 @@ fn window_update() -> Int {
   let released = __os_ReleaseDC(window, dc)
   __free(info)
   1
+}
+
+// ---- GPU（OpenGL の古い方式）で描く ----
+//
+// 小数は 64 ビットの並びのまま受け取り、そのまま OS の関数に渡す
+// （小数を受け取る関数は native.rs の FLOAT_CALLS にあり、呼ぶ直前に小数用の置き場へ写される）。
+// このファイルでは小数の計算ができないので、必要な小数は整数から並びを組み立てる。
+//
+// __global(6) = 描く先、__global(7) = OpenGL の文脈（どちらも GPU のウィンドウを開いたときだけ）
+
+// 正の整数 n（2 の 53 乗未満）を表す小数（64 ビット）の並び
+fn float_bits(n: Int) -> Int {
+  if n <= 0 { return 0 }
+  let mut p = 0
+  while __shr(n, p + 1) != 0 {
+    p = p + 1
+  }
+  (1023 + p) * 4503599627370496 + __and(__shl(n, 52 - p), 4503599627370495)
+}
+
+// 小数の並びの符号を逆にする
+fn float_flip(bits: Int) -> Int {
+  __xor(bits, __shl(1, 63))
+}
+
+// 色の部分 c（0〜255）を 255 で割った小数（32 ビット）の並び
+fn float32_part(c: Int) -> Int {
+  if c <= 0 { return 0 }
+  if c >= 255 { return 1065353216 }
+  let mut k = 0
+  while __shl(c, k) < 255 {
+    k = k + 1
+  }
+  (127 - k) * 8388608 + __shl(c, k + 23) / 255 - 8388608
+}
+
+fn gpu_ready() -> Int {
+  if __load(__global(0)) != 0 && __load(__global(1)) == 0 && __load(__global(7)) != 0 { 1 } else { 0 }
+}
+
+fn gpu_open(title: Int, width: Int, height: Int) {
+  window_close()
+  // 前の GPU のウィンドウの文脈が残っていれば片づける
+  let old = __load(__global(7))
+  if old != 0 {
+    let released = __os_wglMakeCurrent(0, 0)
+    let deleted = __os_wglDeleteContext(old)
+    __store(__global(7), 0)
+  }
+  let mut w = width
+  if w < 1 {
+    w = 1
+  }
+  if w > 4096 {
+    w = 4096
+  }
+  let mut h = height
+  if h < 1 {
+    h = 1
+  }
+  if h > 4096 {
+    h = 4096
+  }
+  // 画面の点 1 つを絵の点 1 つにする（OS に引き伸ばさせない）
+  let aware = __os_SetProcessDPIAware()
+  let window = window_make(title, w, h)
+  if window == 0 { return }
+  let dc = __os_GetDC(window)
+  // 描く先の種類: ウィンドウに、OpenGL で、1 枚描き終えてから見せる。色 32 ビット、奥行き 24 ビット
+  let format = __alloc(40)
+  zero_bytes(format, 40)
+  __store32(format, 65576)
+  __store32(format + 4, 37)
+  __store8(format + 9, 32)
+  __store8(format + 23, 24)
+  let index = __and(__os_ChoosePixelFormat(dc, format), 4294967295)
+  let chosen = __os_SetPixelFormat(dc, index, format)
+  __free(format)
+  let context = __os_wglCreateContext(dc)
+  if context == 0 || __and(__os_wglMakeCurrent(dc, context), 4294967295) == 0 {
+    let destroyed = __os_DestroyWindow(window)
+    return
+  }
+  __store(__global(0), window)
+  __store(__global(1), 0)
+  __store(__global(2), w)
+  __store(__global(3), h)
+  __store(__global(4), 1)
+  __store(__global(6), dc)
+  __store(__global(7), context)
+  let port = __os_glViewport(0, 0, w, h)
+  // 2929 = 手前のものが奥のものを隠す
+  let depth = __os_glEnable(2929)
+  // 見える範囲: 上下 70 度、0.1 〜 1000 先まで。整数だけで決めてから全体を縮める
+  let near = h * 10 / 7
+  let unit = float_bits(near * 10)
+  let fw = float_bits(w)
+  let fh = float_bits(h)
+  let a = __os_glMatrixMode(5889)
+  let b = __os_glLoadIdentity()
+  let c = __os_glFrustum(float_flip(fw), fw, float_flip(fh), fh, float_bits(near), float_bits(near * 10000))
+  let d = __os_glScaled(unit, unit, unit)
+  let e = __os_glMatrixMode(5888)
+  let f = __os_glLoadIdentity()
+}
+
+fn gpu_clear(color: Int) {
+  if gpu_ready() == 0 { return }
+  let r = float32_part(__and(__shr(color, 16), 255))
+  let g = float32_part(__and(__shr(color, 8), 255))
+  let b = float32_part(__and(color, 255))
+  let set = __os_glClearColor(r, g, b, 0)
+  // 16640 = 色と奥行きの両方
+  let cleared = __os_glClear(16640)
+}
+
+// (x, y, z) から見る。turn・tilt は度。小数はどれも 64 ビットの並び
+fn gpu_camera(x: Int, y: Int, z: Int, turn: Int, tilt: Int) {
+  if gpu_ready() == 0 { return }
+  let one = float_bits(1)
+  let a = __os_glMatrixMode(5888)
+  let b = __os_glLoadIdentity()
+  let c = __os_glScaled(one, one, float_flip(one))
+  let d = __os_glRotated(tilt, one, 0, 0)
+  let e = __os_glRotated(float_flip(turn), 0, one, 0)
+  let f = __os_glTranslated(float_flip(x), float_flip(y), float_flip(z))
+}
+
+fn gpu_fog(color: Int, start: Int, end: Int) {
+  if gpu_ready() == 0 { return }
+  if end <= start {
+    let disabled = __os_glDisable(2912)
+    return
+  }
+  let mut lo = start
+  if lo < 0 {
+    lo = 0
+  }
+  if lo > 1048576 {
+    lo = 1048576
+  }
+  let mut hi = end
+  if hi > 1048576 {
+    hi = 1048576
+  }
+  let enabled = __os_glEnable(2912)
+  // 2917 = 霧のかかり方、9729 = 距離に比例
+  let kind = __os_glFogi(2917, 9729)
+  let a = __os_glFogi(2915, lo)
+  let b = __os_glFogi(2916, hi)
+  let parts = __alloc(16)
+  __store32(parts, float32_part(__and(__shr(color, 16), 255)))
+  __store32(parts + 4, float32_part(__and(__shr(color, 8), 255)))
+  __store32(parts + 8, float32_part(__and(color, 255)))
+  __store32(parts + 12, 0)
+  let c = __os_glFogfv(2918, parts)
+  __free(parts)
+}
+
+// 三角形の集まりを GPU に覚えさせ、その番号を返す。
+// points は小数のリスト（三角形 1 つにつき 9 個）、colors は色のリスト（三角形 1 つにつき 1 個）
+fn gpu_mesh(points: Int, colors: Int) -> Int {
+  if gpu_ready() == 0 { return 0 }
+  let mut count = __load(points + 8) / 9
+  if __load(colors + 8) < count {
+    count = __load(colors + 8)
+  }
+  let list = __and(__os_glGenLists(1), 4294967295)
+  if list == 0 { return 0 }
+  // 4864 = 覚えるだけで、まだ描かない。4 = 三角形
+  let opened = __os_glNewList(list, 4864)
+  let began = __os_glBegin(4)
+  let mut i = 0
+  while i < count {
+    let color = __load(colors + 24 + i * 8)
+    let colored = __os_glColor3ub(__and(__shr(color, 16), 255), __and(__shr(color, 8), 255), __and(color, 255))
+    let corner = points + 24 + i * 72
+    let a = __os_glVertex3dv(corner)
+    let b = __os_glVertex3dv(corner + 24)
+    let c = __os_glVertex3dv(corner + 48)
+    i = i + 1
+  }
+  let ended = __os_glEnd()
+  let closed = __os_glEndList()
+  list
+}
+
+fn gpu_draw(mesh: Int, x: Int, y: Int, z: Int) {
+  if gpu_ready() == 0 || mesh <= 0 { return }
+  let a = __os_glPushMatrix()
+  let b = __os_glTranslated(x, y, z)
+  let c = __os_glCallList(mesh)
+  let d = __os_glPopMatrix()
+}
+
+fn gpu_free(mesh: Int) {
+  if gpu_ready() == 0 || mesh <= 0 { return }
+  let deleted = __os_glDeleteLists(mesh, 1)
+}
+
+fn gpu_limit(n: Int) -> Int {
+  if n < 0 - 1048576 { 0 - 1048576 } else if n > 1048576 { 1048576 } else { n }
+}
+
+// 絵の上に重ねる長方形。左上からの点の数で場所を決める
+fn gpu_rect(x: Int, y: Int, width: Int, height: Int, color: Int) {
+  if gpu_ready() == 0 { return }
+  let left = gpu_limit(x)
+  let top = gpu_limit(y)
+  let right = left + gpu_limit(width)
+  let bottom = top + gpu_limit(height)
+  let one = float_bits(1)
+  // 8192 = 入・切の設定を覚えておく
+  let saved = __os_glPushAttrib(8192)
+  let a = __os_glDisable(2929)
+  let b = __os_glDisable(2912)
+  let c = __os_glMatrixMode(5889)
+  let d = __os_glPushMatrix()
+  let e = __os_glLoadIdentity()
+  let f = __os_glOrtho(0, float_bits(__load(__global(2))), float_bits(__load(__global(3))), 0, float_flip(one), one)
+  let g = __os_glMatrixMode(5888)
+  let h = __os_glPushMatrix()
+  let i = __os_glLoadIdentity()
+  let j = __os_glColor3ub(__and(__shr(color, 16), 255), __and(__shr(color, 8), 255), __and(color, 255))
+  // 7 = 四角形
+  let k = __os_glBegin(7)
+  let l = __os_glVertex2i(left, top)
+  let m = __os_glVertex2i(right, top)
+  let n = __os_glVertex2i(right, bottom)
+  let o = __os_glVertex2i(left, bottom)
+  let p = __os_glEnd()
+  let q = __os_glPopMatrix()
+  let r = __os_glMatrixMode(5889)
+  let s = __os_glPopMatrix()
+  let t = __os_glMatrixMode(5888)
+  let u = __os_glPopAttrib()
 }
 
 fn draw_clear(color: Int) {

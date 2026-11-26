@@ -30,6 +30,15 @@ pub const BUILTIN_FNS: &[&str] = &[
     "sleep_ms",
     "random",
     "random_seed",
+    // Drawing in three dimensions with the graphics card.
+    "gpu_open",
+    "gpu_clear",
+    "gpu_camera",
+    "gpu_fog",
+    "gpu_mesh",
+    "gpu_draw",
+    "gpu_free",
+    "gpu_rect",
 ];
 pub const BUILTIN_TYPES: &[&str] =
     &["Int", "Float", "Bool", "String", "Unit", "List", "Option", "Result", "Map"];

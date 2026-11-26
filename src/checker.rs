@@ -1454,6 +1454,16 @@ impl Checker {
             "mouse_down" => Some((vec![Type::Int], Type::Bool, &["io"])),
             "sleep_ms" | "random_seed" => Some((vec![Type::Int], Type::Unit, &["io"])),
             "random" => Some((vec![Type::Int], Type::Int, &["io"])),
+            "gpu_open" => Some((vec![string(), Type::Int, Type::Int], Type::Unit, &["io"])),
+            "gpu_clear" | "gpu_free" => Some((vec![Type::Int], Type::Unit, &["io"])),
+            "gpu_camera" => Some((vec![Type::Float; 5], Type::Unit, &["io"])),
+            "gpu_fog" => Some((vec![Type::Int; 3], Type::Unit, &["io"])),
+            "gpu_mesh" => {
+                let lists = vec![Type::List(Box::new(Type::Float)), Type::List(Box::new(Type::Int))];
+                Some((lists, Type::Int, &["io"]))
+            }
+            "gpu_draw" => Some((vec![Type::Int, Type::Float, Type::Float, Type::Float], Type::Unit, &["io"])),
+            "gpu_rect" => Some((vec![Type::Int; 5], Type::Unit, &["io"])),
             _ => None,
         };
         let (params, ret, effects) = match builtin {

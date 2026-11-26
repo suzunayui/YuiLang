@@ -1,0 +1,587 @@
+// 3 次元のブロックの世界（GPU で描く版）。歩き回って、土・石・木を壊したり置いたりできる。
+//
+//   W / A / S / D          歩く
+//   ← / →                  左右を向く
+//   ↑ / ↓                  上下を向く
+//   スペース                跳ぶ
+//   マウスの左ボタン または Q  画面の中央のブロックを壊す
+//   マウスの右ボタン または E  画面の中央のブロックの手前に置く
+//   1 / 2 / 3 / 4          置くブロックを選ぶ（土 / 石 / 木 / 葉）
+//   Esc                    終わる
+//
+// 絵は、見えているブロックの面を三角形にして GPU に渡して描いている。
+// blocks3d.yui（点 1 つずつ計算する版）より、ずっと広い世界を細かい絵で描ける。
+//
+// 引数に数を渡すと、そのコマ数だけ自動で見回して終わる（動作確認用）。0 なら自分で遊ぶ。
+// 続けて横と縦の点の数を渡すと、その大きさのウィンドウになる（渡さなければ 1280 × 720）:
+//   blocks_gpu.exe 0 1920 1080
+
+// 世界は 横 128 × 高さ 32 × 奥行き 128 マス。マス (x, y, z) は表の (y * 128 + z) * 128 + x 番目。
+// マスの中身: 0 = 空、1 = 土（上の面は草）、2 = 石、3 = 木、4 = 葉
+// 三角形は 横 16 × 奥行き 16 マスの区画ごとにまとめる（8 × 8 = 64 区画）。
+// ブロックが変わったら、その区画だけ作り直す。
+
+struct Player {
+  x: Float,
+  y: Float,
+  z: Float,
+  fall: Float,
+  turn: Float,
+  tilt: Float,
+}
+
+// 三角関数。角度を -π〜π に直してから、級数で求める
+fn sine(angle: Float) -> Float {
+  let pi = 3.141592653589793
+  let mut a = angle
+  while a > pi {
+    a = a - 2.0 * pi
+  }
+  while a < -pi {
+    a = a + 2.0 * pi
+  }
+  let s = a * a
+  a * (1.0 - s / 6.0 * (1.0 - s / 20.0 * (1.0 - s / 42.0 * (1.0 - s / 72.0 * (1.0 - s / 110.0 * (1.0 - s / 156.0 * (1.0 - s / 210.0)))))))
+}
+
+fn cosine(angle: Float) -> Float {
+  sine(angle + 1.5707963267948966)
+}
+
+fn whole(value: Float) -> Int {
+  value.floor().to_int()
+}
+
+// なだらかな丘を作り、木を生やす
+fn make_world(seed: Int) -> List<Int> uses io {
+  random_seed(seed)
+  let mut world = []
+  for i in 0..524288 {
+    world = world.push(0)
+  }
+  let a = random(628).to_float() / 100.0
+  let b = random(628).to_float() / 100.0
+  let c = random(628).to_float() / 100.0
+  for z in 0..128 {
+    for x in 0..128 {
+      let fx = x.to_float()
+      let fz = z.to_float()
+      let hill = sine(fx * 0.11 + a) * 3.0 + sine(fz * 0.09 + b) * 3.0 + sine((fx + fz) * 0.05 + c) * 2.5 + sine(fx * 0.31 + fz * 0.23) * 1.0
+      let height = (11.0 + hill).round().to_int().max(2).min(22)
+      for y in 0..height {
+        world[(y * 128 + z) * 128 + x] = if y < height - 3 { 2 } else { 1 }
+      }
+    }
+  }
+  for tree in 0..220 {
+    let x = 2 + random(124)
+    let z = 2 + random(124)
+    // その場所の地面の高さ
+    let mut ground = 0
+    for y in 0..32 {
+      if world[(y * 128 + z) * 128 + x] != 0 {
+        ground = y + 1
+      }
+    }
+    if ground + 7 < 32 {
+      for dy in 3..6 {
+        for dz in 0..3 {
+          for dx in 0..3 {
+            if dy < 5 || dx == 1 && dz == 1 {
+              world[((ground + dy) * 128 + z + dz - 1) * 128 + x + dx - 1] = 4
+            }
+          }
+        }
+      }
+      for dy in 0..4 {
+        world[((ground + dy) * 128 + z) * 128 + x] = 3
+      }
+    }
+  }
+  world
+}
+
+// (ox, oy, oz) から (dx, dy, dz) の向きへ進み、最初に当たるブロックを探す。
+// マスの境目を 1 つずつまたいでいく（次に x・y・z のどの境目に先に着くかを比べる）。
+// 当たらなければ -1。当たれば 距離 × 8 の整数部 × 8388608 + マスの番号 × 8 + 面 を返す。
+// 面: 0 / 1 = x の正 / 負の向きに進んで当たった、2 / 3 = y、4 / 5 = z
+fn march(
+  world: List<Int>,
+  ox: Float,
+  oy: Float,
+  oz: Float,
+  dx: Float,
+  dy: Float,
+  dz: Float,
+) -> Int {
+  let far = 1000000.0
+  let mut ix = whole(ox)
+  let mut iy = whole(oy)
+  let mut iz = whole(oz)
+  let sx = if dx > 0.0 { 1 } else { -1 }
+  let sy = if dy > 0.0 { 1 } else { -1 }
+  let sz = if dz > 0.0 { 1 } else { -1 }
+  // マス 1 つ分進むのにかかる距離
+  let gx = if dx == 0.0 { far } else { (1.0 / dx).abs() }
+  let gy = if dy == 0.0 { far } else { (1.0 / dy).abs() }
+  let gz = if dz == 0.0 { far } else { (1.0 / dz).abs() }
+  // 次の境目までの距離
+  let mut tx = if dx > 0.0 {
+    (ix.to_float() + 1.0 - ox) * gx
+  } else if dx < 0.0 {
+    (ox - ix.to_float()) * gx
+  } else {
+    far
+  }
+  let mut ty = if dy > 0.0 {
+    (iy.to_float() + 1.0 - oy) * gy
+  } else if dy < 0.0 {
+    (oy - iy.to_float()) * gy
+  } else {
+    far
+  }
+  let mut tz = if dz > 0.0 {
+    (iz.to_float() + 1.0 - oz) * gz
+  } else if dz < 0.0 {
+    (oz - iz.to_float()) * gz
+  } else {
+    far
+  }
+  let mut steps = 0
+  while steps < 40 {
+    let mut distance = 0.0
+    let mut face = 0
+    if tx < ty && tx < tz {
+      ix = ix + sx
+      distance = tx
+      tx = tx + gx
+      face = if sx > 0 { 0 } else { 1 }
+    } else if ty < tz {
+      iy = iy + sy
+      distance = ty
+      ty = ty + gy
+      face = if sy > 0 { 2 } else { 3 }
+    } else {
+      iz = iz + sz
+      distance = tz
+      tz = tz + gz
+      face = if sz > 0 { 4 } else { 5 }
+    }
+    if ix < 0 || ix >= 128 || iz < 0 || iz >= 128 || iy < 0 { return -1 }
+    if iy < 32 {
+      let cell = (iy * 128 + iz) * 128 + ix
+      if world[cell] != 0 { return (distance * 8.0).to_int() * 8388608 + cell * 8 + face }
+    } else if sy > 0 {
+      return -1
+    }
+    steps = steps + 1
+  }
+  -1
+}
+
+// 点 (x, y, z) がブロックの中か。世界の外（横と下）は壁として扱う
+fn solid(world: List<Int>, x: Float, y: Float, z: Float) -> Bool {
+  let ix = whole(x)
+  let iy = whole(y)
+  let iz = whole(z)
+  if ix < 0 || ix >= 128 || iz < 0 || iz >= 128 || iy < 0 { return true }
+  if iy >= 32 { return false }
+  world[(iy * 128 + iz) * 128 + ix] != 0
+}
+
+// 足元・腰・頭の高さで調べる
+fn column(world: List<Int>, x: Float, y: Float, z: Float) -> Bool {
+  solid(world, x, y, z) || solid(world, x, y + 0.9, z) || solid(world, x, y + 1.7, z)
+}
+
+// 足元が (x, y, z) の人（幅 0.6、高さ 1.7）がブロックに重なるか
+fn blocked(world: List<Int>, x: Float, y: Float, z: Float) -> Bool {
+  column(world, x - 0.3, y, z - 0.3) || column(world, x + 0.3, y, z - 0.3) || column(world, x - 0.3, y, z + 0.3) || column(world, x + 0.3, y, z + 0.3)
+}
+
+// ---- 三角形を作る ----
+
+// 点を 1 つ（小数 3 つ）足す
+fn put(points: List<Float>, x: Float, y: Float, z: Float) -> List<Float> {
+  let mut out = points
+  out = out.push(x)
+  out = out.push(y)
+  out = out.push(z)
+  out
+}
+
+// 箱 (x0, y0, z0)〜(x1, y1, z1) の面 1 つを、三角形 2 つ（点 6 つ = 小数 18 個）にする。
+// 面: 0 = x が大きい側、1 = x が小さい側、2 = 上、3 = 下、4 = z が大きい側、5 = z が小さい側
+fn face_points(
+  x0: Float,
+  y0: Float,
+  z0: Float,
+  x1: Float,
+  y1: Float,
+  z1: Float,
+  face: Int,
+) -> List<Float> {
+  let mut out: List<Float> = []
+  if face < 2 {
+    let x = if face == 0 { x1 } else { x0 }
+    out = put(out, x, y0, z0)
+    out = put(out, x, y1, z0)
+    out = put(out, x, y1, z1)
+    out = put(out, x, y0, z0)
+    out = put(out, x, y1, z1)
+    out = put(out, x, y0, z1)
+  } else if face < 4 {
+    let y = if face == 2 { y1 } else { y0 }
+    out = put(out, x0, y, z0)
+    out = put(out, x1, y, z0)
+    out = put(out, x1, y, z1)
+    out = put(out, x0, y, z0)
+    out = put(out, x1, y, z1)
+    out = put(out, x0, y, z1)
+  } else {
+    let z = if face == 4 { z1 } else { z0 }
+    out = put(out, x0, y0, z)
+    out = put(out, x1, y0, z)
+    out = put(out, x1, y1, z)
+    out = put(out, x0, y0, z)
+    out = put(out, x1, y1, z)
+    out = put(out, x0, y1, z)
+  }
+  out
+}
+
+// ブロックの面の色。上から見える面は明るく、横は少し暗く、下は暗く
+fn block_color(kind: Int, face: Int) -> Int {
+  let light = if face == 2 { 100 } else if face == 3 { 45 } else if face < 2 { 78 } else { 62 }
+  let top = face == 2
+  let r = if kind == 1 {
+    if top { 96 } else { 134 }
+  } else if kind == 2 {
+    128
+  } else if kind == 3 {
+    110
+  } else {
+    60
+  }
+  let g = if kind == 1 {
+    if top { 170 } else { 96 }
+  } else if kind == 2 {
+    128
+  } else if kind == 3 {
+    80
+  } else {
+    140
+  }
+  let b = if kind == 1 {
+    if top { 76 } else { 67 }
+  } else if kind == 2 {
+    136
+  } else if kind == 3 {
+    44
+  } else {
+    56
+  }
+  rgb(r * light / 100, g * light / 100, b * light / 100)
+}
+
+// マス (x, y, z) の面 face の向こうが空いているか（空いていれば、その面は見える）
+fn open_side(world: List<Int>, x: Int, y: Int, z: Int, face: Int) -> Bool {
+  let nx = if face == 0 { x + 1 } else if face == 1 { x - 1 } else { x }
+  let ny = if face == 2 { y + 1 } else if face == 3 { y - 1 } else { y }
+  let nz = if face == 4 { z + 1 } else if face == 5 { z - 1 } else { z }
+  // 世界の外側を向いた面と底は、中からは見えない
+  if nx < 0 || nx >= 128 || nz < 0 || nz >= 128 || ny < 0 { return false }
+  if ny >= 32 { return true }
+  world[(ny * 128 + nz) * 128 + nx] == 0
+}
+
+// 区画 (cx, cz) の見える面を全部集めて、GPU に覚えさせる
+fn build_chunk(world: List<Int>, cx: Int, cz: Int) -> Int uses io {
+  let mut points: List<Float> = []
+  let mut colors: List<Int> = []
+  let x_start = cx * 16
+  let z_start = cz * 16
+  let x_end = x_start + 16
+  let z_end = z_start + 16
+  for y in 0..32 {
+    for z in z_start..z_end {
+      for x in x_start..x_end {
+        let kind = world[(y * 128 + z) * 128 + x]
+        if kind != 0 {
+          let fx = x.to_float()
+          let fy = y.to_float()
+          let fz = z.to_float()
+          for face in 0..6 {
+            if open_side(world, x, y, z, face) {
+              for value in face_points(fx, fy, fz, fx + 1.0, fy + 1.0, fz + 1.0, face) {
+                points = points.push(value)
+              }
+              let color = block_color(kind, face)
+              colors = colors.push(color)
+              colors = colors.push(color)
+            }
+          }
+        }
+      }
+    }
+  }
+  gpu_mesh(points, colors)
+}
+
+// マス (x, ?, z) が変わったあと、その区画と、隣り合う区画を作り直す
+fn rebuild(world: List<Int>, meshes: List<Int>, x: Int, z: Int) -> List<Int> uses io {
+  let mut out = meshes
+  let mut done = [-1]
+  for k in 0..5 {
+    let px = if k == 1 { x - 1 } else if k == 2 { x + 1 } else { x }
+    let pz = if k == 3 { z - 1 } else if k == 4 { z + 1 } else { z }
+    if px >= 0 && px < 128 && pz >= 0 && pz < 128 {
+      let chunk = pz / 16 * 8 + px / 16
+      if !done.contains(chunk) {
+        done = done.push(chunk)
+        gpu_free(out[chunk])
+        out[chunk] = build_chunk(world, px / 16, pz / 16)
+      }
+    }
+  }
+  out
+}
+
+// 狙っているブロックを囲む白い枠（細い棒 12 本）
+fn build_frame() -> Int uses io {
+  let mut points: List<Float> = []
+  let mut colors: List<Int> = []
+  let t = 0.012
+  let lo = -0.004
+  let hi = 1.004
+  let white = rgb(255, 255, 255)
+  for a in 0..2 {
+    for b in 0..2 {
+      let p = a.to_float() * (hi - lo) + lo
+      let q = b.to_float() * (hi - lo) + lo
+      for face in 0..6 {
+        // x・y・z それぞれの向きの棒
+        for value in face_points(lo, p - t, q - t, hi, p + t, q + t, face) {
+          points = points.push(value)
+        }
+        for value in face_points(p - t, lo, q - t, p + t, hi, q + t, face) {
+          points = points.push(value)
+        }
+        for value in face_points(p - t, q - t, lo, p + t, q + t, hi, face) {
+          points = points.push(value)
+        }
+        for n in 0..6 {
+          colors = colors.push(white)
+        }
+      }
+    }
+  }
+  gpu_mesh(points, colors)
+}
+
+fn choice_color(kind: Int) -> Int {
+  match kind {
+    1 => rgb(96, 170, 76)
+    2 => rgb(128, 128, 136)
+    3 => rgb(110, 80, 44)
+    _ => rgb(60, 140, 56)
+  }
+}
+
+// 引数の index 番目の数。なければ fallback
+fn number_at(xs: List<String>, index: Int, fallback: Int) -> Int {
+  if index < xs.len() { xs[index].to_int().unwrap_or(fallback) } else { fallback }
+}
+
+fn main() uses io {
+  let limit = number_at(args(), 0, 0)
+  let width = number_at(args(), 1, 1280)
+  let height = number_at(args(), 2, 720)
+  gpu_open("YuiLang: blocks (GPU)", width, height)
+  let mut world = make_world(if limit > 0 { 7 } else { time_ms() })
+  let built = time_ms()
+  let mut meshes: List<Int> = []
+  for cz in 0..8 {
+    for cx in 0..8 {
+      meshes = meshes.push(build_chunk(world, cx, cz))
+    }
+  }
+  let build_time = time_ms() - built
+  let frame_mesh = build_frame()
+  let sky = rgb(130, 185, 240)
+  gpu_fog(sky, 50, 120)
+
+  // 真ん中の地面の上から始める
+  let mut start = 31.0
+  while start > 1.0 && !blocked(world, 64.5, start - 1.0, 64.5) {
+    start = start - 1.0
+  }
+  let mut p = Player { x: 64.5, y: start + 0.5, z: 64.5, fall: 0.0, turn: 0.6, tilt: -0.2 }
+  let mut selected = 1
+  let mut wait = 0
+  let mut frame = 0
+  let mut running = true
+  let began = time_ms()
+  let mut next = began
+  while running {
+    // 向きを変える
+    if key_down("left") {
+      p.turn = p.turn - 0.045
+    }
+    if key_down("right") {
+      p.turn = p.turn + 0.045
+    }
+    if key_down("up") {
+      p.tilt = (p.tilt + 0.035).min(1.4)
+    }
+    if key_down("down") {
+      p.tilt = (p.tilt - 0.035).max(-1.4)
+    }
+    if limit > 0 {
+      p.turn = p.turn + 0.03
+    }
+
+    // 歩く: 向いている方向を前として、横と前後を別々に動かす（壁に沿って滑れる）
+    let st = sine(p.turn)
+    let ct = cosine(p.turn)
+    let mut mx = 0.0
+    let mut mz = 0.0
+    if key_down("w") {
+      mx = mx + st
+      mz = mz + ct
+    }
+    if key_down("s") {
+      mx = mx - st
+      mz = mz - ct
+    }
+    if key_down("d") {
+      mx = mx + ct
+      mz = mz - st
+    }
+    if key_down("a") {
+      mx = mx - ct
+      mz = mz + st
+    }
+    let nx = p.x + mx * 0.09
+    if !blocked(world, nx, p.y, p.z) {
+      p.x = nx
+    }
+    let nz = p.z + mz * 0.09
+    if !blocked(world, p.x, p.y, nz) {
+      p.z = nz
+    }
+
+    // 跳ぶ・落ちる
+    let standing = blocked(world, p.x, p.y - 0.05, p.z)
+    if standing && key_down("space") {
+      p.fall = 0.21
+    }
+    p.fall = (p.fall - 0.012).max(-0.5)
+    let ny = p.y + p.fall
+    if blocked(world, p.x, ny, p.z) {
+      p.fall = 0.0
+    } else {
+      p.y = ny
+    }
+
+    // 画面の中央の先にあるブロック（手の届く範囲だけ）
+    let sp = sine(p.tilt)
+    let cp = cosine(p.tilt)
+    let aim = march(world, p.x, p.y + 1.6, p.z, cp * st, sp, cp * ct)
+    let reach = aim >= 0 && aim / 8388608 < 48
+    let target = if reach { aim / 8 % 1048576 } else { -1 }
+
+    // 置くブロックを選ぶ
+    if key_down("1") {
+      selected = 1
+    }
+    if key_down("2") {
+      selected = 2
+    }
+    if key_down("3") {
+      selected = 3
+    }
+    if key_down("4") {
+      selected = 4
+    }
+
+    // 壊す・置く（押しっぱなしで連続しすぎないよう、少し間をあける）
+    if wait > 0 {
+      wait = wait - 1
+    }
+    let auto_break = limit > 0 && frame % 30 == 15
+    if reach && wait == 0 && (mouse_down(0) || key_down("q") || auto_break) {
+      world[target] = 0
+      meshes = rebuild(world, meshes, target % 128, target / 128 % 128)
+      wait = 10
+    }
+    if reach && wait == 0 && (mouse_down(1) || key_down("e")) {
+      // 当たった面の手前のマス
+      let face = aim % 8
+      let back = if face == 0 {
+        -1
+      } else if face == 1 {
+        1
+      } else if face == 2 {
+        -16384
+      } else if face == 3 {
+        16384
+      } else if face == 4 {
+        -128
+      } else {
+        128
+      }
+      let place = target + back
+      if place >= 0 && place < 524288 && world[place] == 0 {
+        world[place] = selected
+        // 自分に重なる場所には置けない
+        if blocked(world, p.x, p.y, p.z) {
+          world[place] = 0
+        } else {
+          meshes = rebuild(world, meshes, place % 128, place / 128 % 128)
+        }
+      }
+      wait = 10
+    }
+
+    // 描く
+    gpu_clear(sky)
+    gpu_camera(p.x, p.y + 1.6, p.z, p.turn * 57.29577951308232, p.tilt * 57.29577951308232)
+    for mesh in meshes {
+      gpu_draw(mesh, 0.0, 0.0, 0.0)
+    }
+    if reach && wait == 0 {
+      gpu_draw(frame_mesh, (target % 128).to_float(), (target / 16384).to_float(), (target / 128 % 128).to_float())
+    }
+    let cx = width / 2
+    let cy = height / 2
+    gpu_rect(cx - 10, cy - 1, 21, 3, rgb(255, 255, 255))
+    gpu_rect(cx - 1, cy - 10, 3, 21, rgb(255, 255, 255))
+    for kind in 1..5 {
+      let x = 20 + (kind - 1) * 56
+      if kind == selected { gpu_rect(x - 5, height - 65, 50, 50, rgb(255, 255, 255)) }
+      gpu_rect(x, height - 60, 40, 40, choice_color(kind))
+    }
+
+    frame = frame + 1
+    if !window_update() || key_down("escape") || limit > 0 && frame >= limit {
+      running = false
+    }
+    // 1 秒に約 60 コマになるように待つ（自動のときは待たずに速さを測る）
+    if limit == 0 {
+      next = next + 16
+      let now = time_ms()
+      if now < next {
+        sleep_ms(next - now)
+      } else {
+        next = now
+      }
+    }
+  }
+  let spent = time_ms() - began
+  window_close()
+  print("frames: {frame}, position: {p.x} {p.y} {p.z}")
+  if limit > 0 {
+    print("chunks built in {build_time} ms, {spent * 1000 / frame.max(1)} microseconds per frame")
+  }
+}

@@ -66,7 +66,7 @@ const STDERR: i64 = -12;
 /// Functions imported from kernel32.dll, in the order of the import table.
 /// Functions of the operating system that the generated code may call: the
 /// library and the name. An executable imports the ones it actually uses.
-const IMPORTS: [(&str, &str); 37] = [
+const IMPORTS: [(&str, &str); 72] = [
     ("KERNEL32.dll", "GetStdHandle"),
     ("KERNEL32.dll", "WriteFile"),
     ("KERNEL32.dll", "ExitProcess"),
@@ -103,13 +103,48 @@ const IMPORTS: [(&str, &str); 37] = [
     ("USER32.dll", "ScreenToClient"),
     ("USER32.dll", "LoadCursorW"),
     ("USER32.dll", "GetForegroundWindow"),
+    ("USER32.dll", "SetProcessDPIAware"),
     ("GDI32.dll", "StretchDIBits"),
+    ("GDI32.dll", "ChoosePixelFormat"),
+    ("GDI32.dll", "SetPixelFormat"),
+    ("GDI32.dll", "SwapBuffers"),
+    ("OPENGL32.dll", "wglCreateContext"),
+    ("OPENGL32.dll", "wglMakeCurrent"),
+    ("OPENGL32.dll", "wglDeleteContext"),
+    ("OPENGL32.dll", "glClearColor"),
+    ("OPENGL32.dll", "glClear"),
+    ("OPENGL32.dll", "glEnable"),
+    ("OPENGL32.dll", "glDisable"),
+    ("OPENGL32.dll", "glMatrixMode"),
+    ("OPENGL32.dll", "glLoadIdentity"),
+    ("OPENGL32.dll", "glFrustum"),
+    ("OPENGL32.dll", "glOrtho"),
+    ("OPENGL32.dll", "glRotated"),
+    ("OPENGL32.dll", "glTranslated"),
+    ("OPENGL32.dll", "glScaled"),
+    ("OPENGL32.dll", "glViewport"),
+    ("OPENGL32.dll", "glBegin"),
+    ("OPENGL32.dll", "glEnd"),
+    ("OPENGL32.dll", "glColor3ub"),
+    ("OPENGL32.dll", "glVertex3dv"),
+    ("OPENGL32.dll", "glVertex2i"),
+    ("OPENGL32.dll", "glGenLists"),
+    ("OPENGL32.dll", "glNewList"),
+    ("OPENGL32.dll", "glEndList"),
+    ("OPENGL32.dll", "glCallList"),
+    ("OPENGL32.dll", "glDeleteLists"),
+    ("OPENGL32.dll", "glPushMatrix"),
+    ("OPENGL32.dll", "glPopMatrix"),
+    ("OPENGL32.dll", "glPushAttrib"),
+    ("OPENGL32.dll", "glPopAttrib"),
+    ("OPENGL32.dll", "glFogi"),
+    ("OPENGL32.dll", "glFogfv"),
 ];
 /// The imports `runtime.yui` may call as `__os_<name>(...)`, with how many
 /// arguments each takes. They follow the same calling convention as the
 /// code this compiler makes, so a call is an ordinary call. (The address of
 /// any import can also be had with `__import_<name>()`.)
-const OS_CALLS: [(&str, usize); 32] = [
+const OS_CALLS: [(&str, usize); 67] = [
     ("GetStdHandle", 1),
     ("WriteFile", 5),
     ("ReadFile", 5),
@@ -142,7 +177,47 @@ const OS_CALLS: [(&str, usize); 32] = [
     ("LoadCursorW", 2),
     ("GetForegroundWindow", 0),
     ("StretchDIBits", 13),
+    ("SetProcessDPIAware", 0),
+    ("ChoosePixelFormat", 2),
+    ("SetPixelFormat", 3),
+    ("SwapBuffers", 1),
+    ("wglCreateContext", 1),
+    ("wglMakeCurrent", 2),
+    ("wglDeleteContext", 1),
+    ("glClearColor", 4),
+    ("glClear", 1),
+    ("glEnable", 1),
+    ("glDisable", 1),
+    ("glMatrixMode", 1),
+    ("glLoadIdentity", 0),
+    ("glFrustum", 6),
+    ("glOrtho", 6),
+    ("glRotated", 4),
+    ("glTranslated", 3),
+    ("glScaled", 3),
+    ("glViewport", 4),
+    ("glBegin", 1),
+    ("glEnd", 0),
+    ("glColor3ub", 3),
+    ("glVertex3dv", 1),
+    ("glVertex2i", 2),
+    ("glGenLists", 1),
+    ("glNewList", 2),
+    ("glEndList", 0),
+    ("glCallList", 1),
+    ("glDeleteLists", 2),
+    ("glPushMatrix", 0),
+    ("glPopMatrix", 0),
+    ("glPushAttrib", 1),
+    ("glPopAttrib", 0),
+    ("glFogi", 2),
+    ("glFogfv", 2),
 ];
+/// Those of `OS_CALLS` that take floats. Windows wants a float argument in an
+/// xmm register rather than a general one, so the first four arguments are
+/// copied there on the way in. (`runtime.yui` passes floats as their bits:
+/// 64 for a double, the low 32 for a single.)
+const FLOAT_CALLS: [&str; 6] = ["glClearColor", "glFrustum", "glOrtho", "glRotated", "glTranslated", "glScaled"];
 const GET_STD_HANDLE: usize = 0;
 const WRITE_FILE: usize = 1;
 const EXIT_PROCESS: usize = 2;
@@ -203,7 +278,8 @@ const POOL_HEADS: usize = 8;
 const POOL_NEXT: usize = 88;
 const POOL_END: usize = 96;
 /// Cells the runtime keeps things in between calls (`__global(i)`): the
-/// window, its pixels and size, the state of the random numbers.
+/// window, its pixels and size, the state of the random numbers, what the
+/// graphics card draws on and its OpenGL context.
 const GLOBALS: usize = 104;
 const GLOBAL_SCALE: usize = 4;
 /// Where the rest of the writable memory starts: tables of remembered results.
@@ -1808,6 +1884,12 @@ impl Native<'_> {
             if self.rt_seen.contains(&format!("__os_{name}")) {
                 let import = IMPORTS.iter().position(|(_, import)| import == name).unwrap_or(0);
                 self.a.bind(self.os_labels[i]);
+                if FLOAT_CALLS.contains(name) {
+                    self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC1]); // movq xmm0, rcx
+                    self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xCA]); // movq xmm1, rdx
+                    self.a.buf.extend_from_slice(&[0x66, 0x49, 0x0F, 0x6E, 0xD0]); // movq xmm2, r8
+                    self.a.buf.extend_from_slice(&[0x66, 0x49, 0x0F, 0x6E, 0xD9]); // movq xmm3, r9
+                }
                 self.a.buf.extend_from_slice(&[0xFF, 0x25]); // jmp [rip + import]
                 self.iat_fixups.push((self.a.buf.len(), import));
                 self.a.d32(0);
@@ -4366,9 +4448,20 @@ impl Native<'_> {
             | ("draw_clear", [_])
             | ("draw_pixel", [_, _, _])
             | ("draw_rect", [_, _, _, _, _])
-            | ("sleep_ms" | "random_seed", [_]) => {
+            | ("sleep_ms" | "random_seed", [_])
+            | ("gpu_open", [_, _, _])
+            | ("gpu_clear" | "gpu_free", [_])
+            | ("gpu_camera", [_, _, _, _, _])
+            | ("gpu_fog", [_, _, _])
+            | ("gpu_draw", [_, _, _, _])
+            | ("gpu_rect", [_, _, _, _, _]) => {
                 self.call_rt_with(name, args, dst)?;
                 Ok(Some(Ty::Unit))
+            }
+            ("gpu_mesh", [_, _]) => {
+                self.call_rt_with(name, args, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Int))
             }
             ("rgb", [_, _, _]) | ("time_ms", []) => {
                 self.call_rt_with(name, args, dst)?;

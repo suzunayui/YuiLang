@@ -315,6 +315,44 @@ fn main() uses io {
 }
 ```
 
+**GPU で 3 次元の絵を描く**（いまは Windows だけ。ほかの OS では `gpu_open` が実行時エラーになる）
+
+三角形の集まりをグラフィックカード（GPU）に渡して描く。点を 1 つずつ計算するより桁違いに速く、
+画面いっぱいの大きさでも滑らかに動く。`window_open` のウィンドウとは別物で、`draw_*` は使えない
+（`window_update` `window_close` `key_down` `mouse_*` はそのまま使える）。
+
+| 関数 | 型と意味 |
+| --- | --- |
+| `gpu_open(title, width, height)` | `(String, Int, Int) -> Unit uses io`。横 `width` × 縦 `height` の点（画面の点そのまま）のウィンドウを開く |
+| `gpu_clear(color)` | `(Int) -> Unit uses io`。全体を 1 色で塗る。1 コマの最初に呼ぶ |
+| `gpu_camera(x, y, z, turn, tilt)` | `(Float, Float, Float, Float, Float) -> Unit uses io`。`(x, y, z)` から見る。y が上。`turn` は左右の向き（度）で、0 なら +z の向き、増やすと +x の側へ回る。`tilt` は上下の向き（度）で、増やすと上を向く。見える範囲は上下 70 度、0.1〜1000 先まで |
+| `gpu_mesh(points, colors)` | `(List<Float>, List<Int>) -> Int uses io`。三角形の集まりを GPU に覚えさせ、その番号を返す。`points` は三角形 1 つにつき小数 9 個（角 3 つの x, y, z）、`colors` は三角形 1 つにつき色 1 個。GPU のウィンドウがなければ 0 |
+| `gpu_draw(mesh, x, y, z)` | `(Int, Float, Float, Float) -> Unit uses io`。覚えさせた三角形を、`(x, y, z)` だけずらして描く。手前のものが奥のものを隠す |
+| `gpu_free(mesh)` | `(Int) -> Unit uses io`。覚えさせた三角形を捨てる（作り直す前に呼ぶ） |
+| `gpu_fog(color, start, end)` | `(Int, Int, Int) -> Unit uses io`。距離 `start` から `end` にかけて、遠いものを `color` に溶け込ませる。`end <= start` なら霧なし |
+| `gpu_rect(x, y, width, height, color)` | `(Int, Int, Int, Int, Int) -> Unit uses io`。絵の上に重ねる長方形（照準や持ち物の表示用）。左上が `(0, 0)`、単位は画面の点 |
+
+GPU のウィンドウを開いていないとき、これらは何もしない（`gpu_mesh` は 0 を返す）。
+形が変わらないものは `gpu_mesh` を 1 回だけ呼び、毎コマは `gpu_draw` だけを呼ぶ。基本の形:
+
+```
+fn main() uses io {
+  gpu_open("triangle", 1280, 720)
+  let mesh = gpu_mesh([-1.0, 0.0, 5.0, 1.0, 0.0, 5.0, 0.0, 1.5, 5.0], [rgb(240, 200, 60)])
+  let mut turn = 0.0
+  let mut running = true
+  while running {
+    if key_down("left") { turn = turn - 1.0 }
+    if key_down("right") { turn = turn + 1.0 }
+    gpu_clear(rgb(20, 20, 40))
+    gpu_camera(0.0, 0.5, 0.0, turn, 0.0)
+    gpu_draw(mesh, 0.0, 0.0, 0.0)
+    if !window_update() || key_down("escape") { running = false }
+    sleep_ms(8)
+  }
+}
+```
+
 ### メソッド
 
 すべての型: `to_string() -> String`
