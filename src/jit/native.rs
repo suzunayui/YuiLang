@@ -152,6 +152,10 @@ const LIVE_BLOCKS: usize = 0;
 const POOL_HEADS: usize = 8;
 const POOL_NEXT: usize = 88;
 const POOL_END: usize = 96;
+/// Where the rest of the writable memory starts: tables of remembered results.
+const BSS_FIXED: usize = 104;
+/// How many results a function remembers.
+const MEMO_ENTRIES: usize = 1024;
 /// Blocks up to this size come from the small-block allocator.
 const POOL_MAX: usize = 64;
 /// How much it takes from the system at a time.
@@ -356,6 +360,8 @@ struct Native<'a> {
     data: Vec<(usize, Vec<u8>)>,
     /// Positions of rip-relative displacements into the writable memory, and the offset there.
     bss_fixups: Vec<(usize, usize)>,
+    /// How much writable memory is in use.
+    bss_used: usize,
     /// Whether the program needs anything of `runtime.yui`.
     uses_heap: bool,
     /// The functions of `runtime.yui` that are called, and those not compiled yet.
@@ -472,6 +478,7 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         iat_fixups: Vec::new(),
         data: Vec::new(),
         bss_fixups: Vec::new(),
+        bss_used: BSS_FIXED,
         uses_heap: false,
         rt_seen: Default::default(),
         rt_queue: Vec::new(),
@@ -655,7 +662,7 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     }
     let iat_fixups = std::mem::take(&mut n.iat_fixups);
     let bss_fixups = std::mem::take(&mut n.bss_fixups);
-    Ok(write_pe(n.a.finish(), &iat_fixups, &bss_fixups))
+    Ok(write_pe(n.a.finish(), &iat_fixups, &bss_fixups, n.bss_used))
 }
 
 type Decls = Vec<(usize, String, u8)>;
@@ -846,6 +853,10 @@ impl Native<'_> {
             ExprKind::Field(base, ..) => self.path_ty(base).is_none(),
             ExprKind::Index(list, index) => {
                 !matches!(self.path_ty(list), Some(Ty::List(_))) || self.has_call(index)
+            }
+            // These methods exist on numbers only, and are a few instructions each.
+            ExprKind::MethodCall { recv, name, args, .. } if INLINE_METHODS.contains(&name.as_str()) => {
+                self.has_call(recv) || args.iter().any(|arg| self.has_call(arg))
             }
             ExprKind::MethodCall { recv, name, args, .. } => {
                 !(name == "len" && args.is_empty() && matches!(self.path_ty(recv), Some(Ty::List(_))))
@@ -2118,6 +2129,23 @@ impl Native<'_> {
         Ok(())
     }
 
+    /// `rcx = the entry of the table of remembered results` (at `table` in the
+    /// writable memory) for the arguments in `args`. Uses rax and rdx.
+    fn memo_entry(&mut self, args: &[Loc], table: usize) {
+        self.load_loc(RAX, args[0]);
+        for loc in &args[1..] {
+            self.a.imul_imm(RAX, 1_000_003);
+            match loc {
+                Loc::Reg(r) => self.a.alu_rr(0x01, RAX, *r),
+                Loc::Stack(off) => self.a.alu_m(0x03, RAX, M(RSP, *off)),
+            }
+        }
+        self.a.alu_imm(4, RAX, MEMO_ENTRIES as i32 - 1); // and
+        self.a.imul_imm(RAX, (args.len() as i32 + 2) * 8);
+        self.rip_bss(&[0x48, 0x8D, 0x0D], table); // lea rcx, [table]
+        self.a.alu_rr(0x01, RCX, RAX);
+    }
+
     /// Compiles one function. With `captures`, it is the code of a closure:
     /// the closure's block arrives in rcx, before the parameters, and the
     /// captured values are read out of it. `decl` gives the contracts.
@@ -2235,6 +2263,51 @@ impl Native<'_> {
         }
         self.scopes = vec![scope];
         let name = decl.map(|f| f.name.rsplit('.').next().unwrap_or(&f.name).to_string()).unwrap_or_default();
+        // A function without effects gives the same result for the same
+        // arguments, so results can be remembered and reused. That pays off
+        // when the function calls itself more than once per call, which is
+        // where the same arguments come up again and again. (Rust cannot do
+        // this by itself: it does not know that a function has no effects.)
+        let ints: Vec<Loc> = params.iter().map(|(_, at, _)| self.decl_loc[&(*at, VAR)]).collect();
+        let memo = decl.filter(|f| {
+            let mut calls = 0;
+            any_block(&f.body, &mut |e| {
+                if matches!(&e.kind, ExprKind::Call { name, local: false, .. } if *name == f.name) {
+                    calls += 1;
+                }
+                false
+            });
+            !self.in_runtime
+                && f.effects.is_empty()
+                && ret == Ty::Int
+                && (1..=3).contains(&params.len())
+                && params.iter().all(|(_, _, ty)| *ty == Ty::Int)
+                && calls >= 2
+        });
+        let quick_exit = self.a.label();
+        let table = memo.map(|_| {
+            // Each entry: whether it is filled, the arguments, the result.
+            let at = self.bss_used;
+            self.bss_used += MEMO_ENTRIES * 8 * (params.len() + 2);
+            at
+        });
+        if let Some(table) = table {
+            let miss = self.a.label();
+            self.memo_entry(&ints, table);
+            self.a.cmp_imm(M(RCX, 0), 1);
+            self.a.jcc(CC_NE, miss);
+            for (i, loc) in ints.iter().enumerate() {
+                self.a.load(RAX, M(RCX, 8 + 8 * i as i32));
+                match loc {
+                    Loc::Reg(r) => self.a.alu_rr(0x39, RAX, *r),
+                    Loc::Stack(off) => self.a.alu_m(0x3B, RAX, M(RSP, *off)),
+                }
+                self.a.jcc(CC_NE, miss);
+            }
+            self.a.load(RAX, M(RCX, 8 + 8 * ints.len() as i32));
+            self.a.jmp(quick_exit);
+            self.a.bind(miss);
+        }
         for clause in requires {
             let Some(site) = site else { break };
             let text = &self.sources.text[clause.span.start..clause.span.end];
@@ -2278,6 +2351,19 @@ impl Native<'_> {
         }
         // The parameters are the function's own references.
         self.release_scopes(0, (ret != Ty::Unit).then_some(RAX));
+        if let Some(table) = table {
+            // Parameters are never assigned to, so they still hold the arguments.
+            self.a.mov_rr(R8, RAX);
+            self.memo_entry(&ints, table);
+            self.a.store_imm(M(RCX, 0), 1);
+            for (i, loc) in ints.iter().enumerate() {
+                self.load_loc(RAX, *loc);
+                self.a.store(M(RCX, 8 + 8 * i as i32), RAX);
+            }
+            self.a.store(M(RCX, 8 + 8 * ints.len() as i32), R8);
+            self.a.mov_rr(RAX, R8);
+        }
+        self.a.bind(quick_exit);
         self.a.alu_imm(0, RSP, 0);
         let frame_at = [frame_at[0], self.a.buf.len() - 4];
         for reg in used.iter().rev() {
@@ -3737,15 +3823,50 @@ impl Native<'_> {
     }
 
     fn arithmetic(&mut self, op: BinOp, l: &Expr, r: &Expr, dst: u8, span: Span) -> R<Ty> {
+        // An Int variable or small literal on the left is used from where it
+        // is, and the right side is computed straight into `dst` - unless
+        // `dst` is where that variable lives.
+        let mut quick = None;
+        if let Some((a, Ty::Int)) = self.simple(l) {
+            if !matches!(a, Opnd::Reg(reg) if reg == dst) {
+                match self.simple(r) {
+                    Some((b, Ty::Int)) => quick = Some((a, b)),
+                    None if !self.has_call(r) => {
+                        if self.eval(r, dst)? != Ty::Int {
+                            return unsupported("arithmetic on anything but Ints", span);
+                        }
+                        quick = Some((a, Opnd::Reg(dst)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (a, b, temp, spilled) = match quick {
+            Some((a, b)) => (a, b, None, false),
+            None => match self.slow_operands(op, l, r, dst, span)? {
+                Some(operands) => operands,
+                // Floats were computed there.
+                None => return Ok(Ty::Float),
+            },
+        };
+        self.int_arithmetic(op, a, b, dst, span);
+        self.release(temp, spilled);
+        Ok(Ty::Int)
+    }
+
+    /// The general case of `arithmetic`: the left operand goes to `dst`
+    /// first. Floats are computed here entirely, and `None` is returned.
+    #[allow(clippy::type_complexity)]
+    fn slow_operands(&mut self, op: BinOp, l: &Expr, r: &Expr, dst: u8, span: Span) -> R<Option<(Opnd, Opnd, Option<u8>, bool)>> {
         match self.eval(l, dst)? {
             Ty::Int => {}
             Ty::Float => {
                 // Floats: no checks; the processor's rules give infinity and "not a number".
                 let (a, b, _, temp, spilled) = self.operands(dst, r)?;
-                self.load_opnd(RAX, a);
-                self.load_opnd(RCX, b);
                 if op == BinOp::Rem {
                     // The exact remainder, as the old floating-point unit computes it.
+                    self.load_opnd(RAX, a);
+                    self.load_opnd(RCX, b);
                     self.a.store(M(RSP, 0), RCX);
                     self.a.buf.extend_from_slice(&[0xDD, 0x04, 0x24]); // fld qword [rsp]
                     self.a.store(M(RSP, 0), RAX);
@@ -3758,9 +3879,11 @@ impl Native<'_> {
                     self.a.jcc(CC_NZ, again);
                     self.a.buf.extend_from_slice(&[0xDD, 0x1C, 0x24]); // fstp qword [rsp]
                     self.a.buf.extend_from_slice(&[0xDD, 0xD8]); // fstp st(0)
-                    self.a.load(RAX, M(RSP, 0));
+                    self.a.load(dst, M(RSP, 0));
                 } else {
-                    self.floats_in();
+                    // Straight from where the operands are, and straight to `dst`.
+                    self.float_load(0, a);
+                    self.float_load(1, b);
                     let code = match op {
                         BinOp::Add => 0x58,
                         BinOp::Sub => 0x5C,
@@ -3768,11 +3891,10 @@ impl Native<'_> {
                         _ => 0x5E,
                     };
                     self.a.buf.extend_from_slice(&[0xF2, 0x0F, code, 0xC1]); // addsd / subsd / mulsd / divsd xmm0, xmm1
-                    self.float_out();
+                    self.a.buf.extend_from_slice(&[0x66, 0x48 | (dst >> 3), 0x0F, 0x7E, 0xC0 | (dst & 7)]); // movq dst, xmm0
                 }
-                self.a.mov_rr(dst, RAX);
                 self.release(temp, spilled);
-                return Ok(Ty::Float);
+                return Ok(None);
             }
             _ => return unsupported("arithmetic on anything but numbers", span),
         }
@@ -3780,6 +3902,11 @@ impl Native<'_> {
         if ty != Ty::Int {
             return unsupported("arithmetic on anything but Ints", span);
         }
+        Ok(Some((a, b, temp, spilled)))
+    }
+
+    /// `dst = a op b` for Ints, with the checks.
+    fn int_arithmetic(&mut self, op: BinOp, a: Opnd, b: Opnd, dst: u8, span: Span) {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul => {
                 // Compute in rax so that both operands survive for the error message.
@@ -3832,8 +3959,18 @@ impl Native<'_> {
             }
         }
         self.a.mov_rr(dst, RAX);
-        self.release(temp, spilled);
-        Ok(Ty::Int)
+    }
+
+    /// `xmm<x> = o` as a float.
+    fn float_load(&mut self, x: u8, o: Opnd) {
+        let reg = match o {
+            Opnd::Reg(r) => r,
+            _ => {
+                self.load_opnd(RAX, o);
+                RAX
+            }
+        };
+        self.a.buf.extend_from_slice(&[0x66, 0x48 | (reg >> 3), 0x0F, 0x6E, 0xC0 | x << 3 | (reg & 7)]); // movq xmm, reg
     }
 
     /// Jumps to `no` unless `e` is true.
@@ -3857,6 +3994,47 @@ impl Native<'_> {
                 self.cond(x, yes)?;
                 self.a.jmp(no);
                 self.a.bind(yes);
+                Ok(())
+            }
+            ExprKind::Binary(op @ (BinOp::Eq | BinOp::Ne), l, r)
+                if matches!(r.kind, ExprKind::Int(0)) && divisor_of(l).is_some() && !self.in_runtime =>
+            {
+                // `x % d == 0` for a constant `d`: no division is needed.
+                let ExprKind::Binary(_, x, _) = &l.kind else { return Ok(()) };
+                let d = divisor_of(l).unwrap_or(1);
+                let (value, owned) = match self.simple(x) {
+                    Some((Opnd::Reg(reg), Ty::Int)) => (reg, None),
+                    _ => {
+                        let t = self.take_temp(e.span)?;
+                        if self.eval(x, t)? != Ty::Int {
+                            return unsupported("the remainder of anything but Ints", e.span);
+                        }
+                        (t, Some(t))
+                    }
+                };
+                // Where to go when the number is (`!=`) or is not (`==`) a multiple.
+                let wanted = *op == BinOp::Eq;
+                if d & (d - 1) == 0 {
+                    // A power of two: the low bits are zero.
+                    self.a.b(0x48 | (value >> 3));
+                    self.a.b(0xF7);
+                    self.a.b(0xC0 | (value & 7));
+                    self.a.d32((d - 1) as i32); // test value, d - 1
+                    self.a.jcc(if wanted { CC_NZ } else { CC_Z }, no);
+                } else {
+                    let (m, a) = divisibility(d);
+                    self.a.mov_rr(RAX, value);
+                    self.a.mov_imm64(RCX, m);
+                    self.a.imul_rr(RAX, RCX);
+                    self.a.mov_imm64(RCX, a);
+                    self.a.alu_rr(0x01, RAX, RCX);
+                    self.a.mov_imm64(RCX, 2 * a);
+                    self.a.alu_rr(0x39, RAX, RCX);
+                    self.a.jcc(if wanted { CC_A } else { CC_BE }, no);
+                }
+                if let Some(t) = owned {
+                    self.free.push(t);
+                }
                 Ok(())
             }
             ExprKind::Binary(op, l, r) if op.is_comparison() => {
@@ -3920,12 +4098,12 @@ impl Native<'_> {
                 if lt != rt || !(matches!(lt, Ty::Int | Ty::Bool | Ty::Float) || self.plain_enum(lt)) {
                     return unsupported("comparing values of this type", e.span);
                 }
-                self.load_opnd(RAX, left);
                 if lt == Ty::Float {
-                    self.load_opnd(RCX, b);
-                    self.floats_in();
+                    self.float_load(0, left);
+                    self.float_load(1, b);
                     self.float_compare(*op, no);
                 } else {
+                    self.load_opnd(RAX, left);
                     match b {
                         Opnd::Imm(n) => self.a.alu_imm(7, RAX, n),
                         Opnd::Reg(r) => self.a.alu_rr(0x39, RAX, r),
@@ -6106,6 +6284,75 @@ impl Native<'_> {
     }
 }
 
+/// If `e` is `x % d` for a constant `d` that the quick test for
+/// multiples handles (a power of two up to 2^31, or an odd number from 3): `d`.
+fn divisor_of(e: &Expr) -> Option<i64> {
+    match &e.kind {
+        ExprKind::Binary(BinOp::Rem, _, d) => match d.kind {
+            ExprKind::Int(d) if d >= 2 && d & (d - 1) == 0 && d <= 1 << 31 => Some(d),
+            ExprKind::Int(d) if d >= 3 && d % 2 == 1 => Some(d),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Methods of Int and Float that are compiled to a few instructions in
+/// place. No other type has a method with one of these names.
+const INLINE_METHODS: [&str; 12] =
+    ["abs", "min", "max", "sqrt", "floor", "ceil", "round", "bit_and", "bit_or", "bit_xor", "shl", "shr"];
+
+/// For an odd `d` of at least 3: numbers `(m, a)` such that a signed 64-bit
+/// `n` is a multiple of `d` exactly when `n * m + a`, computed with
+/// wrap-around and read as unsigned, is at most `2 * a`.
+///
+/// `m` is the inverse of `d` (`d * m` wraps to 1), so multiplying by it is
+/// an exact division for multiples of `d`: they land on the quotients, which
+/// lie between `-a` and `a`. Multiplying by `m` is one-to-one, so nothing
+/// else can land there.
+fn divisibility(d: i64) -> (i64, i64) {
+    let mut m = d;
+    for _ in 0..6 {
+        m = m.wrapping_mul(2i64.wrapping_sub(d.wrapping_mul(m)));
+    }
+    (m, i64::MAX / d)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn divisibility_test_matches_remainder() {
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for d in [3i64, 5, 7, 9, 11, 15, 25, 101, 1001, 65537, 1_000_003, 999_999_999_989, i64::MAX] {
+            let (m, a) = super::divisibility(d);
+            assert_eq!(d.wrapping_mul(m), 1);
+            let check = |n: i64| {
+                let quick = (n.wrapping_mul(m).wrapping_add(a) as u64) <= 2 * a as u64;
+                assert_eq!(quick, n % d == 0, "{n} % {d}");
+            };
+            for n in [0, 1, -1, d, -d, d - 1, d + 1, i64::MAX, i64::MIN, i64::MIN + 1, i64::MAX / d * d, -(i64::MAX / d) * d] {
+                check(n);
+            }
+            for k in -2000..2000i64 {
+                check(k);
+                check(k.wrapping_mul(d));
+                check(k.wrapping_mul(d).wrapping_add(1));
+            }
+            for _ in 0..20000 {
+                let n = next() as i64;
+                check(n);
+                check(n / d * d);
+            }
+        }
+    }
+}
+
 /// Whether `test` holds for `e` or anything inside it.
 fn any_expr(e: &Expr, test: &mut dyn FnMut(&Expr) -> bool) -> bool {
     if test(e) {
@@ -6189,8 +6436,8 @@ fn align(n: usize, to: usize) -> usize {
 /// of code and constants, and one section with the import table.
 /// `iat_fixups` are the places in the code that call imported functions.
 /// `bss_fixups` are the places that refer to writable memory; if there are
-/// any, a third section provides a page of it, zeroed by the loader.
-fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usize, usize)]) -> Vec<u8> {
+/// any, a third section provides `bss_used` bytes of it, zeroed by the loader.
+fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usize, usize)], bss_used: usize) -> Vec<u8> {
     const FILE_ALIGN: usize = 0x200;
     const SECTION_ALIGN: usize = 0x1000;
     const IMAGE_BASE: u64 = 0x1_4000_0000;
@@ -6233,7 +6480,7 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usi
     }
 
     let bss_rva = idata_rva + align(idata.len(), SECTION_ALIGN);
-    let bss_size = if bss_fixups.is_empty() { 0 } else { SECTION_ALIGN };
+    let bss_size = if bss_fixups.is_empty() { 0 } else { align(bss_used, SECTION_ALIGN) };
     for (at, offset) in bss_fixups {
         let rel = ((bss_rva + offset) as i64 - (text_rva + at + 4) as i64) as i32;
         code[*at..*at + 4].copy_from_slice(&rel.to_le_bytes());

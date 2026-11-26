@@ -1,0 +1,37 @@
+// 「定数で割り切れるか」の判定。割り算を使わない形に変換されるので、境目の値で確かめる
+
+fn count(limit: Int, d3: Bool) -> Int {
+  let mut n = 0
+  let mut i = 0 - limit
+  while i <= limit {
+    if d3 {
+      if i % 3 == 0 {
+        n = n + 1
+      }
+    } else if i % 7 != 0 {
+      n = n + 1
+    }
+    i = i + 1
+  }
+  n
+}
+
+fn main() uses io {
+  let max = 9223372036854775807
+  let min = 0 - max - 1
+  let values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 21, 49, 63, 64, 1000001, 3000000003, max, max - 1, max - 2, max - 6, min, min + 1, min + 2, min + 8]
+  for v in values {
+    let w = 0 - v / 2
+    print("{v}: {v % 2 == 0} {v % 3 == 0} {v % 4 != 0} {v % 5 == 0} {v % 7 == 0} {v % 8 == 0} {v % 9 != 0} {v % 1024 == 0} {v % 1000003 == 0} {w % 3 == 0} {w % 16 == 0} {(v / 3 * 3) % 3 == 0}")
+  }
+  print("{count(1000, true)} {count(1000, false)} {max % 7 == 0} {(max / 7 * 7) % 7 == 0} {min % 2147483648 == 0} {max % 2147483648 == 0}")
+  let mut odd = 0
+  for i in 0..100 {
+    if i % 2 != 0 && i % 15 == 0 || i % 32 == 0 {
+      odd = odd + i
+    }
+  }
+  print("{odd}")
+  let x = 2.5
+  print("{x * 2.0 % 5.0 == 0.0} {x.sqrt().max(1.0) + x.floor().min(x.ceil())} {(0 - 7).abs().max(3).min(100) + 1.shl(4).bit_or(3)}")
+}
