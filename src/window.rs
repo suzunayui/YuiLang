@@ -175,6 +175,10 @@ mod os {
     pub fn text_input() -> String {
         String::new()
     }
+    pub fn text_cursor(_x: i64, _y: i64, _size: i64) {}
+    pub fn gpu_text_width(_size: i64, _text: &str) -> i64 {
+        0
+    }
 }
 
 #[cfg(windows)]
@@ -269,6 +273,34 @@ mod os {
         fn LoadCursorW(instance: isize, name: *const u16) -> isize;
         fn GetForegroundWindow() -> isize;
         fn SetProcessDPIAware() -> i32;
+        fn CreateCaret(window: isize, bitmap: isize, width: i32, height: i32) -> i32;
+        fn SetCaretPos(x: i32, y: i32) -> i32;
+    }
+
+    /// Where the text being composed is shown (COMPOSITIONFORM).
+    #[repr(C)]
+    struct Composition {
+        style: u32,
+        position: Point,
+        area: Rect,
+    }
+
+    /// The font it is shown in (LOGFONTW).
+    #[repr(C)]
+    struct LogFont {
+        height: i32,
+        other_sizes: [i32; 4],
+        flags: [u8; 8],
+        face: [u16; 32],
+    }
+
+    // The part of Windows that turns keystrokes into Japanese and the like.
+    #[link(name = "imm32")]
+    extern "system" {
+        fn ImmGetContext(window: isize) -> isize;
+        fn ImmSetCompositionWindow(context: isize, form: *const Composition) -> i32;
+        fn ImmSetCompositionFontW(context: isize, font: *const LogFont) -> i32;
+        fn ImmReleaseContext(window: isize, context: isize) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -312,6 +344,7 @@ mod os {
         fn SelectObject(dc: isize, object: isize) -> isize;
         fn DeleteObject(object: isize) -> i32;
         fn GetTextMetricsW(dc: isize, metrics: *mut [i32; 16]) -> i32;
+        fn GetTextExtentPoint32W(dc: isize, text: *const u16, units: i32, size: *mut Point) -> i32;
     }
 
     /// What kind of surface OpenGL is to draw on (PIXELFORMATDESCRIPTOR).
@@ -661,6 +694,71 @@ mod os {
         })
     }
 
+    /// The letters of `size` (made if there are none yet): their place in `fonts`.
+    unsafe fn font_index(fonts: &mut Vec<Font>, dc: isize, size: i64) -> usize {
+        if let Some(index) = fonts.iter().position(|font| font.size == size) {
+            return index;
+        }
+        // Four sizes are kept; a fifth replaces the first.
+        if fonts.len() == 4 {
+            let old = fonts.remove(0);
+            glDeleteLists(old.base, 65536);
+            DeleteObject(old.handle);
+        }
+        let face = wide("Yu Gothic UI");
+        let handle = CreateFontW(-(size as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
+        SelectObject(dc, handle);
+        let mut metrics = [0i32; 16];
+        GetTextMetricsW(dc, &mut metrics);
+        let base = glGenLists(65536);
+        fonts.push(Font { size, handle, base, made: vec![false; 65536], ascent: metrics[1], height: metrics[0] });
+        fonts.len() - 1
+    }
+
+    /// How many pixels wide `text` is when drawn with `gpu_text` at `size`.
+    pub fn gpu_text_width(size: i64, text: &str) -> i64 {
+        with_gpu(|window| unsafe {
+            let Some((dc, _)) = window.gpu else { return 0 };
+            FONTS.with(|f| {
+                let mut fonts = f.borrow_mut();
+                let index = font_index(&mut fonts, dc, size.clamp(6, 200));
+                SelectObject(dc, fonts[index].handle);
+                let units: Vec<u16> = text.encode_utf16().collect();
+                let mut extent = Point::default();
+                GetTextExtentPoint32W(dc, units.as_ptr(), units.len() as i32, &mut extent);
+                extent.x as i64
+            })
+        })
+    }
+
+    /// Tells the system where the text being typed appears, so that what is
+    /// being composed (Japanese and the like) shows up there, `size` high.
+    pub fn text_cursor(x: i64, y: i64, size: i64) {
+        WINDOW.with(|w| {
+            let slot = w.borrow();
+            let Some(window) = slot.as_ref() else { return };
+            let (x, y, size) = (limit(x), limit(y), size.clamp(6, 200) as i32);
+            // Safety: the structures are laid out as Windows expects.
+            unsafe {
+                // Newer input methods go by the caret, older ones by the composition window.
+                CreateCaret(window.handle, 0, 1, size);
+                SetCaretPos(x, y);
+                let context = ImmGetContext(window.handle);
+                if context != 0 {
+                    // 2 = at this point
+                    let form = Composition { style: 2, position: Point { x, y }, area: Rect { left: 0, top: 0, right: 0, bottom: 0 } };
+                    ImmSetCompositionWindow(context, &form);
+                    let mut font = LogFont { height: -size, other_sizes: [0, 0, 0, 400], flags: [0, 0, 0, 1, 0, 0, 0, 0], face: [0; 32] };
+                    for (to, from) in font.face.iter_mut().zip("Yu Gothic UI".encode_utf16()) {
+                        *to = from;
+                    }
+                    ImmSetCompositionFontW(context, &font);
+                    ImmReleaseContext(window.handle, context);
+                }
+            }
+        })
+    }
+
     /// Text on top of the picture: its top left at (x, y), letters `size`
     /// pixels high. A line feed starts a new line.
     pub fn gpu_text(x: i64, y: i64, size: i64, color: i64, text: &str) {
@@ -669,25 +767,7 @@ mod os {
             let size = size.clamp(6, 200);
             FONTS.with(|f| {
                 let mut fonts = f.borrow_mut();
-                let index = match fonts.iter().position(|font| font.size == size) {
-                    Some(index) => index,
-                    None => {
-                        // Four sizes are kept; a fifth replaces the first.
-                        if fonts.len() == 4 {
-                            let old = fonts.remove(0);
-                            glDeleteLists(old.base, 65536);
-                            DeleteObject(old.handle);
-                        }
-                        let face = wide("Yu Gothic UI");
-                        let handle = CreateFontW(-(size as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
-                        SelectObject(dc, handle);
-                        let mut metrics = [0i32; 16];
-                        GetTextMetricsW(dc, &mut metrics);
-                        let base = glGenLists(65536);
-                        fonts.push(Font { size, handle, base, made: vec![false; 65536], ascent: metrics[1], height: metrics[0] });
-                        fonts.len() - 1
-                    }
-                };
+                let index = font_index(&mut fonts, dc, size);
                 let font = &mut fonts[index];
                 if font.base == 0 {
                     return;
@@ -852,3 +932,4 @@ mod os {
 
 pub use os::{close, key_down, mouse, mouse_down, open, update};
 pub use os::{gpu_camera, gpu_clear, gpu_draw, gpu_fog, gpu_free, gpu_mesh, gpu_open, gpu_rect, gpu_text, text_input};
+pub use os::{gpu_text_width, text_cursor};

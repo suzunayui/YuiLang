@@ -1526,6 +1526,11 @@ impl<'a> Interp<'a> {
                         Value::Unit
                     }
                     "text_input" => Value::str(&window::text_input()),
+                    "text_cursor" => {
+                        window::text_cursor(int(0), int(1), int(2));
+                        Value::Unit
+                    }
+                    "gpu_text_width" => Value::Int(window::gpu_text_width(int(0), &name_of(1))),
                     "env" => Value::str(&std::env::var(name_of(0)).unwrap_or_default()),
                     "http_start" => {
                         let headers: Vec<String> = match args.get(2) {

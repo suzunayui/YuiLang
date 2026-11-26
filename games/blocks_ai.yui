@@ -791,6 +791,8 @@ fn main() uses io, net {
     if typing {
       gpu_rect(16, height - 112, width - 32, 40, rgb(255, 255, 255))
       gpu_text(26, height - 106, 24, rgb(20, 24, 40), "> {draft}_")
+      // 変換中の文字が、書いた文のすぐ後ろに出るようにする
+      text_cursor(26 + gpu_text_width(24, "> {draft}"), height - 106, 24)
     }
 
     frame = frame + 1

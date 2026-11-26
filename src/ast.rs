@@ -41,6 +41,8 @@ pub const BUILTIN_FNS: &[&str] = &[
     "gpu_rect",
     "gpu_text",
     "text_input",
+    "text_cursor",
+    "gpu_text_width",
     // The environment, and requests over the network.
     "env",
     "http_start",

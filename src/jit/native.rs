@@ -66,7 +66,7 @@ const STDERR: i64 = -12;
 /// Functions imported from kernel32.dll, in the order of the import table.
 /// Functions of the operating system that the generated code may call: the
 /// library and the name. An executable imports the ones it actually uses.
-const IMPORTS: [(&str, &str); 92] = [
+const IMPORTS: [(&str, &str); 99] = [
     ("KERNEL32.dll", "GetStdHandle"),
     ("KERNEL32.dll", "WriteFile"),
     ("KERNEL32.dll", "ExitProcess"),
@@ -159,12 +159,19 @@ const IMPORTS: [(&str, &str); 92] = [
     ("GDI32.dll", "GetTextMetricsW"),
     ("OPENGL32.dll", "glRasterPos2i"),
     ("OPENGL32.dll", "wglUseFontBitmapsW"),
+    ("USER32.dll", "CreateCaret"),
+    ("USER32.dll", "SetCaretPos"),
+    ("GDI32.dll", "GetTextExtentPoint32W"),
+    ("IMM32.dll", "ImmGetContext"),
+    ("IMM32.dll", "ImmSetCompositionWindow"),
+    ("IMM32.dll", "ImmSetCompositionFontW"),
+    ("IMM32.dll", "ImmReleaseContext"),
 ];
 /// The imports `runtime.yui` may call as `__os_<name>(...)`, with how many
 /// arguments each takes. They follow the same calling convention as the
 /// code this compiler makes, so a call is an ordinary call. (The address of
 /// any import can also be had with `__import_<name>()`.)
-const OS_CALLS: [(&str, usize); 87] = [
+const OS_CALLS: [(&str, usize); 94] = [
     ("GetStdHandle", 1),
     ("WriteFile", 5),
     ("ReadFile", 5),
@@ -252,6 +259,13 @@ const OS_CALLS: [(&str, usize); 87] = [
     ("GetTextMetricsW", 2),
     ("glRasterPos2i", 2),
     ("wglUseFontBitmapsW", 4),
+    ("CreateCaret", 4),
+    ("SetCaretPos", 2),
+    ("GetTextExtentPoint32W", 4),
+    ("ImmGetContext", 1),
+    ("ImmSetCompositionWindow", 2),
+    ("ImmSetCompositionFontW", 2),
+    ("ImmReleaseContext", 2),
 ];
 /// Those of `OS_CALLS` that take floats. Windows wants a float argument in an
 /// xmm register rather than a general one, so the first four arguments are
@@ -4525,13 +4539,13 @@ impl Native<'_> {
             | ("gpu_open", [_, _, _])
             | ("gpu_clear" | "gpu_free", [_])
             | ("gpu_camera", [_, _, _, _, _])
-            | ("gpu_fog", [_, _, _])
+            | ("gpu_fog" | "text_cursor", [_, _, _])
             | ("gpu_draw", [_, _, _, _])
             | ("gpu_rect" | "gpu_text", [_, _, _, _, _]) => {
                 self.call_rt_with(name, args, dst)?;
                 Ok(Some(Ty::Unit))
             }
-            ("gpu_mesh", [_, _]) | ("http_start", [_, _, _, _]) => {
+            ("gpu_mesh" | "gpu_text_width", [_, _]) | ("http_start", [_, _, _, _]) => {
                 self.call_rt_with(name, args, dst)?;
                 self.a.mov_rr(dst, RAX);
                 Ok(Some(Ty::Int))

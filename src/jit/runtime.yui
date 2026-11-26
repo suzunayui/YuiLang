@@ -2070,6 +2070,73 @@ fn gpu_font(size: Int) -> Int {
   entry
 }
 
+// gpu_text で size の大きさで描いたときの、text の横幅（点の数）
+fn gpu_text_width(size: Int, text: Int) -> Int {
+  if gpu_ready() == 0 { return 0 }
+  let mut height = size
+  if height < 6 {
+    height = 6
+  }
+  if height > 200 {
+    height = 200
+  }
+  let entry = gpu_font(height)
+  let dc = __load(__global(6))
+  let old = __os_SelectObject(dc, __load(entry + 8))
+  let wide = wide_copy(text)
+  let mut units = 0
+  while __load8(wide + units * 2) != 0 || __load8(wide + units * 2 + 1) != 0 {
+    units = units + 1
+  }
+  let extent = __alloc(16)
+  __store(extent, 0)
+  let measured = __os_GetTextExtentPoint32W(dc, wide, units, extent)
+  let width = __load32(extent)
+  __free(extent)
+  __free(wide)
+  width
+}
+
+// 打っている文字が出る場所を OS に伝える。変換中の文字（日本語など）が、そこに size の高さで出るようになる
+fn text_cursor(x: Int, y: Int, size: Int) {
+  let window = __load(__global(0))
+  if window == 0 { return }
+  let mut height = size
+  if height < 6 {
+    height = 6
+  }
+  if height > 200 {
+    height = 200
+  }
+  let px = gpu_limit(x)
+  let py = gpu_limit(y)
+  // 新しい日本語入力は文字の入力位置（キャレット）を、古いものは変換中の枠の位置を見る
+  let made = __os_CreateCaret(window, 0, 1, height)
+  let moved = __os_SetCaretPos(px, py)
+  let context = __os_ImmGetContext(window)
+  if context == 0 { return }
+  // 枠の置き方: 2 = この点に置く
+  let form = __alloc(32)
+  zero_bytes(form, 32)
+  __store32(form, 2)
+  __store32(form + 4, px)
+  __store32(form + 8, py)
+  let placed = __os_ImmSetCompositionWindow(context, form)
+  __free(form)
+  // 書体: 高さ（負の数で文字の大きさ）、太さ 400、文字の種類はおまかせ、名前
+  let font = __alloc(96)
+  zero_bytes(font, 96)
+  __store32(font, 4294967296 - height)
+  __store32(font + 16, 400)
+  __store8(font + 23, 1)
+  let face = wide_copy("Yu Gothic UI")
+  __copy(font + 28, face, 26)
+  __free(face)
+  let styled = __os_ImmSetCompositionFontW(context, font)
+  __free(font)
+  let released = __os_ImmReleaseContext(window, context)
+}
+
 // 絵の上に重ねる文字。左上が (x, y)、文字の高さが size 点。改行で次の行へ進む
 fn gpu_text(x: Int, y: Int, size: Int, color: Int, text: Int) {
   if gpu_ready() == 0 { return }

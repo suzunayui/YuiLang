@@ -30,6 +30,8 @@ fn main() uses io, net {
   print("{missing.len()} {path.len() > 0}")
   // ウィンドウがなければ、打たれた文字はなく、文字を描いても何も起きない
   let typed = text_input()
-  gpu_text(10, 10, 24, rgb(255, 255, 255), "こんにちは")
-  print("{typed.len()}")
+  let hello = "こんにちは"
+  gpu_text(10, 10, 24, rgb(255, 255, 255), hello)
+  text_cursor(10, 10, 24)
+  print("{typed.len()} {gpu_text_width(24, hello)}")
 }

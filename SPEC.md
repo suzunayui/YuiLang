@@ -297,6 +297,7 @@ fn parse_pair(a: String, b: String) -> Option<Int> {
 | `random(limit)` | `(Int) -> Int uses io`。0 以上 `limit` 未満の乱数（`limit` が 0 以下なら 0） |
 | `random_seed(seed)` | `(Int) -> Unit uses io`。乱数の種を決める。同じ種なら同じ並びになる |
 | `text_input()` | `() -> String uses io`。前に呼んでからウィンドウに打たれた文字（日本語入力で確定した文字も届く）。Enter は改行 `"\n"`、Backspace は文字コード 8、Esc は 27 の文字として入る。ウィンドウがなければ空 |
+| `text_cursor(x, y, size)` | `(Int, Int, Int) -> Unit uses io`。打っている文字が出る場所（左上）と文字の高さを OS に伝える。日本語などの変換中の文字が、画面の隅ではなくそこに出るようになる。入力欄を出している間、毎コマ呼ぶ |
 | `env(name)` | `(String) -> String uses io`。環境変数の値。なければ空の文字列 |
 
 描画は、ウィンドウの持つ点の表に色を書き込むだけで、`window_update()` を呼んだときに画面に出る。
@@ -335,6 +336,7 @@ fn main() uses io {
 | `gpu_fog(color, start, end)` | `(Int, Int, Int) -> Unit uses io`。距離 `start` から `end` にかけて、遠いものを `color` に溶け込ませる。`end <= start` なら霧なし |
 | `gpu_rect(x, y, width, height, color)` | `(Int, Int, Int, Int, Int) -> Unit uses io`。絵の上に重ねる長方形（照準や持ち物の表示用）。左上が `(0, 0)`、単位は画面の点 |
 | `gpu_text(x, y, size, color, text)` | `(Int, Int, Int, Int, String) -> Unit uses io`。絵の上に重ねる文字。左上が `(x, y)`、文字の高さが `size` 点（6〜200）。日本語も描ける。`"\n"` で次の行へ進む。`x` や `y` が負だと描かれない。同時に使える大きさは 4 種類まで（5 種類目は古いものと入れ替わる） |
+| `gpu_text_width(size, text)` | `(Int, String) -> Int uses io`。`gpu_text` で描いたときの横幅（点の数）。GPU のウィンドウがなければ 0 |
 
 GPU のウィンドウを開いていないとき、これらは何もしない（`gpu_mesh` は 0 を返す）。
 形が変わらないものは `gpu_mesh` を 1 回だけ呼び、毎コマは `gpu_draw` だけを呼ぶ。基本の形:
