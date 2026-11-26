@@ -1,0 +1,104 @@
+// 小数: 演算、比較、メソッド、表示
+
+struct Stats {
+  min: Float,
+  max: Float,
+  mean: Float,
+}
+
+enum Shape {
+  Circle(Float),
+  Rect(Float, Float),
+  Empty,
+}
+
+fn area(s: Shape) -> Float {
+  match s {
+    Shape.Circle(r) => 3.0 * r * r
+    Shape.Rect(w, h) => w * h
+    Shape.Empty => 0.0
+  }
+}
+
+fn stats(xs: List<Float>) -> Option<Stats> {
+  let first = xs.first()?
+  let total = xs.fold(0.0, |acc, x| acc + x)
+  Some(Stats {
+    min: xs.fold(first, |a, b| a.min(b)),
+    max: xs.fold(first, |a, b| a.max(b)),
+    mean: total / xs.len().to_float(),
+  })
+}
+
+fn power(base: Float, n: Int) -> Float {
+  let mut out = 1.0
+  for i in 0..n {
+    out = out * base
+  }
+  out
+}
+
+fn show(x: Float) uses io {
+  print("{x}")
+}
+
+fn main() uses io {
+  print("{area(Shape.Rect(2.0, 3.0))} {area(Shape.Circle(1.5))} {area(Shape.Empty)}")
+  print("{stats([3.0, 1.5, 4.25, 0.5])} {stats([])}")
+  let a = 0.1
+  let b = 0.2
+  print("{a + b} {a * b} {a - b} {a / b} {1.0 / 3.0} {2.0 / 3.0} {10.0 % 3.0} {7.5 % 2.0} {0.0 - 7.5 % 2.0} {-a}")
+  print("{a < b} {a > b} {a <= a} {a >= b} {a == a} {a != b} {a + b == 0.3} {0.5 + 0.25 == 0.75}")
+
+  // 表示: 整数値、小さい値、大きい値、端の値
+  print("{1.0} {0.0} {-0.0} {100.0} {1.5} {0.001} {123456.789} {power(0.5, 1074)} {power(2.0, 1023) * 1.9999999999999998}")
+  print("{power(10.0, 15)} {power(10.0, 16)} {power(10.0, 17)} {9007199254740993.0} {power(10.0, 21)} {power(10.0, 22)} {power(10.0, 23)} {123456789012345680.0}")
+  print("{0.000001} {0.0000001} {1.0 / power(10.0, 10)} {power(0.5, 1022)} {power(0.5, 1074) * 1.0} {3.141592653589793} {2.718281828459045}")
+  print("{0.3} {0.30000000000000004} {0.1 + 0.7} {4.35} {4.35 * 100.0} {power(10.0, 23) / 10.0} {power(10.0, 22) * 9.999999999999999}")
+  let zero = 0.0
+  let inf = 1.0 / zero
+  let nan = zero / zero
+  print("{inf} {-inf} {nan} {inf > power(10.0, 308)} {nan == nan} {nan != nan} {nan < 1.0} {nan > 1.0} {inf - inf}")
+
+  // 2 の累乗と 10 の累乗をたどる
+  let mut x = 1.0
+  for i in 0..12 {
+    show(x)
+    x = x * 1024.0 + 0.5
+  }
+  let mut y = 1.0
+  for i in 0..10 {
+    show(y)
+    y = y / 1000.0 * 1.0000001
+  }
+  let mut z = 1.0
+  for i in 0..8 {
+    show(power(10.0, i * 5))
+    show(1.0 / power(10.0, i * 5))
+    show(power(2.0, i * 9 + 1) - 1.0)
+    z = z * 3.0
+  }
+  print("{z} {power(2.0, 52)} {power(2.0, 53) + 1.0} {power(2.0, 64)} {power(0.5, 1074)} {power(0.5, 1075)} {power(2.0, 1023)} {power(2.0, 1024)}")
+
+  // メソッド
+  print("{2.7.to_int()} {(-2.7).to_int()} {0.0.to_int()} {(power(10.0, 18)).to_int()} {7.to_float()} {(0 - 3).to_float()} {9007199254740993.to_float()}")
+  print("{(-1.5).abs()} {1.5.abs()} {2.0.sqrt()} {16.0.sqrt()} {(-1.0).sqrt()} {2.5.floor()} {(-2.5).floor()} {2.5.ceil()} {(-2.5).ceil()}")
+  print("{2.5.round()} {(-2.5).round()} {2.4.round()} {2.6.round()} {0.5.round()} {(-0.5).round()} {0.49999999999999994.round()} {(power(10.0, 20)).round()}")
+  print("{1.0.min(2.0)} {1.0.max(2.0)} {nan.min(1.0)} {1.0.min(nan)} {nan.max(1.0)} {1.0.max(nan)} {inf.min(1.0)} {(-inf).max(1.0)}")
+  print("{1.5.to_string()} {[1.0, 2.5, nan]} {Some(0.1)} {[1.0, 2.0] == [1.0, 2.0]} {[nan] == [nan]} {Shape.Circle(1.0) == Shape.Circle(1.0)} {Shape.Rect(1.0, 2.0)}")
+  let total = [0.1, 0.2, 0.3].fold(0.0, |acc, v| acc + v)
+  print("{total} {[1.5, 2.5].map(|v| v * 2.0)} {[1.5, -2.5, 3.0].filter(|v| v > 0.0).len()}")
+
+  // いろいろな値の表示（疑似乱数で作った整数の比、積、平方根）
+  let mut seed = 12345
+  for i in 0..400 {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    let top = seed
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    let bottom = seed % 99991 + 1
+    let ratio = top.to_float() / bottom.to_float()
+    let tiny = ratio / power(10.0, seed % 300)
+    let huge = ratio * power(10.0, seed % 290)
+    print("{ratio} {tiny} {huge} {ratio.sqrt()} {(ratio * ratio).floor()} {tiny * huge}")
+  }
+}

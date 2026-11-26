@@ -37,7 +37,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_BE, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -47,6 +47,9 @@ const RSP: u8 = 4;
 const CC_NS: u8 = 0x9;
 const CC_Z: u8 = CC_E;
 const CC_NZ: u8 = CC_NE;
+/// "Parity": set by a comparison of floats when one of them is not a number.
+const CC_P: u8 = 0xA;
+const CC_NP: u8 = 0xB;
 
 /// Registers for expression values. Calls do not preserve them.
 const TEMPS: [u8; 4] = [R8, R9, R10, R11];
@@ -141,6 +144,8 @@ fn unsupported<T>(what: impl Into<String>, span: Span) -> R<T> {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Ty {
     Int,
+    /// The 8 bytes of a 64-bit float, kept in the same registers as an Int.
+    Float,
     Bool,
     Unit,
     /// A list: a pointer to a counted block on the heap. The number says which list type.
@@ -785,7 +790,7 @@ impl Native<'_> {
     /// Anything with statements inside counts, to stay on the safe side.
     fn has_call(&self, e: &Expr) -> bool {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Unit | ExprKind::Ident(_) => false,
             ExprKind::Unary(_, x) => self.has_call(x),
             ExprKind::Binary(_, l, r) => self.has_call(l) || self.has_call(r),
             // Reading from a struct or a list held by a variable is done in place.
@@ -1247,6 +1252,7 @@ impl Native<'_> {
         if args.is_empty() {
             match name {
                 "Int" => return Ok(Ty::Int),
+                "Float" => return Ok(Ty::Float),
                 "Bool" => return Ok(Ty::Bool),
                 "Unit" => return Ok(Ty::Unit),
                 "String" => return Ok(Ty::Str),
@@ -1326,6 +1332,7 @@ impl Native<'_> {
     fn ty_key(&self, ty: Ty) -> String {
         match ty {
             Ty::Int => "Int".to_string(),
+            Ty::Float => "Float".to_string(),
             Ty::Bool => "Bool".to_string(),
             Ty::Unit => "Unit".to_string(),
             Ty::Str => "String".to_string(),
@@ -2377,6 +2384,7 @@ impl Native<'_> {
     fn quick_ty(&self, e: &Expr) -> Option<Ty> {
         match &e.kind {
             ExprKind::Int(_) => Some(Ty::Int),
+            ExprKind::Float(_) => Some(Ty::Float),
             ExprKind::Bool(_) => Some(Ty::Bool),
             ExprKind::Ident(name) => self.scopes.iter().rev().find_map(|s| s.get(name.as_str())).map(|l| l.ty),
             ExprKind::Binary(op, ..) => match op {
@@ -2393,6 +2401,7 @@ impl Native<'_> {
         match &e.kind {
             ExprKind::Ident(name) => Ok(self.lookup(name, e.span)?.ty),
             ExprKind::Int(_) => Ok(Ty::Int),
+            ExprKind::Float(_) => Ok(Ty::Float),
             ExprKind::Bool(_) => Ok(Ty::Bool),
             _ => self.expr_ty(e),
         }
@@ -3121,6 +3130,10 @@ impl Native<'_> {
                 self.a.mov_imm64(dst, *b as i64);
                 Ok(Ty::Bool)
             }
+            ExprKind::Float(f) => {
+                self.a.mov_imm64(dst, f.to_bits() as i64);
+                Ok(Ty::Float)
+            }
             ExprKind::Unit => Ok(Ty::Unit),
             ExprKind::Ident(name) => {
                 let local = self.lookup(name, e.span)?;
@@ -3459,8 +3472,15 @@ impl Native<'_> {
             }
             ExprKind::MethodCall { recv, name, name_span, args } => self.method(e, recv, name, *name_span, args, dst),
             ExprKind::Unary(UnOp::Neg, x) => {
-                if self.eval(x, dst)? != Ty::Int {
-                    return unsupported("negating anything but an Int", e.span);
+                match self.eval(x, dst)? {
+                    Ty::Int => {}
+                    Ty::Float => {
+                        // Flips the sign bit.
+                        self.a.mov_imm64(RAX, i64::MIN);
+                        self.a.alu_rr(0x31, dst, RAX);
+                        return Ok(Ty::Float);
+                    }
+                    _ => return unsupported("negating anything but a number", e.span),
                 }
                 let stub = self.fail_stub(Diagnostic::new("E0503", "integer overflow in negation", e.span));
                 self.a.mov_rr(RAX, dst);
@@ -3528,13 +3548,48 @@ impl Native<'_> {
                 self.a.jmp(if matches!(e.kind, ExprKind::Break) { exit } else { next });
                 Ok(Ty::Never)
             }
-            _ => unsupported("this kind of expression", e.span),
         }
     }
 
     fn arithmetic(&mut self, op: BinOp, l: &Expr, r: &Expr, dst: u8, span: Span) -> R<Ty> {
-        if self.eval(l, dst)? != Ty::Int {
-            return unsupported("arithmetic on anything but Ints", span);
+        match self.eval(l, dst)? {
+            Ty::Int => {}
+            Ty::Float => {
+                // Floats: no checks; the processor's rules give infinity and "not a number".
+                let (a, b, _, temp, spilled) = self.operands(dst, r)?;
+                self.load_opnd(RAX, a);
+                self.load_opnd(RCX, b);
+                if op == BinOp::Rem {
+                    // The exact remainder, as the old floating-point unit computes it.
+                    self.a.store(M(RSP, 0), RCX);
+                    self.a.buf.extend_from_slice(&[0xDD, 0x04, 0x24]); // fld qword [rsp]
+                    self.a.store(M(RSP, 0), RAX);
+                    self.a.buf.extend_from_slice(&[0xDD, 0x04, 0x24]); // fld qword [rsp]
+                    let again = self.a.label();
+                    self.a.bind(again);
+                    self.a.buf.extend_from_slice(&[0xD9, 0xF8]); // fprem
+                    self.a.buf.extend_from_slice(&[0xDF, 0xE0]); // fnstsw ax
+                    self.a.buf.extend_from_slice(&[0xF6, 0xC4, 0x04]); // test ah, 4 (not finished)
+                    self.a.jcc(CC_NZ, again);
+                    self.a.buf.extend_from_slice(&[0xDD, 0x1C, 0x24]); // fstp qword [rsp]
+                    self.a.buf.extend_from_slice(&[0xDD, 0xD8]); // fstp st(0)
+                    self.a.load(RAX, M(RSP, 0));
+                } else {
+                    self.floats_in();
+                    let code = match op {
+                        BinOp::Add => 0x58,
+                        BinOp::Sub => 0x5C,
+                        BinOp::Mul => 0x59,
+                        _ => 0x5E,
+                    };
+                    self.a.buf.extend_from_slice(&[0xF2, 0x0F, code, 0xC1]); // addsd / subsd / mulsd / divsd xmm0, xmm1
+                    self.float_out();
+                }
+                self.a.mov_rr(dst, RAX);
+                self.release(temp, spilled);
+                return Ok(Ty::Float);
+            }
+            _ => return unsupported("arithmetic on anything but numbers", span),
         }
         let (a, b, ty, temp, spilled) = self.operands(dst, r)?;
         if ty != Ty::Int {
@@ -3677,16 +3732,22 @@ impl Native<'_> {
                         (a, b, temp, spilled, Some(t), lt, rt)
                     }
                 };
-                if lt != rt || !(matches!(lt, Ty::Int | Ty::Bool) || self.plain_enum(lt)) {
-                    return unsupported("comparing anything but Ints, Bools and Strings", e.span);
+                if lt != rt || !(matches!(lt, Ty::Int | Ty::Bool | Ty::Float) || self.plain_enum(lt)) {
+                    return unsupported("comparing values of this type", e.span);
                 }
                 self.load_opnd(RAX, left);
-                match b {
-                    Opnd::Imm(n) => self.a.alu_imm(7, RAX, n),
-                    Opnd::Reg(r) => self.a.alu_rr(0x39, RAX, r),
-                    Opnd::Mem(m) => self.a.alu_m(0x3B, RAX, m),
+                if lt == Ty::Float {
+                    self.load_opnd(RCX, b);
+                    self.floats_in();
+                    self.float_compare(*op, no);
+                } else {
+                    match b {
+                        Opnd::Imm(n) => self.a.alu_imm(7, RAX, n),
+                        Opnd::Reg(r) => self.a.alu_rr(0x39, RAX, r),
+                        Opnd::Mem(m) => self.a.alu_m(0x3B, RAX, m),
+                    }
+                    self.a.jcc(condition(*op) ^ 1, no);
                 }
-                self.a.jcc(condition(*op) ^ 1, no);
                 self.release(temp, spilled);
                 if let Some(t) = owned {
                     self.free.push(t);
@@ -3815,6 +3876,20 @@ impl Native<'_> {
                 self.release(temp, spilled);
                 Ok(Ty::Unit)
             }
+            ("__shr" | "__shl" | "__and", [value, by]) => {
+                self.eval(value, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, by)?;
+                self.load_opnd(RAX, a);
+                self.load_opnd(RCX, b);
+                match name {
+                    "__shr" => self.a.buf.extend_from_slice(&[0x48, 0xD3, 0xE8]), // shr rax, cl
+                    "__shl" => self.a.buf.extend_from_slice(&[0x48, 0xD3, 0xE0]), // shl rax, cl
+                    _ => self.a.buf.extend_from_slice(&[0x48, 0x21, 0xC8]),        // and rax, rcx
+                }
+                self.a.mov_rr(dst, RAX);
+                self.release(temp, spilled);
+                Ok(Ty::Int)
+            }
             ("__load8", [address]) => {
                 self.eval(address, dst)?;
                 self.a.mov_rr(RAX, dst);
@@ -3874,6 +3949,7 @@ impl Native<'_> {
                 StrPart::Lit(text) => text.len(),
                 StrPart::Expr(value) => match self.quick_ty(value) {
                     Some(Ty::Int) => 20,
+                    Some(Ty::Float) => 24,
                     Some(Ty::Bool) => 5,
                     _ => 24,
                 },
@@ -3902,6 +3978,11 @@ impl Native<'_> {
                             self.a.load(RCX, building);
                             self.a.load(RDX, slot);
                             self.call_rt("str_append_int");
+                        }
+                        Ty::Float => {
+                            self.a.load(RCX, building);
+                            self.a.load(RDX, slot);
+                            self.call_rt("str_append_float");
                         }
                         Ty::Bool => {
                             self.bool_text(slot);
@@ -4071,7 +4152,7 @@ impl Native<'_> {
     /// A method call. Which methods there are depends on the receiver.
     fn method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (self.recv_ty(recv)?, name, args) {
-            (ty @ (Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_)), "to_string", []) => {
+            (ty @ (Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_) | Ty::Float), "to_string", []) => {
                 self.eval(recv, dst)?;
                 let slot = self.push_spill();
                 self.a.store(slot, dst);
@@ -4086,6 +4167,15 @@ impl Native<'_> {
                 self.a.load(dst, slot);
                 self.spill_depth -= 1;
                 Ok(Ty::Str)
+            }
+            (Ty::Float, ..) => self.float_method(e, recv, name, name_span, args, dst),
+            (Ty::Int, "to_float", []) => {
+                self.eval(recv, dst)?;
+                self.a.mov_rr(RAX, dst);
+                self.a.buf.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]); // cvtsi2sd xmm0, rax
+                self.float_out();
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Float)
             }
             (Ty::Int, "abs" | "min" | "max" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "shr", _) => {
                 self.int_method(e, recv, name, name_span, args, dst)
@@ -4427,6 +4517,152 @@ impl Native<'_> {
         }
     }
 
+    /// `xmm0 = rax, xmm1 = rcx` as floats.
+    fn floats_in(&mut self) {
+        self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0, rax
+        self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC9]); // movq xmm1, rcx
+    }
+
+    /// `rax = xmm0`.
+    fn float_out(&mut self) {
+        self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]); // movq rax, xmm0
+    }
+
+    /// Jumps to `no` unless `xmm0 op xmm1`. A comparison with "not a number"
+    /// is false, except `!=`, which is true.
+    fn float_compare(&mut self, op: BinOp, no: usize) {
+        const A_B: [u8; 4] = [0x66, 0x0F, 0x2E, 0xC1]; // ucomisd xmm0, xmm1
+        const B_A: [u8; 4] = [0x66, 0x0F, 0x2E, 0xC8]; // ucomisd xmm1, xmm0
+        match op {
+            BinOp::Lt => {
+                self.a.buf.extend_from_slice(&B_A);
+                self.a.jcc(CC_BE, no);
+            }
+            BinOp::Le => {
+                self.a.buf.extend_from_slice(&B_A);
+                self.a.jcc(CC_B, no);
+            }
+            BinOp::Gt => {
+                self.a.buf.extend_from_slice(&A_B);
+                self.a.jcc(CC_BE, no);
+            }
+            BinOp::Ge => {
+                self.a.buf.extend_from_slice(&A_B);
+                self.a.jcc(CC_B, no);
+            }
+            BinOp::Ne => {
+                let yes = self.a.label();
+                self.a.buf.extend_from_slice(&A_B);
+                self.a.jcc(CC_P, yes);
+                self.a.jcc(CC_E, no);
+                self.a.bind(yes);
+            }
+            _ => {
+                self.a.buf.extend_from_slice(&A_B);
+                self.a.jcc(CC_NE, no);
+                self.a.jcc(CC_P, no);
+            }
+        }
+    }
+
+    /// A method of a Float.
+    fn float_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        const SIGN: i64 = i64::MIN;
+        match (name, args) {
+            ("to_int", []) => {
+                self.eval(recv, dst)?;
+                // Kept where the error message can read it.
+                let slot = self.push_spill();
+                self.a.store(slot, dst);
+                let d = Diagnostic::new("E0503", "`\u{1}` cannot be converted to Int", e.span);
+                let text = self.error_text(&d);
+                let (before, after) = text.split_once('\u{1}').unwrap_or((&text, ""));
+                let before = (self.constant(before.as_bytes()), before.len());
+                let after = (self.constant(after.as_bytes()), after.len());
+                let stub = self.a.label();
+                self.stubs.push(Stub::Missing { label: stub, key: slot, ty: Ty::Float, before, after });
+                self.a.mov_rr(RAX, dst);
+                // Not a number, infinite, or too large either way.
+                self.a.mov_imm64(RCX, 9.3e18f64.to_bits() as i64);
+                self.floats_in();
+                self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1]); // ucomisd xmm0, xmm1
+                self.a.jcc(CC_P, stub);
+                self.a.jcc(CC_AE, stub);
+                self.a.mov_imm64(RCX, (-9.3e18f64).to_bits() as i64);
+                self.floats_in();
+                self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC1]); // ucomisd xmm0, xmm1
+                self.a.jcc(CC_BE, stub);
+                self.a.buf.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2C, 0xC0]); // cvttsd2si rax, xmm0
+                self.a.mov_rr(dst, RAX);
+                self.spill_depth -= 1;
+                Ok(Ty::Int)
+            }
+            ("abs", []) => {
+                self.eval(recv, dst)?;
+                self.a.mov_imm64(RAX, !SIGN);
+                self.a.alu_rr(0x21, dst, RAX);
+                Ok(Ty::Float)
+            }
+            ("sqrt" | "floor" | "ceil" | "round", []) => {
+                self.eval(recv, dst)?;
+                self.a.mov_rr(RAX, dst);
+                self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0, rax
+                match name {
+                    "sqrt" => self.a.buf.extend_from_slice(&[0xF2, 0x0F, 0x51, 0xC0]), // sqrtsd xmm0, xmm0
+                    "floor" => self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x09]), // roundsd down
+                    "ceil" => self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, 0x0A]), // roundsd up
+                    _ => {
+                        // Halves go away from zero: cut the fraction off, then
+                        // step one further if at least a half was cut.
+                        let done = self.a.label();
+                        self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x0B, 0xC8, 0x0B]); // roundsd xmm1, xmm0, toward zero
+                        self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x28, 0xD0]); // movapd xmm2, xmm0
+                        self.a.buf.extend_from_slice(&[0xF2, 0x0F, 0x5C, 0xD1]); // subsd xmm2, xmm1
+                        self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xD1]); // movq rcx, xmm2
+                        self.a.mov_imm64(RDX, !SIGN);
+                        self.a.alu_rr(0x21, RCX, RDX);
+                        self.a.mov_imm64(RDX, 0.5f64.to_bits() as i64);
+                        self.a.alu_rr(0x39, RCX, RDX);
+                        self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x28, 0xC1]); // movapd xmm0, xmm1
+                        self.a.jcc(CC_B, done);
+                        self.a.mov_rr(RCX, RAX);
+                        self.a.mov_imm64(RDX, SIGN);
+                        self.a.alu_rr(0x21, RCX, RDX);
+                        self.a.mov_imm64(RDX, 1.0f64.to_bits() as i64);
+                        self.a.alu_rr(0x09, RCX, RDX);
+                        self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xD1]); // movq xmm2, rcx
+                        self.a.buf.extend_from_slice(&[0xF2, 0x0F, 0x58, 0xC2]); // addsd xmm0, xmm2
+                        self.a.bind(done);
+                    }
+                }
+                self.float_out();
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Float)
+            }
+            ("min" | "max", [other]) => {
+                self.eval(recv, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, other)?;
+                self.load_opnd(RAX, a);
+                self.load_opnd(RCX, b);
+                self.floats_in();
+                let keep = self.a.label();
+                self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x28, 0xD0]); // movapd xmm2, xmm0
+                // minsd / maxsd xmm0, xmm1: gives the second if either is not a number.
+                self.a.buf.extend_from_slice(&[0xF2, 0x0F, if name == "min" { 0x5D } else { 0x5F }, 0xC1]);
+                // If the second is not a number, the answer is the first.
+                self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x2E, 0xC9]); // ucomisd xmm1, xmm1
+                self.a.jcc(CC_NP, keep);
+                self.a.buf.extend_from_slice(&[0x66, 0x0F, 0x28, 0xC2]); // movapd xmm0, xmm2
+                self.a.bind(keep);
+                self.float_out();
+                self.a.mov_rr(dst, RAX);
+                self.release(temp, spilled);
+                Ok(Ty::Float)
+            }
+            _ => unsupported(format!("the method `{name}` of a Float"), name_span),
+        }
+    }
+
     /// A method of an Int.
     fn int_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (name, args) {
@@ -4530,6 +4766,12 @@ impl Native<'_> {
                 self.call_rt("str_eq");
                 self.a.alu_imm(7, RAX, 1);
                 self.a.jcc(CC_NE, differ);
+            }
+            Ty::Float => {
+                self.a.mov_rr(RAX, RCX);
+                self.a.mov_rr(RCX, RDX);
+                self.floats_in();
+                self.float_compare(BinOp::Eq, differ);
             }
             _ if self.deep(ty) => {
                 let eq = self.eq_label(ty);
@@ -4646,6 +4888,7 @@ impl Native<'_> {
     fn repr_call(&mut self, ty: Ty) {
         match ty {
             Ty::Int => self.call_rt("str_append_int"),
+            Ty::Float => self.call_rt("str_append_float"),
             Ty::Str => self.call_rt("str_append_quoted"),
             Ty::Bool => {
                 let (yes, no) = (self.constant(b"true"), self.constant(b"false"));
@@ -5404,7 +5647,7 @@ impl Native<'_> {
                 }
                 self.spill_depth -= 1;
             }
-            Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_) => {
+            Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_) | Ty::Float => {
                 // Written out as text first.
                 let slot = self.push_spill();
                 self.a.store(slot, t);

@@ -1,0 +1,5 @@
+// `yui build --native` がまだ対応していない機能を使う。断られることを確かめるためのファイル
+fn main() uses io {
+  let line = read_line()
+  print("you typed {line}")
+}

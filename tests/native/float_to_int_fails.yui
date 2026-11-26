@@ -1,0 +1,5 @@
+fn main() uses io {
+  let big = 10000000000.0
+  print("{(big * 1000.0).to_int()}")
+  print("{(big * big).to_int()}")
+}

@@ -9,6 +9,9 @@
 //   __load8(address) -> Int       その番地の 1 バイトを読む（0〜255）
 //   __store8(address, value)      その番地に 1 バイトを書く
 //   __copy(to, from, bytes)       メモリを写す
+//   __shr(value, bits) -> Int     右に bits ビットずらす（上は 0 で埋める）
+//   __shl(value, bits) -> Int     左に bits ビットずらす
+//   __and(a, b) -> Int            ビットごとの AND
 //
 // 足し算・引き算・掛け算は溢れを調べない。単項のマイナスと、定数以外での割り算は使わない
 // （エラー表示がこのファイルの位置を指せないため）。
@@ -559,4 +562,251 @@ fn str_shift_case(s: Int, first: Int) -> Int {
   }
   __store(out + 8, count)
   out
+}
+
+fn str_push(s: Int, byte: Int) -> Int {
+  let out = str_reserve(s, 1)
+  let length = __load(out + 8)
+  __store8(out + 24 + length, byte)
+  __store(out + 8, length + 1)
+  out
+}
+
+// ここから小数を文字列にする部品。
+// 大きな整数: 32 ビットずつを 8 バイトのマスに入れ、下の桁から 80 マス並べる（2560 ビット。
+// いちばん小さい小数といちばん大きい小数の計算が、どちらも収まる）
+
+fn big_set(a: Int, value: Int) {
+  let mut i = 2
+  while i < 80 {
+    __store(a + i * 8, 0)
+    i = i + 1
+  }
+  __store(a, __and(value, 4294967295))
+  __store(a + 8, __shr(value, 32))
+}
+
+fn big_copy(to: Int, from: Int) {
+  __copy(to, from, 640)
+}
+
+// a = a * factor（factor は 2 の 31 乗未満）
+fn big_mul(a: Int, factor: Int) {
+  let mut carry = 0
+  let mut i = 0
+  while i < 80 {
+    let v = __load(a + i * 8) * factor + carry
+    __store(a + i * 8, __and(v, 4294967295))
+    carry = __shr(v, 32)
+    i = i + 1
+  }
+}
+
+// a = a * 2 の bits 乗
+fn big_shift(a: Int, bits: Int) {
+  let mut rest = bits
+  while rest >= 30 {
+    big_mul(a, 1073741824)
+    rest = rest - 30
+  }
+  if rest > 0 { big_mul(a, __shl(1, rest)) }
+}
+
+fn big_add(a: Int, b: Int) {
+  let mut carry = 0
+  let mut i = 0
+  while i < 80 {
+    let v = __load(a + i * 8) + __load(b + i * 8) + carry
+    __store(a + i * 8, __and(v, 4294967295))
+    carry = __shr(v, 32)
+    i = i + 1
+  }
+}
+
+// a = a - b（a が b 以上のときだけ）
+fn big_sub(a: Int, b: Int) {
+  let mut borrow = 0
+  let mut i = 0
+  while i < 80 {
+    let mut v = __load(a + i * 8) - __load(b + i * 8) - borrow
+    borrow = 0
+    if v < 0 {
+      v = v + 4294967296
+      borrow = 1
+    }
+    __store(a + i * 8, v)
+    i = i + 1
+  }
+}
+
+// a が b より小さければ負、同じなら 0、大きければ正
+fn big_cmp(a: Int, b: Int) -> Int {
+  let mut i = 80
+  while i > 0 {
+    i = i - 1
+    let x = __load(a + i * 8)
+    let y = __load(b + i * 8)
+    if x != y { return x - y }
+  }
+  0
+}
+
+// 小数（64 ビットの中身が bits）を、その値に戻せるいちばん短い桁数の 10 進表記で足す。
+// 指数表記は使わない。整数値で 10 の 16 乗未満なら ".0" を付ける。
+//
+// 求め方: 値を r / s という分数で持ち、隣の小数との中間までの幅を plus / s、minus / s で持つ。
+// 桁を 1 つずつ取り出し、残りが幅の中に入ったら、それ以上の桁は要らない（Steele と White、
+// Burger と Dybvig の方法）
+fn str_append_float(s: Int, bits: Int) -> Int {
+  let negative = __shr(bits, 63)
+  let exponent = __and(__shr(bits, 52), 2047)
+  let fraction = __and(bits, 4503599627370495)
+  let mut out = s
+  if exponent == 2047 {
+    if fraction != 0 { return str_push(str_push(str_push(out, 78), 97), 78) }
+    if negative == 1 {
+      out = str_push(out, 45)
+    }
+    return str_push(str_push(str_push(out, 105), 110), 102)
+  }
+  if negative == 1 {
+    out = str_push(out, 45)
+  }
+  if exponent == 0 && fraction == 0 { return str_push(str_push(str_push(out, 48), 46), 48) }
+
+  // 値 = mantissa * 2 の power 乗
+  let mut mantissa = fraction
+  let mut power = 0 - 1074
+  if exponent != 0 {
+    mantissa = fraction + 4503599627370496
+    power = exponent - 1075
+  }
+  // 仮数が偶数なら、幅のちょうど端も「この値に戻る」範囲に入る
+  let even = 1 - __and(mantissa, 1)
+  // 仮数が 2 の累乗ちょうどのとき、下側の隣は半分の近さにある
+  let mut narrow = 0
+  if fraction == 0 && exponent > 1 {
+    narrow = 1
+  }
+  let work = __alloc(3600)
+  let r = work
+  let scale = work + 640
+  let plus = work + 1280
+  let minus = work + 1920
+  let sum = work + 2560
+  let digits = work + 3200
+  big_set(r, mantissa)
+  big_set(scale, 1)
+  big_set(plus, 1)
+  big_set(minus, 1)
+  if power >= 0 {
+    big_shift(r, power + 1 + narrow)
+    big_shift(scale, 1 + narrow)
+    big_shift(plus, power + narrow)
+    big_shift(minus, power)
+  } else {
+    big_shift(r, 1 + narrow)
+    big_shift(scale, 1 + narrow - power)
+    big_shift(plus, narrow)
+  }
+
+  // point: 小数点の位置。値 = 0.d1 d2 d3... * 10 の point 乗 になるように合わせる
+  let mut point = 0
+  let mut fitting = 1
+  while fitting == 1 {
+    big_copy(sum, r)
+    big_add(sum, plus)
+    if float_reaches(sum, scale, even) == 1 {
+      big_mul(scale, 10)
+      point = point + 1
+    } else {
+      fitting = 0
+    }
+  }
+  fitting = 1
+  while fitting == 1 {
+    big_copy(sum, r)
+    big_add(sum, plus)
+    big_mul(sum, 10)
+    if float_reaches(sum, scale, even) == 1 {
+      fitting = 0
+    } else {
+      big_mul(r, 10)
+      big_mul(plus, 10)
+      big_mul(minus, 10)
+      point = point - 1
+    }
+  }
+
+  // 桁を取り出す
+  let mut count = 0
+  let mut going = 1
+  while going == 1 {
+    big_mul(r, 10)
+    big_mul(plus, 10)
+    big_mul(minus, 10)
+    let mut digit = 0
+    while big_cmp(r, scale) >= 0 {
+      big_sub(r, scale)
+      digit = digit + 1
+    }
+    // low: ここで止めても下側の幅に収まる。high: 1 つ上げても上側の幅に収まる
+    let below = big_cmp(r, minus)
+    let mut low = 0
+    if below < 0 || below == 0 && even == 1 {
+      low = 1
+    }
+    big_copy(sum, r)
+    big_add(sum, plus)
+    let high = float_reaches(sum, scale, even)
+    if low == 1 || high == 1 {
+      going = 0
+      if low == 0 {
+        digit = digit + 1
+      } else if high == 1 {
+        // どちらでもよいときは、近いほう。ちょうど真ん中なら偶数の桁にする
+        big_copy(sum, r)
+        big_mul(sum, 2)
+        let half = big_cmp(sum, scale)
+        if half > 0 || half == 0 && __and(digit, 1) == 1 {
+          digit = digit + 1
+        }
+      }
+    }
+    __store8(digits + count, 48 + digit)
+    count = count + 1
+  }
+
+  // 並べる
+  let mut i = 0
+  if point <= 0 {
+    out = str_push(str_push(out, 48), 46)
+    while i < 0 - point {
+      out = str_push(out, 48)
+      i = i + 1
+    }
+    out = str_append(out, digits, count)
+  } else if point >= count {
+    out = str_append(out, digits, count)
+    i = count
+    while i < point {
+      out = str_push(out, 48)
+      i = i + 1
+    }
+    if point <= 16 {
+      out = str_push(str_push(out, 46), 48)
+    }
+  } else {
+    out = str_append(out, digits, point)
+    out = str_push(out, 46)
+    out = str_append(out, digits + point, count - point)
+  }
+  __free(work)
+  out
+}
+
+// sum が scale に届いているか（even なら、ちょうど同じでも届いたことにする）
+fn float_reaches(sum: Int, scale: Int, even: Int) -> Int {
+  let order = big_cmp(sum, scale)
+  if order > 0 || order == 0 && even == 1 { 1 } else { 0 }
 }
