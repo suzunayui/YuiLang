@@ -220,26 +220,48 @@ fn build_jobs(world: List<Int>, boxes: List<Int>, ox: Int, oz: Int) -> List<Int>
     }
     b = b + 7
   }
-  // 建物が乗る列のうち、いちばん高い地面に合わせる
-  let mut base = 0
+  // 建物が使う範囲（横・奥行き）と高さ
+  let mut x_lo = 16
+  let mut x_hi = -1
+  let mut z_lo = 16
+  let mut z_hi = -1
   let mut height = 0
   for z in 0..16 {
     for x in 0..16 {
       for y in 0..16 {
         if grid[(y * 16 + z) * 16 + x] > 0 {
-          base = base.max(ground_at(world, ox + x, oz + z))
+          x_lo = x_lo.min(x)
+          x_hi = x_hi.max(x)
+          z_lo = z_lo.min(z)
+          z_hi = z_hi.max(z)
           height = height.max(y + 1)
         }
       }
     }
   }
   let mut jobs: List<Int> = []
-  // 低いところは土で埋めて土台にする
-  for z in 0..16 {
-    for x in 0..16 {
-      if grid[z * 16 + x] > 0 {
-        for y in ground_at(world, ox + x, oz + z)..base {
-          jobs = jobs.push(1).push(ox + x).push(y).push(oz + z).push(1)
+  if height == 0 { return jobs }
+  // その範囲の地面の高さの、真ん中の値に床を合わせる
+  let mut grounds: List<Int> = []
+  for z in z_lo..z_hi + 1 {
+    for x in x_lo..x_hi + 1 {
+      grounds = grounds.push(ground_at(world, ox + x, oz + z))
+    }
+  }
+  let base = grounds.sort()[grounds.len() / 2]
+  // 建物とそのまわり 1 マスの地面を、床の高さにならす（高い所は削り、低い所は土で埋める）。
+  // こうすると、入口の前が段差にならない
+  for z in z_lo - 1..z_hi + 2 {
+    for x in x_lo - 1..x_hi + 2 {
+      let wx = ox + x
+      let wz = oz + z
+      if wx >= 1 && wx < 127 && wz >= 1 && wz < 127 {
+        let ground = ground_at(world, wx, wz)
+        for y in ground..base {
+          jobs = jobs.push(1).push(wx).push(y).push(wz).push(1)
+        }
+        for y in base..ground {
+          jobs = jobs.push(0).push(wx).push(y).push(wz).push(0)
         }
       }
     }
@@ -251,7 +273,9 @@ fn build_jobs(world: List<Int>, boxes: List<Int>, ox: Int, oz: Int) -> List<Int>
         let wy = base + y
         if wy < 32 {
           let wanted = grid[(y * 16 + z) * 16 + x]
-          let now = world[(wy * 128 + oz + z) * 128 + ox + x]
+          // ならす作業で削られることになっている所は、空いているものとして考える
+          let leveled = wy < ground_at(world, ox + x, oz + z)
+          let now = if leveled { 0 } else { world[(wy * 128 + oz + z) * 128 + ox + x] }
           if wanted > 0 && now != wanted {
             jobs = jobs.push(1).push(ox + x).push(wy).push(oz + z).push(wanted)
           } else if now != 0 && (wanted == 0 || wanted < 0 && (now == 3 || now == 4)) {
