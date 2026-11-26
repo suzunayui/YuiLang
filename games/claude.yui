@@ -1,6 +1,7 @@
 // Claude（Anthropic の API）に話しかける。
 //
-//   let id = claude.ask(key, system, user, schema)   依頼を始める（裏で進むので、待つ間もゲームは止まらない）
+//   let id = claude.ask(key, claude.model(), system, user, schema)
+//                                                    依頼を始める（裏で進むので、待つ間もゲームは止まらない）
 //   if http_done(id) {                               終わったか毎コマ調べる
 //     match claude.answer(http_result(id)) {         返事の本文（schema どおりの JSON の文字列）を取り出す
 //       Ok(text) => ...
@@ -13,9 +14,23 @@
 
 import json
 
-// 使うモデル。速さと賢さのつり合いで選ぶ（"claude-sonnet-5-5" や "claude-haiku-5-5" にすると速く安くなる）
+// ふだん使うモデル
 fn model() -> String {
   "claude-opus-5-5"
+}
+
+// 短い呼び名からモデルの名前を決める。知らない呼び名なら空の文字列。
+// 料金（100 万トークンあたり、送る分 / 返ってくる分）: opus 4 / 20 ドル、sonnet 2 / 10 ドル、haiku 0.1 / 0.5 ドル
+fn model_named(short: String) -> String {
+  if short == "opus" { return "claude-opus-5-5" }
+  if short == "sonnet" { return "claude-sonnet-5-5" }
+  if short == "haiku" { return "claude-haiku-5-5" }
+  ""
+}
+
+// 安全上の理由で断られたときに、別のモデルで続けてもらえるモデルか（Haiku にはその仕組みがない）
+fn has_fallback(name: String) -> Bool {
+  !name.starts_with("claude-haiku")
 }
 
 // どのくらい深く考えさせるか: "low" / "medium" / "high"。深いほど返事が遅く、高くなる
@@ -24,12 +39,11 @@ fn effort() -> String {
 }
 
 // 送る本文（JSON）を組み立てる
-fn body(system: String, user: String, schema: String) -> String {
+fn body(name: String, system: String, user: String, schema: String) -> String {
   let parts = [
-    "\{\"model\":{json.quote(model())}",
-    "\"max_tokens\":16000",
-    // 安全上の理由で断られたときは、別のモデルで続ける
-    "\"fallbacks\":\"default\"",
+    "\{\"model\":{json.quote(name)}",
+    // 安全上の理由で断られたときは、別のモデルで続ける（その仕組みがあるモデルだけ）
+    if has_fallback(name) { "\"max_tokens\":16000,\"fallbacks\":\"default\"" } else { "\"max_tokens\":16000" },
     "\"output_config\":\{\"effort\":{json.quote(effort())},\"format\":\{\"type\":\"json_schema\",\"schema\":{schema}}}",
     "\"system\":{json.quote(system)}",
     "\"messages\":[\{\"role\":\"user\",\"content\":{json.quote(user)}}]}",
@@ -38,14 +52,12 @@ fn body(system: String, user: String, schema: String) -> String {
 }
 
 // 依頼を始めて、その番号を返す（http_done / http_result に渡す）
-fn ask(key: String, system: String, user: String, schema: String) -> Int uses net {
-  let headers = [
-    "Content-Type: application/json",
-    "x-api-key: {key}",
-    "anthropic-version: 2026-10-21",
-    "anthropic-beta: server-side-fallback-2026-07-01",
-  ]
-  http_start("POST", "https://api.anthropic.com/v1/messages", headers, body(system, user, schema))
+fn ask(key: String, name: String, system: String, user: String, schema: String) -> Int uses net {
+  let mut headers = ["Content-Type: application/json", "x-api-key: {key}", "anthropic-version: 2026-10-21"]
+  if has_fallback(name) {
+    headers = headers.push("anthropic-beta: server-side-fallback-2026-07-01")
+  }
+  http_start("POST", "https://api.anthropic.com/v1/messages", headers, body(name, system, user, schema))
 }
 
 // http_result の結果から、返事の本文を取り出す
@@ -131,13 +143,20 @@ fn reply_text(response: String) -> Result<String, String> {
 }
 
 test "送る本文は正しい JSON になる" {
-  let text = body("あなたは\"仲間\"です", "木を集めて\nきて", "\{\"type\":\"object\"}")
+  let text = body(model(), "あなたは\"仲間\"です", "木を集めて\nきて", "\{\"type\":\"object\"}")
   let v = json.parse(text).unwrap_or(json.Value.Null)
   assert json.text_of(json.get(v, "model")) == model()
   assert json.text_of(json.get(v, "system")) == "あなたは\"仲間\"です"
   assert json.text_of(json.get(json.at(json.get(v, "messages"), 0), "content")) == "木を集めて\nきて"
   assert json.text_of(json.get(json.get(json.get(json.get(v, "output_config"), "format"), "schema"), "type")) == "object"
   assert json.text_of(json.get(json.get(v, "output_config"), "effort")) == effort()
+  assert json.text_of(json.get(v, "fallbacks")) == "default"
+  // Haiku には、別のモデルで続ける指定を付けない
+  let small = json.parse(body(model_named("haiku"), "s", "u", "\{}")).unwrap_or(json.Value.Null)
+  assert json.text_of(json.get(small, "model")) == "claude-haiku-5-5"
+  assert json.text_of(json.get(small, "fallbacks")) == ""
+  assert json.int_of(json.get(small, "max_tokens")) == 16000
+  assert model_named("nobody") == ""
 }
 
 test "返事から文章を取り出す" {

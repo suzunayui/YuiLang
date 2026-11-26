@@ -3,6 +3,8 @@
 //
 //   Enter                  お願いを書き始める（もう一度 Enter で送る、Esc でやめる）
 //                          例: 「木を集めてきてー」「かわいいおうち建ててー」
+//                          「/sonnet」「/haiku」「/opus」と送ると、ユイの頭脳（モデル）を切り替える。
+//                          opus がいちばん賢くて高く、sonnet は半額、haiku は 40 分の 1
 //   W / A / S / D          歩く
 //   ← / →  ↑ / ↓           向きを変える
 //   スペース                跳ぶ
@@ -684,6 +686,7 @@ fn main() uses io, net {
   let mut escape_held = false
   let mut draft = ""
   let mut request = 0
+  let mut model = claude.model()
   // 料金（円）: 起動してからの合計、いま建てているものの分とその名前
   let mut total_cost = 0.0
   let mut built_cost = 0.0
@@ -732,7 +735,16 @@ fn main() uses io, net {
     // ---- お願いを送る ----
     if !send.is_empty() {
       log = log.push("あなた: {send}")
-      if request != 0 {
+      let wanted = if send.starts_with("/") { claude.model_named(send.slice(1, send.len())) } else { "" }
+      if send.starts_with("/") {
+        // モデルの切り替え
+        if wanted.is_empty() {
+          log = log.push("（/opus、/sonnet、/haiku のどれかを送ってね。いまは {model}）")
+        } else {
+          model = wanted
+          log = log.push("（ユイの頭脳を {model} に切り替えたよ）")
+        }
+      } else if request != 0 {
         log = log.push("ユイ: ちょっと待ってね、まだ考えてるところ…")
       } else if key.is_empty() {
         // 決まった返事を、API の返事と同じ道筋で処理する
@@ -748,7 +760,7 @@ fn main() uses io, net {
       } else {
         let wood = bag[3]
         let user = "プレイヤーのお願い: {send}\n（ユイがこれまでに集めた木: {wood} 個）"
-        request = claude.ask(key, system_prompt(), user, schema())
+        request = claude.ask(key, model, system_prompt(), user, schema())
         if request == 0 {
           log = log.push("（一度に送れる数を超えました）")
         }
