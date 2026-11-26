@@ -6336,7 +6336,7 @@ mod tests {
                 let quick = (n.wrapping_mul(m).wrapping_add(a) as u64) <= 2 * a as u64;
                 assert_eq!(quick, n % d == 0, "{n} % {d}");
             };
-            for n in [0, 1, -1, d, -d, d - 1, d + 1, i64::MAX, i64::MIN, i64::MIN + 1, i64::MAX / d * d, -(i64::MAX / d) * d] {
+            for n in [0, 1, -1, d, -d, d - 1, d.wrapping_add(1), i64::MAX, i64::MIN, i64::MIN + 1, i64::MAX / d * d, -(i64::MAX / d) * d] {
                 check(n);
             }
             for k in -2000..2000i64 {
