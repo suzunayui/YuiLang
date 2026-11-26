@@ -1,0 +1,47 @@
+// 標準入力、コマンドライン引数、ファイルの読み書き。
+// テストは引数と標準入力を与え、作業用のフォルダで `yui run` とネイティブの両方を動かして比べる
+
+fn show(r: Result<String, String>) -> String {
+  match r {
+    Ok(text) => "ok {text.len()}: {text}"
+    Err(e) => "error: {e}"
+  }
+}
+
+fn done(r: Result<Unit, String>) -> String {
+  match r {
+    Ok(_) => "written"
+    Err(e) => "error: {e}"
+  }
+}
+
+fn main() uses io, fs {
+  let xs = args()
+  print("{xs.len()} args: {xs}")
+  for x in xs {
+    print("  [{x}] {x.len()}")
+  }
+  let first = read_line()
+  let second = read_line()
+  let third = read_line()
+  let fourth = read_line()
+  print("[{first}] [{second}] [{third}] [{fourth}] {first.len()} {second.len()}")
+
+  let path = "out_file.txt"
+  print(done(write_file(path, "line one\n日本語 {first}\n")))
+  print(show(read_file(path)))
+  print(done(write_file(path, "")))
+  print(show(read_file(path)))
+  print(done(write_file(path, "replaced")))
+  print(show(read_file(path)))
+  print(show(read_file("no_such_file.txt")))
+  print(done(write_file("no_such_dir/x.txt", "x")))
+  print(show(read_file("not_text.bin")))
+  print(show(read_file("日本語のファイル.txt")))
+  let newline = "\n"
+  let big = read_file("big.txt")
+  match big {
+    Ok(text) => print("big {text.len()} {text.split(newline).len()}")
+    Err(e) => print("error: {e}")
+  }
+}

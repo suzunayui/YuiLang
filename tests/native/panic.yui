@@ -1,0 +1,11 @@
+fn check(n: Int) -> Int {
+  if n > 2 {
+    panic("value {n} is too large")
+  }
+  n
+}
+
+fn main() uses io {
+  print("{check(1)}")
+  print("{check(5)}")
+}

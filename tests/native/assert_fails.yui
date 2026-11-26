@@ -1,0 +1,7 @@
+fn main() uses io {
+  let xs = [1, 2, 3]
+  assert xs.len() == 3
+  assert xs.contains(2) && !xs.is_empty()
+  assert xs.contains(7) || xs.is_empty()
+  print("not reached")
+}

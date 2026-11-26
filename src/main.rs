@@ -164,8 +164,13 @@ fn run_embedded(units: Vec<SourceUnit>) -> i32 {
 fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
     let source = Path::new(&opts.file);
     let name = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "main.yui".to_string());
-    // Runtime errors name the file relative to the program, as in a bundled build.
-    let sources = SourceMap::single(&name, &loaded.units[0].text);
+    // Runtime errors name the files relative to the program, as in a bundled
+    // build. The files are laid out as they were loaded, so that positions agree.
+    let mut sources = SourceMap::default();
+    for unit in &loaded.units {
+        let file = if unit.module.is_empty() { name.clone() } else { format!("{}.yui", unit.module.replace('.', "/")) };
+        sources.add(&file, &unit.text);
+    }
     let bytes = match yuilang::jit::native::build(&loaded.program, &sources) {
         Ok(bytes) => bytes,
         Err(reason) => {

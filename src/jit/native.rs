@@ -37,7 +37,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_BE, CC_E, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_BE, CC_E, CC_G, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -64,7 +64,35 @@ const STDOUT: i64 = -11;
 const STDERR: i64 = -12;
 
 /// Functions imported from kernel32.dll, in the order of the import table.
-const IMPORTS: [&str; 6] = ["GetStdHandle", "WriteFile", "ExitProcess", "HeapAlloc", "HeapFree", "HeapReAlloc"];
+const IMPORTS: [&str; 13] = [
+    "GetStdHandle",
+    "WriteFile",
+    "ExitProcess",
+    "HeapAlloc",
+    "HeapFree",
+    "HeapReAlloc",
+    "ReadFile",
+    "GetCommandLineW",
+    "CreateFileW",
+    "GetFileSizeEx",
+    "CloseHandle",
+    "GetLastError",
+    "FormatMessageW",
+];
+/// The imports `runtime.yui` may call as `__os_<name>(...)`, with how many
+/// arguments each takes. They follow the same calling convention as the
+/// code this compiler makes, so a call is an ordinary call.
+const OS_CALLS: [(&str, usize); 9] = [
+    ("GetStdHandle", 1),
+    ("WriteFile", 5),
+    ("ReadFile", 5),
+    ("GetCommandLineW", 0),
+    ("CreateFileW", 7),
+    ("GetFileSizeEx", 2),
+    ("CloseHandle", 1),
+    ("GetLastError", 0),
+    ("FormatMessageW", 7),
+];
 const GET_STD_HANDLE: usize = 0;
 const WRITE_FILE: usize = 1;
 const EXIT_PROCESS: usize = 2;
@@ -237,6 +265,17 @@ struct FnInfo {
     contracts: bool,
 }
 
+/// A piece of an error message that is put together when the error happens.
+#[derive(Clone, Copy)]
+enum Part {
+    /// Fixed text: its label and length.
+    Text(usize, usize),
+    /// A value parked in a spill slot, written the way it appears inside other values.
+    Value(M, Ty),
+    /// A string parked in a spill slot, written as it is.
+    Raw(M),
+}
+
 /// Error-reporting code that belongs to a function but is kept out of its body.
 enum Stub {
     Fail { label: usize, message: usize, len: usize },
@@ -245,6 +284,8 @@ enum Stub {
     /// A key that is not in a map. The message is `before`, the key (parked
     /// in `key`) as text, and `after`: (label of the text, its length) each.
     Missing { label: usize, key: M, ty: Ty, before: (usize, usize), after: (usize, usize) },
+    /// An error whose message is the parts in order; the last one is text.
+    Report { label: usize, parts: Vec<Part> },
     /// An error whose message has one number in it, the value of a register.
     Number { label: usize, value: u8, record: usize },
     /// A violated `requires` or `ensures`. `header` is the first line of the
@@ -298,6 +339,8 @@ struct Native<'a> {
     map_queue: Vec<(u8, u32)>,
     rt_number: usize,
     rt_contract: usize,
+    /// For each of `OS_CALLS`: the label of a jump to the import.
+    os_labels: Vec<usize>,
     /// Whether those two are needed.
     uses_errors: bool,
     /// Closures to compile, and for each function used as a value, the code
@@ -367,9 +410,6 @@ struct Native<'a> {
 /// `sources` is used for the text of runtime errors.
 pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsupported> {
     let nowhere = Span::new(0, 0);
-    if let Some(import) = program.imports.first() {
-        return unsupported("`import`", import.span);
-    }
     let mut a = Asm::default();
     let mut fns = HashMap::new();
     let Ok(runtime) = crate::parser::parse_file(RUNTIME, 0, "", true) else {
@@ -391,6 +431,13 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     let (rt_alloc, rt_realloc, rt_free) = (a.label(), a.label(), a.label());
     let (rt_pool_alloc, rt_pool_free) = (a.label(), a.label());
     let (rt_number, rt_contract) = (a.label(), a.label());
+    let mut os_labels = Vec::new();
+    for (name, params) in OS_CALLS {
+        let label = a.label();
+        os_labels.push(label);
+        let info = FnInfo { label, params: vec![Ty::Int; params], ret: Ty::Int, contracts: false };
+        fns.insert(format!("%__os_{name}"), info);
+    }
     let mut n = Native {
         a,
         sources,
@@ -416,6 +463,7 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         map_queue: Vec::new(),
         rt_number,
         rt_contract,
+        os_labels,
         uses_errors: false,
         closures: Vec::new(),
         thunks: HashMap::new(),
@@ -1690,6 +1738,17 @@ impl Native<'_> {
         self.a.buf.extend_from_slice(&[0x49, 0x89, 0x0C, 0x10]); // mov [r8 + rdx], rcx
         self.a.b(0xC3);
 
+        // The operating system's functions that the runtime calls: a jump each.
+        for (i, (name, _)) in OS_CALLS.iter().enumerate() {
+            if self.rt_seen.contains(&format!("__os_{name}")) {
+                let import = IMPORTS.iter().position(|import| import == name).unwrap_or(0);
+                self.a.bind(self.os_labels[i]);
+                self.a.buf.extend_from_slice(&[0xFF, 0x25]); // jmp [rip + import]
+                self.iat_fixups.push((self.a.buf.len(), import));
+                self.a.d32(0);
+            }
+        }
+
         // Reached with the stack as inside the routines above.
         self.a.bind(oom);
         let text = b"error: out of memory\n";
@@ -1746,6 +1805,26 @@ impl Native<'_> {
         let mut blob = (place.len() as u32).to_le_bytes().to_vec();
         blob.extend(place.as_bytes());
         self.constant(&blob)
+    }
+
+    /// Reserves code that reports `d`, whose message has the marks `\u{1}`,
+    /// `\u{2}`, `\u{3}` where the `values` go, in that order.
+    fn report(&mut self, d: Diagnostic, values: Vec<Part>) -> usize {
+        let text = self.error_text(&d);
+        let mut rest = text.as_str();
+        let mut parts = Vec::new();
+        let mut values = values.into_iter();
+        for mark in ['\u{1}', '\u{2}', '\u{3}'] {
+            if let Some((before, after)) = rest.split_once(mark) {
+                parts.push(Part::Text(self.constant(before.as_bytes()), before.len()));
+                parts.extend(values.next());
+                rest = after;
+            }
+        }
+        parts.push(Part::Text(self.constant(rest.as_bytes()), rest.len()));
+        let label = self.a.label();
+        self.stubs.push(Stub::Report { label, parts });
+        label
     }
 
     /// Reserves code that reports an error whose message contains the value
@@ -1873,6 +1952,43 @@ impl Native<'_> {
                     self.lea_label(RCX, after.0);
                     self.a.mov_imm64(RDX, after.1 as i64);
                     self.call_label(self.rt_fail);
+                }
+                Stub::Report { label, parts } => {
+                    self.a.bind(label);
+                    let last = parts.len() - 1;
+                    for (i, part) in parts.into_iter().enumerate() {
+                        match part {
+                            Part::Text(text, len) if i == last => {
+                                self.lea_label(RCX, text);
+                                self.a.mov_imm64(RDX, len as i64);
+                                self.call_label(self.rt_fail);
+                            }
+                            Part::Text(text, len) => {
+                                self.lea_label(RCX, text);
+                                self.a.mov_imm64(RDX, len as i64);
+                                self.a.mov_imm64(R8, STDERR);
+                                self.call_label(self.rt_write);
+                            }
+                            Part::Value(at, ty) => {
+                                self.a.mov_imm64(RCX, 32);
+                                self.call_rt("str_new");
+                                self.a.mov_rr(RCX, RAX);
+                                self.a.load(RDX, at);
+                                self.repr_call(ty);
+                                self.a.lea(RCX, M(RAX, ELEMENTS));
+                                self.a.load(RDX, M(RAX, LENGTH));
+                                self.a.mov_imm64(R8, STDERR);
+                                self.call_label(self.rt_write);
+                            }
+                            Part::Raw(at) => {
+                                self.a.load(RAX, at);
+                                self.a.lea(RCX, M(RAX, ELEMENTS));
+                                self.a.load(RDX, M(RAX, LENGTH));
+                                self.a.mov_imm64(R8, STDERR);
+                                self.call_label(self.rt_write);
+                            }
+                        }
+                    }
                 }
                 Stub::Number { label, value, record } => {
                     self.a.bind(label);
@@ -2610,7 +2726,17 @@ impl Native<'_> {
                 self.load_loc(RCX, list);
                 self.drop_value(list_ty);
             }
-            Stmt::Assert { span, .. } => return unsupported("`assert`", *span),
+            Stmt::Assert { cond, span } => {
+                let text = self.sources.text[cond.span.start..cond.span.end].to_string();
+                match &cond.kind {
+                    // A comparison that fails shows both sides.
+                    ExprKind::Binary(op, l, r) if op.is_comparison() => self.assert_cmp(*op, l, r, &text, *span)?,
+                    _ => {
+                        let stub = self.fail_stub(Diagnostic::new("E0501", format!("assertion failed: `{text}`"), *span));
+                        self.cond(cond, stub)?;
+                    }
+                }
+            }
             Stmt::Expr(e) => {
                 let t = self.take_temp(e.span)?;
                 let ty = self.eval(e, t)?;
@@ -2983,6 +3109,64 @@ impl Native<'_> {
         Ok(())
     }
 
+    /// `assert l op r`: both sides are kept so that a failure can show them.
+    fn assert_cmp(&mut self, op: BinOp, l: &Expr, r: &Expr, text: &str, span: Span) -> R<()> {
+        let t = self.take_temp(span)?;
+        let held = self.pending.len();
+        let ty = self.eval(l, t)?;
+        let left = self.push_spill();
+        self.a.store(left, t);
+        self.hold(left, ty);
+        let right_ty = self.eval(r, t)?;
+        let right = self.push_spill();
+        self.a.store(right, t);
+        self.pending.truncate(held);
+        if right_ty != ty {
+            return unsupported("comparing values of different types", span);
+        }
+        let d = Diagnostic::new("E0501", format!("assertion failed: `{text}` (left: \u{1}, right: \u{2})"), span);
+        let fail = self.report(d, vec![Part::Value(left, ty), Part::Value(right, ty)]);
+        let equality = matches!(op, BinOp::Eq | BinOp::Ne);
+        match ty {
+            Ty::Float => {
+                self.a.load(RAX, left);
+                self.a.load(RCX, right);
+                self.floats_in();
+                self.float_compare(op, fail);
+            }
+            Ty::Str => {
+                self.a.load(RCX, left);
+                self.a.load(RDX, right);
+                self.call_rt(if equality { "str_eq" } else { "str_cmp" });
+                self.a.alu_imm(7, RAX, equality as i32);
+                self.a.jcc(condition(op) ^ 1, fail);
+            }
+            _ if self.deep(ty) && equality => {
+                let eq = self.eq_label(ty);
+                self.a.load(RCX, left);
+                self.a.load(RDX, right);
+                self.call_label(eq);
+                self.a.alu_imm(7, RAX, 1);
+                self.a.jcc(condition(op) ^ 1, fail);
+            }
+            _ if matches!(ty, Ty::Int | Ty::Bool) || self.plain_enum(ty) => {
+                self.a.load(RAX, left);
+                self.a.alu_m(0x3B, RAX, right);
+                self.a.jcc(condition(op) ^ 1, fail);
+            }
+            _ => return unsupported("comparing values of this type", span),
+        }
+        if ty.heap() {
+            for slot in [left, right] {
+                self.a.load(RCX, slot);
+                self.drop_value(ty);
+            }
+        }
+        self.spill_depth -= 2;
+        self.free.push(t);
+        Ok(())
+    }
+
     /// `name = value` for a variable whose value is counted: what it held is given up.
     fn assign_heap(&mut self, name: &str, local: Local, value: &Expr) -> R<()> {
         // `xs = xs.push(v)` hands the variable's own reference to `push`, which
@@ -3348,8 +3532,8 @@ impl Native<'_> {
                 let Some((param_tys, ret)) = self.fn_def(ty) else {
                     return unsupported("this closure", e.span);
                 };
-                if params.len() != param_tys.len() || params.len() > 3 {
-                    return unsupported("closures with more than three parameters", e.span);
+                if params.len() != param_tys.len() {
+                    return unsupported("this closure", e.span);
                 }
                 // The captured values are copied into the closure's block.
                 let held = self.pending.len();
@@ -3423,8 +3607,8 @@ impl Native<'_> {
                 let Some((params, ret)) = self.fn_def(local.ty) else {
                     return unsupported(format!("calling `{name}`"), e.span);
                 };
-                if params.len() != args.len() || args.len() > 3 {
-                    return unsupported("a call of a function value with more than three arguments", e.span);
+                if params.len() != args.len() {
+                    return unsupported("this call of a function value", e.span);
                 }
                 let outer = self.arguments(args, 1)?;
                 self.load_loc(RCX, local.loc);
@@ -3769,8 +3953,24 @@ impl Native<'_> {
         if name == "print" {
             return self.print(&args[0]);
         }
-        if self.in_runtime && name.starts_with("__") && name != "__copy" {
+        if name == "panic" && !self.in_runtime {
+            // Stops with the message. Nothing is released: the program ends here.
+            let (slot, _, ty) = self.park(&args[0], dst)?;
+            if ty != Ty::Str {
+                return unsupported("`panic` with anything but a String", span);
+            }
+            let stub = self.report(Diagnostic::new("E0500", "panic: \u{1}", span), vec![Part::Raw(slot)]);
+            self.a.jmp(stub);
+            self.spill_depth -= 1;
+            return Ok(Ty::Never);
+        }
+        if self.in_runtime && name.starts_with("__") && !self.fns.contains_key(&format!("%{name}")) {
             return self.intrinsic(name, args, dst, span);
+        }
+        if !self.in_runtime {
+            if let Some(ty) = self.os_builtin(name, args, dst, span)? {
+                return Ok(ty);
+            }
         }
         let key = if self.in_runtime { format!("%{name}") } else { self.fn_key(name, span)? };
         if self.in_runtime {
@@ -3857,6 +4057,79 @@ impl Native<'_> {
         }
         self.spill_depth -= parked.iter().flatten().count() as i32;
         Ok(outer)
+    }
+
+    /// The built-in functions that talk to the operating system: `read_line`,
+    /// `args`, `read_file`, `write_file`. `None` if `name` is not one of them.
+    fn os_builtin(&mut self, name: &str, args: &[Expr], dst: u8, span: Span) -> R<Option<Ty>> {
+        match (name, args) {
+            ("read_line", []) => {
+                self.call_rt("read_line");
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Str))
+            }
+            ("args", []) => {
+                let ty = self.ty_text("List<String>", &[], span)?;
+                self.call_rt("args_list");
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(ty))
+            }
+            ("read_file", [path]) => {
+                // The routine gives the text, or the message of the error,
+                // and says which it is in `ok`.
+                let ty = self.ty_text("Result<String, String>", &[], span)?;
+                let (p, owned, _) = self.park(path, dst)?;
+                let ok = self.push_spill();
+                self.a.load(RCX, p);
+                self.a.lea(RDX, ok);
+                self.call_rt("file_read");
+                let text = self.push_spill();
+                self.a.store(text, RAX);
+                self.fill_block(self.size_of(ty), &[(text, 16)], dst);
+                // Ok is variant 0, Err is 1.
+                self.a.load(RAX, ok);
+                self.a.buf.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
+                self.a.store(M(dst, 8), RAX);
+                if owned {
+                    self.a.load(RCX, p);
+                    self.release_keeping(dst, Ty::Str);
+                }
+                self.spill_depth -= 3;
+                Ok(Some(ty))
+            }
+            ("write_file", [path, content]) => {
+                // The routine gives 0, or the message of the error.
+                let ty = self.ty_text("Result<Unit, String>", &[], span)?;
+                let (p, p_owned, _) = self.park(path, dst)?;
+                let held = self.pending.len();
+                if p_owned {
+                    self.hold(p, Ty::Str);
+                }
+                let (c, c_owned, _) = self.park(content, dst)?;
+                self.pending.truncate(held);
+                self.a.load(RCX, p);
+                self.a.load(RDX, c);
+                self.call_rt("file_write");
+                let message = self.push_spill();
+                self.a.store(message, RAX);
+                self.fill_block(self.size_of(ty), &[(message, 16)], dst);
+                let ok = self.a.label();
+                self.a.store_imm(M(dst, 8), 0);
+                self.a.cmp_imm(message, 0);
+                self.a.jcc(CC_E, ok);
+                self.a.store_imm(M(dst, 8), 1);
+                self.a.bind(ok);
+                for (slot, owned) in [(p, p_owned), (c, c_owned)] {
+                    if owned {
+                        self.a.load(RCX, slot);
+                        self.release_keeping(dst, Ty::Str);
+                    }
+                }
+                self.spill_depth -= 3;
+                Ok(Some(ty))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Direct access to memory, for `runtime.yui` only.
@@ -4210,10 +4483,88 @@ impl Native<'_> {
                 self.a.mov_rr(dst, RAX);
                 Ok(Ty::Str)
             }
-            (Ty::Str, "split", [_]) | (Ty::Str, "chars", []) => {
+            (Ty::Str, "slice", [from, to]) => self.slice(e, recv, from, to, dst),
+            (Ty::Str, "trim", []) => {
+                let left = self.park(recv, dst)?;
+                self.rt_op("str_trim", left, None, None, None, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Str)
+            }
+            (Ty::Str, "replace", [from, to]) => {
+                // Three strings, each parked; whatever was made for the call is given up after it.
+                let held = self.pending.len();
+                let mut parked = vec![self.park(recv, dst)?];
+                for arg in [from, to] {
+                    if let Some((slot, true, ty)) = parked.last().copied() {
+                        self.hold(slot, ty);
+                    }
+                    parked.push(self.park(arg, dst)?);
+                }
+                self.pending.truncate(held);
+                self.a.load(RCX, parked[0].0);
+                self.a.load(RDX, parked[1].0);
+                self.a.load(R8, parked[2].0);
+                self.call_rt("str_replace");
+                for (slot, owned, _) in &parked {
+                    if *owned {
+                        self.a.load(RCX, *slot);
+                        self.a.store(*slot, RAX);
+                        self.call_rt("str_release");
+                        self.a.load(RAX, *slot);
+                    }
+                }
+                self.spill_depth -= 3;
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Str)
+            }
+            (Ty::Str, "to_int", []) => {
+                // The routine says whether the text is a number, and stores the number.
+                let result = self.expr_ty(e)?;
+                let (slot, owned, _) = self.park(recv, dst)?;
+                let value = self.push_spill();
+                let (none, done) = (self.a.label(), self.a.label());
+                self.a.load(RCX, slot);
+                self.a.lea(RDX, value);
+                self.call_rt("str_parse_int");
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_Z, none);
+                self.fill_block(self.size_of(result), &[(value, 16)], dst);
+                self.a.store_imm(M(dst, 8), 1);
+                self.a.jmp(done);
+                self.a.bind(none);
+                self.a.mov_imm64(dst, 0);
+                self.a.bind(done);
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.release_keeping(dst, Ty::Str);
+                }
+                self.spill_depth -= 2;
+                Ok(result)
+            }
+            (Ty::Int, "to_char", []) => {
+                self.eval(recv, dst)?;
+                let d = Diagnostic::new("E0509", "\u{1} is not a character code", e.span);
+                let stub = self.number_stub(dst, d);
+                // Up to 0x10FFFF, and not one of the halves of a pair (0xD800 to 0xDFFF).
+                self.a.alu_imm(7, dst, 0x10FFFF);
+                self.a.jcc(CC_A, stub);
+                self.a.mov_rr(RAX, dst);
+                self.a.alu_imm(5, RAX, 0xD800);
+                self.a.alu_imm(7, RAX, 0x7FF);
+                self.a.jcc(CC_BE, stub);
+                self.a.mov_rr(RCX, dst);
+                self.call_rt("str_from_code");
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Str)
+            }
+            (Ty::Str, "split", [_]) | (Ty::Str, "chars" | "codes", []) => {
                 let result = self.expr_ty(e)?;
                 let left = self.park(recv, dst)?;
-                let routine = if name == "split" { "str_split" } else { "str_chars_list" };
+                let routine = match name {
+                    "split" => "str_split",
+                    "chars" => "str_chars_list",
+                    _ => "str_codes",
+                };
                 self.rt_op(routine, left, args.first(), None, None, dst)?;
                 self.a.mov_rr(dst, RAX);
                 Ok(result)
@@ -5220,6 +5571,77 @@ impl Native<'_> {
         Ok(())
     }
 
+    /// `recv.slice(from, to)` on a list (items) or a string (characters).
+    fn slice(&mut self, e: &Expr, recv: &Expr, from: &Expr, to: &Expr, dst: u8) -> R<Ty> {
+        let (slot, owned, ty) = self.park(recv, dst)?;
+        let held = self.pending.len();
+        if owned {
+            self.hold(slot, ty);
+        }
+        self.eval(from, dst)?;
+        let a = self.push_spill();
+        self.a.store(a, dst);
+        self.eval(to, dst)?;
+        let b = self.push_spill();
+        self.a.store(b, dst);
+        self.pending.truncate(held);
+        // The length: of a string, in characters.
+        self.a.load(RCX, slot);
+        if ty == Ty::Str {
+            self.call_rt("str_chars");
+        } else {
+            self.a.load(RAX, M(RCX, LENGTH));
+        }
+        let len = self.push_spill();
+        self.a.store(len, RAX);
+        let d = Diagnostic::new("E0505", "slice \u{1}..\u{2} is out of bounds for a length of \u{3}", e.span);
+        let fail = self.report(d, vec![Part::Value(a, Ty::Int), Part::Value(b, Ty::Int), Part::Value(len, Ty::Int)]);
+        // 0 <= from <= to <= length
+        self.a.load(RAX, a);
+        self.a.alu_imm(7, RAX, 0);
+        self.a.jcc(CC_L, fail);
+        self.a.alu_m(0x3B, RAX, b);
+        self.a.jcc(CC_G, fail);
+        self.a.load(RAX, b);
+        self.a.alu_m(0x3B, RAX, len);
+        self.a.jcc(CC_G, fail);
+        self.a.load(RCX, slot);
+        self.a.load(RDX, a);
+        self.a.load(R8, b);
+        if ty == Ty::Str {
+            self.call_rt("str_slice");
+        } else {
+            self.call_rt("list_slice");
+            self.retain_items(self.item_ty(ty));
+        }
+        if owned {
+            self.a.load(RCX, slot);
+            self.a.store(slot, RAX);
+            self.drop_value(ty);
+            self.a.load(RAX, slot);
+        }
+        self.spill_depth -= 4;
+        self.a.mov_rr(dst, RAX);
+        Ok(ty)
+    }
+
+    /// The list in rax is new and holds items copied from elsewhere: counts them.
+    fn retain_items(&mut self, item: Ty) {
+        if !item.heap() {
+            return;
+        }
+        let (top, done) = (self.a.label(), self.a.label());
+        self.a.mov_imm64(RCX, 0);
+        self.a.bind(top);
+        self.a.alu_m(0x3B, RCX, M(RAX, LENGTH));
+        self.a.jcc(CC_GE, done);
+        self.element(0x8B, RDX, RAX, RCX);
+        self.retain(RDX, item);
+        self.a.alu_imm(0, RCX, 1);
+        self.a.jmp(top);
+        self.a.bind(done);
+    }
+
     /// A method of a list.
     fn list_method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (name, args) {
@@ -5294,6 +5716,7 @@ impl Native<'_> {
                 self.spill_depth -= 1;
                 Ok(result)
             }
+            ("slice", [from, to]) => self.slice(e, recv, from, to, dst),
             ("is_empty", []) => {
                 self.list_method(e, recv, "len", name_span, args, dst)?;
                 self.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax

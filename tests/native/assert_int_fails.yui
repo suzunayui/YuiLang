@@ -1,0 +1,4 @@
+fn main() uses io {
+  let name = "yui"
+  assert name.len() + 1 > 9
+}

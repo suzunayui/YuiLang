@@ -1,0 +1,4 @@
+fn main() uses io {
+  print(97.to_char())
+  print(55296.to_char())
+}

@@ -1,0 +1,80 @@
+// assert、文字列とリストの残りのメソッド、引数の多いクロージャ
+
+struct Point {
+  x: Int,
+  y: Int,
+}
+
+fn checked(xs: List<Int>) -> Int {
+  assert xs.len() > 0
+  assert xs[0] == xs[0]
+  let total = xs.fold(0, |acc, x| acc + x)
+  assert total >= xs[0] || xs[0] < 0
+  total
+}
+
+fn parse_pair(a: String, b: String) -> Option<Int> {
+  let x = a.to_int()?
+  let y = b.to_int()?
+  Some(x + y)
+}
+
+fn initials(name: String) -> String {
+  let space = " "
+  let nothing = ""
+  name.split(space).filter(|w| !w.is_empty()).map(|w| w.slice(0, 1).to_upper()).join(nothing)
+}
+
+fn main() uses io {
+  print("{checked([1, 2, 3])}")
+  let p = Point { x: 1, y: 2 }
+  assert p == Point { x: 1, y: 2 }
+  assert p.x != p.y
+  assert 1.5 < 2.5
+  let name = "yui"
+  assert name == "yui"
+  assert name < "z"
+  assert [1, 2] == [1, 2]
+  assert Some(name) != None
+
+  // 文字列
+  let padded = "  hello world \t\n"
+  let wide = "　全角の空白　"
+  print("[{padded.trim()}] [{wide.trim()}] [{name.trim()}] [{padded.trim().trim()}] {padded.trim().len()}")
+  let blank = "   "
+  let nothing = ""
+  print("[{blank.trim()}] [{nothing.trim()}] {blank.trim().is_empty()}")
+  let text = "hello world, hello yui"
+  let hello = "hello"
+  let bye = "bye"
+  let l = "l"
+  print("{text.replace(hello, bye)} / {text.replace(l, nothing)} / {text.replace(nothing, bye)} / {text.replace(bye, hello)} / {name.replace(name, name)}")
+  let jp = "こんにちは世界"
+  print("{text.slice(0, 5)} {text.slice(6, 11)} [{text.slice(3, 3)}] {jp.slice(5, 7)} {jp.slice(0, 2)} {jp.slice(0, 7)} {name.slice(1, 3)}")
+  let n1 = "42"
+  let n2 = " -17 "
+  let n3 = "+8"
+  let n4 = "4x"
+  let n5 = "9223372036854775807"
+  let n6 = "9223372036854775808"
+  let n7 = "-9223372036854775808"
+  let n8 = "-9223372036854775809"
+  print("{n1.to_int()} {n2.to_int()} {n3.to_int()} {n4.to_int()} {n5.to_int()} {n6.to_int()} {n7.to_int()} {n8.to_int()}")
+  let n9 = "-"
+  let n10 = "1 2"
+  let n11 = "007"
+  print("{nothing.to_int()} {n9.to_int()} {n10.to_int()} {n11.to_int()} {blank.to_int()} {parse_pair(n1, n2)} {parse_pair(n1, n4)}")
+  print("{name.codes()} {jp.codes()} {nothing.codes()} {65.to_char()} {12354.to_char()} {128512.to_char()} {233.to_char()}{0.to_char().len()}")
+  print("{name.codes().map(|c| (c - 32).to_char()).join(nothing)} {initials(text)} {initials(padded)}")
+
+  // リストの slice
+  let xs = [10, 20, 30, 40, 50]
+  let ws = ["a", "b", "c"]
+  print("{xs.slice(1, 3)} {xs.slice(0, 5)} {xs.slice(2, 2)} {xs.slice(5, 5)} {ws.slice(1, 3)} {ws.slice(0, 1).concat(ws.slice(2, 3))}")
+
+  // 引数の多い関数値
+  let add4 = |a, b, c, d| a + b * 10 + c * 100 + d * 1000
+  let scale = 2
+  let mix = |a, b, c, d, e| "{a}{b}{c}{d}{e}{scale}"
+  print("{add4(1, 2, 3, 4)} {mix(1, name, 3, true, 5)}")
+}

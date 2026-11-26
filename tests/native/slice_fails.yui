@@ -1,0 +1,5 @@
+fn main() uses io {
+  let xs = [1, 2, 3]
+  print("{xs.slice(1, 3)}")
+  print("{xs.slice(2, 4)}")
+}

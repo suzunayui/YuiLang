@@ -349,7 +349,7 @@ fn native_executables_match_yui_run() {
     let refused = out_dir.join("refused.exe");
     let result = Command::new(yui)
         .args(["build", "--native"])
-        .arg(root().join("tests/refused/read_line.yui"))
+        .arg(root().join("tests/refused/to_float.yui"))
         .arg("-o")
         .arg(&refused)
         .output()
@@ -358,4 +358,66 @@ fn native_executables_match_yui_run() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("E0902"));
     assert!(!refused.exists());
     let _ = std::fs::remove_dir_all(&out_dir);
+}
+/// Standard input, command-line arguments and files: the native executable
+/// must behave like `yui run` given the same arguments, input and folder.
+/// Also a program made of several files.
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[test]
+fn native_input_and_output_match_yui_run() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let yui = env!("CARGO_BIN_EXE_yui");
+    let dir = std::env::temp_dir().join(format!("yuilang_native_io_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(root().join("tests/native_io/io.yui"), dir.join("io.yui")).unwrap();
+    std::fs::write(dir.join("not_text.bin"), [0xFF, 0xFE, 0x80, b'a', b'b', b'c']).unwrap();
+    std::fs::write(dir.join("日本語のファイル.txt"), "なかみ\n").unwrap();
+    std::fs::write(dir.join("big.txt"), "0123456789 日本語\n".repeat(20000)).unwrap();
+    let exe = dir.join("io.exe");
+    let built = Command::new(yui)
+        .current_dir(&dir)
+        .env("YUI_NATIVE_CHECK_HEAP", "1")
+        .args(["build", "--native", "io.yui", "-o"])
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let program_args = ["one", "two words", "日本語", "a\"b", "c\\d", "", "tail\\"];
+    let input = "hello\r\nsecond line \n\nlast without newline";
+    let run = |mut command: Command| {
+        let mut child =
+            command.current_dir(&dir).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let mut interpreted = Command::new(yui);
+    interpreted.args(["run", "io.yui", "--"]).args(program_args);
+    let expected = run(interpreted);
+    let mut native = Command::new(&exe);
+    native.args(program_args);
+    let actual = run(native);
+    assert!(String::from_utf8_lossy(&expected.stdout).contains("7 args"), "the interpreter did not get the arguments");
+    assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout));
+    assert_eq!(String::from_utf8_lossy(&actual.stderr), String::from_utf8_lossy(&expected.stderr));
+    assert_eq!(actual.status.code(), expected.status.code());
+
+    // Several files: built from the folder of the main one.
+    let modules = root().join("examples/modules");
+    let exe = dir.join("modules.exe");
+    let built = Command::new(yui)
+        .current_dir(&modules)
+        .env("YUI_NATIVE_CHECK_HEAP", "1")
+        .args(["build", "--native", "main.yui", "-o"])
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let expected = Command::new(yui).current_dir(&modules).args(["run", "main.yui"]).output().unwrap();
+    let actual = Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout));
+    assert_eq!(String::from_utf8_lossy(&actual.stderr), String::from_utf8_lossy(&expected.stderr));
+    assert_eq!(actual.status.code(), expected.status.code());
+    let _ = std::fs::remove_dir_all(&dir);
 }
