@@ -1,0 +1,79 @@
+// Map: 生成、読み書き、メソッド、表示、比較。文字列の split / chars / to_lower / to_upper
+
+struct Entry {
+  name: String,
+  scores: Map<String, Int>,
+}
+
+fn word_counts(text: String) -> Map<String, Int> {
+  let mut counts: Map<String, Int> = Map {}
+  for word in text.to_lower().split(" ") {
+    if word.is_empty() { continue }
+    counts[word] = counts.get(word).unwrap_or(0) + 1
+  }
+  counts
+}
+
+fn squares(n: Int) -> Map<Int, Int> {
+  let mut out: Map<Int, Int> = Map {}
+  let mut i = n
+  while i > 0 {
+    out[i] = i * i
+    i = i - 1
+  }
+  out
+}
+
+fn total(m: Map<String, Int>) -> Int {
+  m.values().fold(0, |acc, v| acc + v)
+}
+
+fn main() uses io {
+  let counts = word_counts("to be or not To BE  or")
+  for word in counts.keys() {
+    print("{word}: {counts[word]}")
+  }
+  print("{counts} {counts.len()} {counts.is_empty()} {total(counts)}")
+  let be = "be"
+  let cat = "cat"
+  print("{counts.has(be)} {counts.has(cat)} {counts.get(be)} {counts.get(cat)} {counts.get(cat).unwrap_or(-1)}")
+
+  // 値として扱われる
+  let a = Map { "x": 1 }
+  let b = a.set("y", 2)
+  let c = b.set("x", 10).remove("y")
+  let same = Map { "y": 2, "x": 1 }
+  print("{a} {b} {c} {a.len()} {b == same} {a == b} {b.remove(cat) == b} {b.remove(be).remove(cat).keys()}")
+  let mut d = b
+  d["z"] = 3
+  d["x"] = d["x"] + d["y"]
+  print("{d} {b} {d.keys()} {d.values()} {d.remove(be).len()}")
+
+  // 整数と真偽値のキー、リストや構造体の値
+  let sq = squares(5)
+  print("{sq} {sq[3]} {sq.keys()} {sq.get(9)} {sq.remove(3).keys()} {sq.set(0, 0).keys()[0]}")
+  let flags = Map { true: "yes", false: "no" }
+  print("{flags} {flags[true]} {flags[1 > 2]}")
+  let mut groups: Map<Int, List<String>> = Map {}
+  for word in ["a", "bb", "cc", "d", "eee"] {
+    let size = word.len()
+    groups[size] = groups.get(size).unwrap_or([]).push(word)
+  }
+  print("{groups} {groups[2].len()} {groups.values().map(|g| g.len())}")
+  let none: Map<String, Int> = Map {}
+  print("{none} {none.is_empty()} {none.keys()} {none == Map {}}")
+  let mut entry = Entry { name: "e", scores: Map { "math": 90 } }
+  let before = entry
+  entry.scores = entry.scores.set("art", 70)
+  let art = "art"
+  print("{entry} {before.scores.len()} {entry.scores[art]}")
+
+  // 文字列
+  let text = "Hello, YuiLang World"
+  let comma = ","
+  let nothing = ""
+  print("{text.to_lower()} {text.to_upper()} {text.split(comma)} {text.split(nothing).len()} {nothing.split(comma)} {comma.split(comma)}")
+  let jp = "こんにちは"
+  let ell = "l"
+  print("{jp.chars()} {jp.chars().len()} {jp.split(nothing).reverse().join(nothing)} {text.chars().filter(|ch| ch == ell).len()}")
+}

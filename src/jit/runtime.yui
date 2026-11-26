@@ -72,6 +72,209 @@ fn list_reserve(list: Int, extra: Int) -> Int {
   grown
 }
 
+// a の後ろに b をつないだ新しいリスト。要素は写すだけで、数え直しは呼び出し側がする
+fn list_concat(a: Int, b: Int) -> Int {
+  let n = __load(a + 8)
+  let m = __load(b + 8)
+  let out = list_new(n + m)
+  __copy(out + 24, a + 24, n * 8)
+  __copy(out + 24 + n * 8, b + 24, m * 8)
+  __store(out + 8, n + m)
+  out
+}
+
+fn list_reversed(a: Int) -> Int {
+  let n = __load(a + 8)
+  let out = list_new(n)
+  let mut i = 0
+  while i < n {
+    __store(out + 24 + i * 8, __load(a + 16 + (n - i) * 8))
+    i = i + 1
+  }
+  __store(out + 8, n)
+  out
+}
+
+fn list_contains(a: Int, value: Int) -> Int {
+  let n = __load(a + 8)
+  let mut i = 0
+  while i < n {
+    if __load(a + 24 + i * 8) == value { return 1 }
+    i = i + 1
+  }
+  0
+}
+
+fn list_contains_str(a: Int, value: Int) -> Int {
+  let n = __load(a + 8)
+  let mut i = 0
+  while i < n {
+    if str_eq(__load(a + 24 + i * 8), value) == 1 { return 1 }
+    i = i + 1
+  }
+  0
+}
+
+// x が y より前なら 1。strings が 1 なら文字列として比べる
+fn before(x: Int, y: Int, strings: Int) -> Int {
+  if strings == 1 { if str_cmp(x, y) < 0 { 1 } else { 0 } } else if x < y { 1 } else { 0 }
+}
+
+// ヒープソートの部品: start の要素を、end より前の範囲で正しい位置まで沈める
+fn sift(base: Int, start: Int, end: Int, strings: Int) {
+  let mut root = start
+  while root * 2 + 1 < end {
+    let mut child = root * 2 + 1
+    if child + 1 < end && before(__load(base + child * 8), __load(base + child * 8 + 8), strings) == 1 {
+      child = child + 1
+    }
+    let top = __load(base + root * 8)
+    let below = __load(base + child * 8)
+    if before(top, below, strings) == 1 {
+      __store(base + root * 8, below)
+      __store(base + child * 8, top)
+      root = child
+    } else {
+      return
+    }
+  }
+}
+
+// 昇順に並べた新しいリスト（ヒープソート）
+fn list_sorted(a: Int, strings: Int) -> Int {
+  let n = __load(a + 8)
+  let out = list_new(n)
+  __copy(out + 24, a + 24, n * 8)
+  __store(out + 8, n)
+  let base = out + 24
+  let mut start = n / 2
+  while start > 0 {
+    start = start - 1
+    sift(base, start, n, strings)
+  }
+  let mut end = n
+  while end > 1 {
+    end = end - 1
+    let first = __load(base)
+    __store(base, __load(base + end * 8))
+    __store(base + end * 8, first)
+    sift(base, 0, end, strings)
+  }
+  out
+}
+
+// 文字列のリストを sep でつないだ文字列
+fn list_join(a: Int, sep: Int) -> Int {
+  let n = __load(a + 8)
+  let mut out = str_new(16)
+  let mut i = 0
+  while i < n {
+    if i > 0 {
+      out = str_append_str(out, sep)
+    }
+    out = str_append_str(out, __load(a + 24 + i * 8))
+    i = i + 1
+  }
+  out
+}
+
+// Map の形: [参照カウント][件数][容量] のあとに、16 バイトずつ [キー][値] がキーの昇順で並ぶ
+
+fn map_new(capacity: Int) -> Int {
+  let m = __alloc(24 + capacity * 16)
+  __store(m, 1)
+  __store(m + 8, 0)
+  __store(m + 16, capacity)
+  m
+}
+
+// key のある位置。なければ「-1 - 入れるべき位置」。strings が 1 ならキーは文字列
+fn map_find(m: Int, key: Int, strings: Int) -> Int {
+  let mut low = 0
+  let mut high = __load(m + 8)
+  while low < high {
+    let middle = (low + high) / 2
+    let here = __load(m + 24 + middle * 16)
+    let mut order = 0
+    if strings == 1 {
+      order = str_cmp(here, key)
+    } else if here < key {
+      order = 0 - 1
+    } else if here > key {
+      order = 1
+    }
+    if order == 0 { return middle }
+    if order < 0 {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  0 - 1 - low
+}
+
+// at 番目の値を入れ替えて、前の値を返す
+fn map_swap(m: Int, at: Int, value: Int) -> Int {
+  let place = m + 32 + at * 16
+  let old = __load(place)
+  __store(place, value)
+  old
+}
+
+// at 番目に [key][value] を割り込ませる。持ち主が 1 人の Map にだけ使う（移動するかもしれない）
+fn map_insert(m: Int, at: Int, key: Int, value: Int) -> Int {
+  let count = __load(m + 8)
+  let mut out = m
+  if count == __load(m + 16) {
+    let room = count * 2 + 4
+    out = __realloc(m, 24 + room * 16)
+    __store(out + 16, room)
+  }
+  let mut i = count
+  while i > at {
+    __store(out + 24 + i * 16, __load(out + 8 + i * 16))
+    __store(out + 32 + i * 16, __load(out + 16 + i * 16))
+    i = i - 1
+  }
+  __store(out + 24 + at * 16, key)
+  __store(out + 32 + at * 16, value)
+  __store(out + 8, count + 1)
+  out
+}
+
+// at 番目を取り除いて詰める。持ち主が 1 人の Map にだけ使う
+fn map_close(m: Int, at: Int) {
+  let count = __load(m + 8) - 1
+  let mut i = at
+  while i < count {
+    __store(m + 24 + i * 16, __load(m + 40 + i * 16))
+    __store(m + 32 + i * 16, __load(m + 48 + i * 16))
+    i = i + 1
+  }
+  __store(m + 8, count)
+}
+
+// キー（offset が 24）か値（32）を順に並べた新しいリスト。数え直しは呼び出し側がする
+fn map_column(m: Int, offset: Int) -> Int {
+  let count = __load(m + 8)
+  let out = list_new(count)
+  let mut i = 0
+  while i < count {
+    __store(out + 24 + i * 8, __load(m + offset + i * 16))
+    i = i + 1
+  }
+  __store(out + 8, count)
+  out
+}
+
+fn map_keys(m: Int) -> Int {
+  map_column(m, 24)
+}
+
+fn map_values(m: Int) -> Int {
+  map_column(m, 32)
+}
+
 // 文字列の形: 先頭から [参照カウント][バイト数][容量][UTF-8 のバイト列]。
 // 参照カウントが負のものはプログラムに埋め込まれた定数で、解放も書き換えもしない
 
@@ -277,4 +480,83 @@ fn str_contains(s: Int, part: Int) -> Int {
     i = i + 1
   }
   0
+}
+
+// s の from バイト目から to バイト目の手前までを写した新しい文字列
+fn str_piece(s: Int, from: Int, to: Int) -> Int {
+  let out = str_new(to - from)
+  __copy(out + 24, s + 24 + from, to - from)
+  __store(out + 8, to - from)
+  out
+}
+
+// 1 文字ずつの文字列のリスト。UTF-8 の続きのバイト（128〜191）の前では切らない
+fn str_chars_list(s: Int) -> Int {
+  let count = __load(s + 8)
+  let mut out = list_new(count)
+  let mut start = 0
+  let mut i = 1
+  while i <= count {
+    let mut boundary = 1
+    if i < count {
+      let byte = __load8(s + 24 + i)
+      if byte >= 128 && byte <= 191 {
+        boundary = 0
+      }
+    }
+    if boundary == 1 {
+      out = list_push(out, str_piece(s, start, i))
+      start = i
+    }
+    i = i + 1
+  }
+  out
+}
+
+// sep で区切った文字列のリスト。sep が空なら 1 文字ずつ
+fn str_split(s: Int, sep: Int) -> Int {
+  let count = __load(s + 8)
+  let width = __load(sep + 8)
+  if width == 0 { return str_chars_list(s) }
+  let mut out = list_new(4)
+  let mut start = 0
+  let mut i = 0
+  while i + width <= count {
+    if bytes_equal(s + 24 + i, sep + 24, width) == 1 {
+      out = list_push(out, str_piece(s, start, i))
+      i = i + width
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  list_push(out, str_piece(s, start, count))
+}
+
+fn str_is_ascii(s: Int) -> Int {
+  let count = __load(s + 8)
+  let mut i = 0
+  while i < count {
+    if __load8(s + 24 + i) >= 128 { return 0 }
+    i = i + 1
+  }
+  1
+}
+
+// first から 26 文字（大文字なら 65、小文字なら 97）を、もう一方の大小に変えた新しい文字列
+fn str_shift_case(s: Int, first: Int) -> Int {
+  let count = __load(s + 8)
+  let out = str_new(count)
+  let mut i = 0
+  while i < count {
+    let byte = __load8(s + 24 + i)
+    if byte >= first && byte < first + 26 {
+      __store8(out + 24 + i, byte + 162 - first * 2)
+    } else {
+      __store8(out + 24 + i, byte)
+    }
+    i = i + 1
+  }
+  __store(out + 8, count)
+  out
 }

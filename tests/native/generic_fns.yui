@@ -1,0 +1,110 @@
+// ジェネリックな関数と、リストの残りのメソッド
+
+struct Pair<A, B> {
+  first: A,
+  second: B,
+}
+
+enum Tree<T> {
+  Leaf,
+  Node(Tree<T>, T, Tree<T>),
+}
+
+fn id<T>(x: T) -> T {
+  x
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+  Pair { first: p.second, second: p.first }
+}
+
+fn insert(tree: Tree<Int>, value: Int) -> Tree<Int> {
+  match tree {
+    Tree.Leaf => Tree.Node(Tree.Leaf, value, Tree.Leaf)
+    Tree.Node(left, v, right) => if value < v {
+      Tree.Node(insert(left, value), v, right)
+    } else {
+      Tree.Node(left, v, insert(right, value))
+    }
+  }
+}
+
+fn to_list<T>(tree: Tree<T>) -> List<T> {
+  match tree {
+    Tree.Leaf => []
+    Tree.Node(left, v, right) => to_list(left).push(v).concat(to_list(right))
+  }
+}
+
+fn depth<T>(tree: Tree<T>) -> Int {
+  match tree {
+    Tree.Leaf => 0
+    Tree.Node(left, _, right) => 1 + depth(left).max(depth(right))
+  }
+}
+
+fn apply_twice<T>(f: fn(T) -> T, x: T) -> T {
+  f(f(x))
+}
+
+fn compose<A, B, C>(f: fn(A) -> B, g: fn(B) -> C) -> (fn(A) -> C) {
+  |x| g(f(x))
+}
+
+fn each<T>(xs: List<T>, f: fn(T) uses io) uses io {
+  for x in xs {
+    f(x)
+  }
+}
+
+fn first_or<T>(xs: List<T>, fallback: T) -> T {
+  xs.first().unwrap_or(fallback)
+}
+
+fn repeat<T>(x: T, n: Int) -> List<T>
+  requires n >= 0
+  ensures result.len() == n
+{
+  let mut out = []
+  for i in 0..n {
+    out = out.push(x)
+  }
+  out
+}
+
+fn double(x: Int) -> Int {
+  x * 2
+}
+
+fn shout(s: String) -> String {
+  "{s}!"
+}
+
+fn main() uses io {
+  let name = "yui"
+  print("{id(1)} {id(name)} {id([1, 2])} {id(Some(3))} {id(true)}")
+  let p = swap(Pair { first: 1, second: "one" })
+  print("{p.first} {p.second} {swap(p)} {swap(swap(p)).first}")
+  let tree = [5, 2, 8, 1, 9].fold(Tree.Leaf, insert)
+  print("{to_list(tree)} {depth(tree)} {tree}")
+  let words: Tree<String> = Tree.Node(Tree.Leaf, name, Tree.Node(Tree.Leaf, "z", Tree.Leaf))
+  print("{to_list(words)} {depth(words)}")
+  print("{apply_twice(double, 3)} {apply_twice(shout, name)} {apply_twice(|x| x + 5, 0)}")
+  let inc_then_double = compose(|x| x + 1, double)
+  let count_then_shout = compose(|s| "{s}".len(), |n| "{n}!")
+  print("{inc_then_double(4)} {count_then_shout(name)}")
+  each(["a", "b"], |s| print("item {s}"))
+  each([1, 2, 3], |n| print("number {n * n}"))
+  let none: List<Int> = []
+  print("{first_or([7, 8], 0)} {first_or(none, 3)} {first_or([name], shout(name))} {repeat(name, 3)} {repeat(7, 2)} {repeat(none, 2)}")
+
+  // リストのメソッド
+  let xs = [3, 1, 2]
+  let ws = ["pear", "apple", "fig"]
+  print("{xs.concat([9, 8])} {none.concat(xs)} {xs.concat(none)} {ws.concat([name])} {xs.reverse()} {ws.reverse()} {none.reverse()}")
+  print("{xs.sort()} {ws.sort()} {[5, 3, 9, 1, 7, 3, 8, 2, 0, 6, 4, 3].sort()} {none.sort()} {xs} {ws}")
+  let sep = ", "
+  print("{ws.join(sep)} / {ws.sort().join(name)} / [{[name].join(sep)}] [{ws.filter(|w| w.len() > 9).join(sep)}]")
+  print("{xs.contains(2)} {xs.contains(5)} {ws.contains(name)} {ws.concat([name]).contains(name)} {xs.is_empty()} {none.is_empty()} {ws.filter(|w| w.len() > 9).is_empty()}")
+  print(xs.map(|x| "<{x}>").join(sep))
+}

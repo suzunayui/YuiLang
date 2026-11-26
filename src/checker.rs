@@ -90,6 +90,9 @@ struct Checker {
     /// literal or variable, by span.
     record_exprs: bool,
     expr_types: Vec<((usize, usize), Type)>,
+    /// For each call of (or reference to) a generic function, by span: the
+    /// types of its type parameters, in the order of the declaration.
+    call_types: Vec<((usize, usize), Vec<Type>)>,
     /// Operand type of every arithmetic and comparison expression, by span.
     op_types: Vec<((usize, usize), Type)>,
     /// Position of the field read by every field access, by span.
@@ -121,6 +124,7 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
         decl_types: Vec::new(),
         record_exprs: RECORD_EXPR_TYPES.load(std::sync::atomic::Ordering::Relaxed),
         expr_types: Vec::new(),
+        call_types: Vec::new(),
         op_types: Vec::new(),
         field_uses: Vec::new(),
     };
@@ -157,6 +161,9 @@ pub fn check(program: &Program) -> (Vec<Diagnostic>, TypeInfo) {
     }
     for (at, ty) in &c.expr_types {
         info.expr_types.insert(*at, c.show(ty));
+    }
+    for (at, types) in &c.call_types {
+        info.call_types.insert(*at, types.iter().map(|ty| c.show(ty)).collect());
     }
     info.field_index = c.field_uses.iter().copied().collect();
     (c.diags, info)
@@ -230,6 +237,14 @@ impl Checker {
     }
 
     /// Fresh inference variables for a list of type parameters.
+    /// With `record_exprs`: remembers which types a use of a generic function
+    /// gives its type parameters.
+    fn note_instance(&mut self, span: Span, params: &[String], map: &HashMap<String, Type>) {
+        if self.record_exprs && !params.is_empty() {
+            self.call_types.push(((span.start, span.end), params.iter().map(|p| map[p].clone()).collect()));
+        }
+    }
+
     fn instantiate(&mut self, params: &[String]) -> HashMap<String, Type> {
         params.iter().map(|p| (p.clone(), self.fresh())).collect()
     }
@@ -1029,6 +1044,7 @@ impl Checker {
             ExprKind::FnRef(name) => match self.fns.get(name).cloned() {
                 Some(sig) => {
                     let map = self.instantiate(&sig.type_params);
+                    self.note_instance(e.span, &sig.type_params, &map);
                     let params = sig.params.iter().map(|p| substitute(p, &map)).collect();
                     Type::Fn(params, Box::new(substitute(&sig.ret, &map)), sig.effects.clone())
                 }
@@ -1433,6 +1449,7 @@ impl Checker {
             None => match self.fns.get(name).cloned() {
                 Some(sig) => {
                     let map = self.instantiate(&sig.type_params);
+                    self.note_instance(span, &sig.type_params, &map);
                     let params: Vec<Type> = sig.params.iter().map(|p| substitute(p, &map)).collect();
                     (params, substitute(&sig.ret, &map), sig.effects)
                 }

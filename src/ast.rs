@@ -36,6 +36,9 @@ pub struct TypeInfo {
     /// expression that is not a plain literal or variable, written as in
     /// source, by span.
     pub expr_types: std::collections::HashMap<(usize, usize), String>,
+    /// Likewise only when asked for: for each use of a generic function, by
+    /// span, the types its type parameters stand for there.
+    pub call_types: std::collections::HashMap<(usize, usize), Vec<String>>,
     /// For each field access `a.b`, by span: the position of the field in its struct.
     pub field_index: std::collections::HashMap<(usize, usize), u32>,
 }

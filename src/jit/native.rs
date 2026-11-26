@@ -101,6 +101,14 @@ const FN_CODE: i32 = 8;
 const FN_FREE: i32 = 16;
 const FN_CAPTURES: i32 = 24;
 
+/// A map is laid out like a list whose items are pairs: after the count, the
+/// length and the capacity come the entries, 16 bytes each, key then value.
+const MAP_KEY: u8 = 24;
+const MAP_VALUE: u8 = 32;
+/// Kinds of generated code per map type.
+const MAP_SET: u8 = 0;
+const MAP_REMOVE: u8 = 1;
+
 /// Enum values below this are variants without fields, not addresses.
 const SMALL: i32 = 4096;
 
@@ -145,6 +153,8 @@ enum Ty {
     Enum(u32),
     /// A function value: a pointer to a counted block.
     Fn(u32),
+    /// A map: a pointer to a counted block of its entries, in the order of the keys.
+    Map(u32),
     /// The expression does not produce a value (`return`, `break`, ...).
     Never,
 }
@@ -152,7 +162,7 @@ enum Ty {
 impl Ty {
     /// Whether values of this type are counted references.
     fn heap(self) -> bool {
-        matches!(self, Ty::List(_) | Ty::Str | Ty::Struct(_) | Ty::Enum(_) | Ty::Fn(_))
+        matches!(self, Ty::List(_) | Ty::Str | Ty::Struct(_) | Ty::Enum(_) | Ty::Fn(_) | Ty::Map(_))
     }
 }
 
@@ -167,6 +177,8 @@ enum Def {
     Enum(Vec<(String, Vec<Ty>)>),
     /// The types of the parameters and of the result.
     Fn(Vec<Ty>, Ty),
+    /// The types of the keys and of the values.
+    Map(Ty, Ty),
 }
 
 /// A closure whose body is still to be compiled.
@@ -180,6 +192,8 @@ struct Closure {
     captures: Vec<(String, Ty)>,
     ret: Ty,
     body: std::rc::Rc<Expr>,
+    /// What the type parameters of the function it was written in stand for.
+    env: Vec<(String, Ty)>,
 }
 
 /// What a function to compile is made of.
@@ -223,6 +237,9 @@ enum Stub {
     Fail { label: usize, message: usize, len: usize },
     Overflow { label: usize, a: Opnd, b: Opnd, record: usize },
     Bounds { label: usize, list: u8, index: u8, record: usize },
+    /// A key that is not in a map. The message is `before`, the key (parked
+    /// in `key`) as text, and `after`: (label of the text, its length) each.
+    Missing { label: usize, key: M, ty: Ty, before: (usize, usize), after: (usize, usize) },
     /// An error whose message has one number in it, the value of a register.
     Number { label: usize, value: u8, record: usize },
     /// A violated `requires` or `ensures`. `header` is the first line of the
@@ -246,6 +263,13 @@ struct Native<'a> {
     fns: HashMap<String, FnInfo>,
     structs: HashMap<String, &'a StructDecl>,
     enums: HashMap<String, &'a EnumDecl>,
+    /// Functions with type parameters. Each is compiled once per combination
+    /// of types it is used with; `instances` are the ones still to compile:
+    /// the name in `fns`, the function, and what its type parameters stand for.
+    generics: HashMap<String, Rc<FnDecl>>,
+    instances: Vec<(String, Rc<FnDecl>, Vec<(String, Ty)>)>,
+    /// What the type parameters of the function being compiled stand for.
+    env: Vec<(String, Ty)>,
     /// The numbered types, the type each name stands for (`Option<Int>`), and the names.
     defs: Vec<Def>,
     def_ids: HashMap<String, Ty>,
@@ -264,6 +288,9 @@ struct Native<'a> {
     eq_labels: HashMap<u32, usize>,
     repr_labels: HashMap<u32, usize>,
     text_queue: Vec<(bool, u32)>,
+    /// Generated code per map type: `set` and `remove` (see `MAP_SET`).
+    map_labels: HashMap<(u8, u32), usize>,
+    map_queue: Vec<(u8, u32)>,
     rt_number: usize,
     rt_contract: usize,
     /// Whether those two are needed.
@@ -366,6 +393,9 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         fns,
         structs: HashMap::new(),
         enums: HashMap::new(),
+        generics: HashMap::new(),
+        instances: Vec::new(),
+        env: Vec::new(),
         defs: Vec::new(),
         def_ids: HashMap::new(),
         def_keys: Vec::new(),
@@ -377,6 +407,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         eq_labels: HashMap::new(),
         repr_labels: HashMap::new(),
         text_queue: Vec::new(),
+        map_labels: HashMap::new(),
+        map_queue: Vec::new(),
         rt_number,
         rt_contract,
         uses_errors: false,
@@ -467,7 +499,9 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             continue;
         }
         if !f.type_params.is_empty() {
-            return unsupported("generic functions", f.name_span);
+            // Compiled when used, once per combination of types.
+            n.generics.insert(f.name.clone(), f.clone());
+            continue;
         }
         let mut params = Vec::new();
         for p in &f.params {
@@ -511,7 +545,11 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     // Whatever the functions needed: closures (which may need more in turn),
     // and code generated per type.
     loop {
-        if let Some(closure) = n.closures.pop() {
+        if let Some((key, f, env)) = n.instances.pop() {
+            n.env = env;
+            n.function(&f, &key)?;
+        } else if let Some(closure) = n.closures.pop() {
+            n.env = closure.env.clone();
             n.closure(closure)?;
         } else if let Some((push, id)) = n.glue_queue.pop() {
             if push {
@@ -521,6 +559,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
             }
         } else if let Some(id) = n.clone_queue.pop() {
             n.emit_clone(id);
+        } else if let Some((kind, id)) = n.map_queue.pop() {
+            n.emit_map(kind, id);
         } else if let Some((text, id)) = n.text_queue.pop() {
             if text {
                 n.emit_repr(id);
@@ -597,6 +637,12 @@ fn binds(pat: &Pattern, decls: &mut Decls) {
 fn weigh(e: &Expr, depth: u32, weight: &mut HashMap<String, usize>, decls: &mut Decls) {
     match &e.kind {
         ExprKind::Field(base, ..) | ExprKind::Try(base) => weigh(base, depth, weight, decls),
+        ExprKind::MapLit(entries) => {
+            for (key, value) in entries {
+                weigh(key, depth, weight, decls);
+                weigh(value, depth, weight, decls);
+            }
+        }
         ExprKind::StructLit { fields, .. } => {
             for (_, _, value) in fields {
                 weigh(value, depth, weight, decls);
@@ -846,7 +892,7 @@ impl Native<'_> {
     /// One more owner for the value in `reg`.
     fn retain(&mut self, reg: u8, ty: Ty) {
         match ty {
-            Ty::List(_) | Ty::Struct(_) | Ty::Fn(_) => self.a.inc_mem(M(reg, 0)),
+            Ty::List(_) | Ty::Struct(_) | Ty::Fn(_) | Ty::Map(_) => self.a.inc_mem(M(reg, 0)),
             Ty::Enum(_) if self.plain_enum(ty) => {}
             Ty::Enum(_) => {
                 // A variant without fields is a small number, not a block.
@@ -874,7 +920,7 @@ impl Native<'_> {
             Ty::Str => self.call_rt("str_release"),
             Ty::List(_) if !self.item_ty(ty).heap() => self.call_rt("list_release"),
             Ty::Enum(_) if self.plain_enum(ty) => {}
-            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) => {
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) | Ty::Map(id) => {
                 let label = self.glue(false, id);
                 self.call_label(label);
             }
@@ -972,6 +1018,24 @@ impl Native<'_> {
                 self.a.bind(end);
             }
             Def::Fn(..) => {}
+            Def::Map(k, v) => {
+                let (top, end) = (self.a.label(), self.a.label());
+                self.a.mov_imm64(RSI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RSI, M(RBX, LENGTH));
+                self.a.jcc(CC_GE, end);
+                if k.heap() {
+                    self.entry(0x8B, RCX, RBX, RSI, MAP_KEY);
+                    self.drop_value(k);
+                }
+                if v.heap() {
+                    self.entry(0x8B, RCX, RBX, RSI, MAP_VALUE);
+                    self.drop_value(v);
+                }
+                self.a.alu_imm(0, RSI, 1);
+                self.a.jmp(top);
+                self.a.bind(end);
+            }
             Def::List(item) => {
                 let (top, end) = (self.a.label(), self.a.label());
                 self.a.mov_imm64(RSI, 0);
@@ -1032,14 +1096,49 @@ impl Native<'_> {
     // ---- types ----
 
     fn ty_expr(&mut self, t: &TypeExpr) -> R<Ty> {
-        self.ty_text(&t.to_string(), &[], t.span)
+        let env = self.env.clone();
+        self.ty_text(&t.to_string(), &env, t.span)
+    }
+
+    /// The name in `fns` of the function `name` as used at `span`. For a
+    /// generic function that is the instance for the types it is used with
+    /// there, which is registered (and queued for compiling) if it is new.
+    fn fn_key(&mut self, name: &str, span: Span) -> R<String> {
+        let Some(f) = self.generics.get(name).cloned() else { return Ok(name.to_string()) };
+        let types = self.types;
+        let Some(texts) = types.call_types.get(&(span.start, span.end)) else {
+            return unsupported(format!("this use of the generic function `{name}`"), span);
+        };
+        let env = self.env.clone();
+        let mut args = Vec::new();
+        for text in texts {
+            args.push(self.ty_text(text, &env, span)?);
+        }
+        let key = format!("{name}<{}>", args.iter().map(|ty| self.ty_key(*ty)).collect::<Vec<_>>().join(", "));
+        if !self.fns.contains_key(&key) {
+            let inner: Vec<(String, Ty)> = f.type_params.iter().cloned().zip(args).collect();
+            let mut params = Vec::new();
+            for p in &f.params {
+                params.push(self.ty_text(&p.ty.to_string(), &inner, p.span)?);
+            }
+            let ret = match &f.ret {
+                Some(t) => self.ty_text(&t.to_string(), &inner, t.span)?,
+                None => Ty::Unit,
+            };
+            let label = self.a.label();
+            let contracts = !f.requires.is_empty() || !f.ensures.is_empty();
+            self.fns.insert(key.clone(), FnInfo { label, params, ret, contracts });
+            self.instances.push((key.clone(), f, inner));
+        }
+        Ok(key)
     }
 
     /// The type the checker found for `e`.
     fn expr_ty(&mut self, e: &Expr) -> R<Ty> {
         let types = self.types;
+        let env = self.env.clone();
         match types.expr_types.get(&(e.span.start, e.span.end)) {
-            Some(text) => self.ty_text(text, &[], e.span),
+            Some(text) => self.ty_text(text, &env, e.span),
             None => unsupported("an expression whose type is not known", e.span),
         }
     }
@@ -1168,6 +1267,12 @@ impl Native<'_> {
         let id = self.defs.len() as u32;
         match (name, args) {
             ("List", [item]) => return Ok(self.define(key, Ty::List(id), Def::List(*item))),
+            ("Map", [k, v]) => {
+                if !matches!(k, Ty::Int | Ty::Str | Ty::Bool) {
+                    return unsupported("a Map with keys of this type", span);
+                }
+                return Ok(self.define(key, Ty::Map(id), Def::Map(*k, *v)));
+            }
             ("Option", [some]) => {
                 let variants = vec![("None".to_string(), vec![]), ("Some".to_string(), vec![*some])];
                 return Ok(self.define(key, Ty::Enum(id), Def::Enum(variants)));
@@ -1225,7 +1330,7 @@ impl Native<'_> {
             Ty::Unit => "Unit".to_string(),
             Ty::Str => "String".to_string(),
             Ty::Never => "Never".to_string(),
-            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) => self.def_keys[id as usize].clone(),
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Fn(id) | Ty::Map(id) => self.def_keys[id as usize].clone(),
         }
     }
 
@@ -1277,7 +1382,7 @@ impl Native<'_> {
         match &self.defs[id as usize] {
             Def::Struct(fields) => Some(8 + 8 * fields.len()),
             Def::Enum(variants) => Some(16 + 8 * variants.iter().map(|(_, fields)| fields.len()).max().unwrap_or(0)),
-            Def::List(_) | Def::Fn(..) => None,
+            Def::List(_) | Def::Fn(..) | Def::Map(..) => None,
         }
     }
 
@@ -1742,6 +1847,25 @@ impl Native<'_> {
                         self.a.load(*r, *slot);
                     }
                     self.a.jmp(back);
+                }
+                Stub::Missing { label, key, ty, before, after } => {
+                    self.a.bind(label);
+                    self.lea_label(RCX, before.0);
+                    self.a.mov_imm64(RDX, before.1 as i64);
+                    self.a.mov_imm64(R8, STDERR);
+                    self.call_label(self.rt_write);
+                    self.a.mov_imm64(RCX, 32);
+                    self.call_rt("str_new");
+                    self.a.mov_rr(RCX, RAX);
+                    self.a.load(RDX, key);
+                    self.repr_call(ty);
+                    self.a.lea(RCX, M(RAX, ELEMENTS));
+                    self.a.load(RDX, M(RAX, LENGTH));
+                    self.a.mov_imm64(R8, STDERR);
+                    self.call_label(self.rt_write);
+                    self.lea_label(RCX, after.0);
+                    self.a.mov_imm64(RDX, after.1 as i64);
+                    self.call_label(self.rt_fail);
                 }
                 Stub::Number { label, value, record } => {
                     self.a.bind(label);
@@ -2490,7 +2614,7 @@ impl Native<'_> {
 
     /// The label of the generated code that copies a value of type `ty`.
     fn clone_label(&mut self, ty: Ty) -> usize {
-        let (Ty::List(id) | Ty::Struct(id)) = ty else { return self.rt_fail };
+        let (Ty::List(id) | Ty::Struct(id) | Ty::Map(id)) = ty else { return self.rt_fail };
         self.uses_heap = true;
         if let Some(label) = self.clone_labels.get(&id) {
             return *label;
@@ -2540,6 +2664,28 @@ impl Native<'_> {
                 self.a.jmp(top);
                 self.a.bind(done);
             }
+            Def::Map(k, v) => {
+                let (top, done) = (self.a.label(), self.a.label());
+                self.a.load(RCX, M(RBX, LENGTH));
+                self.call_rt("map_new");
+                self.a.load(RSI, M(RBX, LENGTH));
+                self.a.store(M(RAX, LENGTH), RSI);
+                // The new map is kept in r9: reaching an entry uses rax.
+                self.a.mov_rr(R9, RAX);
+                self.a.mov_imm64(RCX, 0);
+                self.a.bind(top);
+                self.a.alu_rr(0x39, RCX, RSI);
+                self.a.jcc(CC_GE, done);
+                for (at, ty) in [(MAP_KEY, k), (MAP_VALUE, v)] {
+                    self.entry(0x8B, R8, RBX, RCX, at);
+                    self.retain(R8, ty);
+                    self.entry(0x89, R8, R9, RCX, at);
+                }
+                self.a.alu_imm(0, RCX, 1);
+                self.a.jmp(top);
+                self.a.bind(done);
+                self.a.mov_rr(RAX, R9);
+            }
             _ => {}
         }
         self.a.alu_imm(0, RSP, 40);
@@ -2579,6 +2725,27 @@ impl Native<'_> {
         let var = self.lookup(name, root.span)?;
         if var.borrowed {
             return unsupported("assigning into a value that is only borrowed", target.span);
+        }
+
+        // `map[key] = value`: the variable hands its map to `set` and gets the result.
+        if let ([Step::Index(key, _)], Ty::Map(id)) = (&steps[..], var.ty) {
+            let t = self.take_temp(target.span)?;
+            let held = self.pending.len();
+            let key_ty = self.eval(key, t)?;
+            let k = self.push_spill();
+            self.a.store(k, t);
+            self.hold(k, key_ty);
+            self.eval(value, t)?;
+            self.pending.truncate(held);
+            self.a.mov_rr(R8, t);
+            self.a.load(RDX, k);
+            self.spill_depth -= 1;
+            self.free.push(t);
+            self.load_loc(RCX, var.loc);
+            let set = self.map_label(MAP_SET, id);
+            self.call_label(set);
+            self.store_loc(var.loc, RAX);
+            return Ok(());
         }
 
         // The usual cases without leaving the registers: a plain value stored
@@ -2998,6 +3165,56 @@ impl Native<'_> {
                 self.spill_depth -= 1;
                 Ok(ty)
             }
+            ExprKind::MapLit(entries) => {
+                let ty = self.expr_ty(e)?;
+                let Ty::Map(id) = ty else { return unsupported("this map", e.span) };
+                self.a.mov_imm64(RCX, entries.len() as i64);
+                self.call_rt("map_new");
+                let slot = self.push_spill();
+                self.a.store(slot, RAX);
+                let held = self.pending.len();
+                self.hold(slot, ty);
+                for (key, value) in entries {
+                    let inner = self.pending.len();
+                    let key_ty = self.eval(key, dst)?;
+                    let k = self.push_spill();
+                    self.a.store(k, dst);
+                    self.hold(k, key_ty);
+                    self.eval(value, dst)?;
+                    self.pending.truncate(inner);
+                    self.a.mov_rr(R8, dst);
+                    self.a.load(RDX, k);
+                    self.a.load(RCX, slot);
+                    self.spill_depth -= 1;
+                    let set = self.map_label(MAP_SET, id);
+                    self.call_label(set);
+                    self.a.store(slot, RAX);
+                }
+                self.pending.truncate(held);
+                self.a.load(dst, slot);
+                self.spill_depth -= 1;
+                Ok(ty)
+            }
+            ExprKind::Index(map, key) if matches!(self.recv_ty(map), Ok(Ty::Map(_))) => {
+                // `map[key]`: the value, which must be there.
+                let (m, m_owned, key_slot, key_owned, ty) = self.map_find(map, key, dst)?;
+                let (key_ty, value_ty) = self.map_def(ty);
+                let d = Diagnostic::new("E0507", "key \u{1} is not in the map", e.span)
+                    .hint("use `.get(key)` to receive an Option, or check with `.has(key)`");
+                let text = self.error_text(&d);
+                let (before, after) = text.split_once('\u{1}').unwrap_or((&text, ""));
+                let before = (self.constant(before.as_bytes()), before.len());
+                let after = (self.constant(after.as_bytes()), after.len());
+                let label = self.a.label();
+                self.stubs.push(Stub::Missing { label, key: key_slot, ty: key_ty, before, after });
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_L, label);
+                self.a.load(RCX, m);
+                self.entry(0x8B, dst, RCX, RAX, MAP_VALUE);
+                self.retain(dst, value_ty);
+                self.map_done(m, m_owned, key_slot, key_owned, ty, dst);
+                Ok(value_ty)
+            }
             ExprKind::Index(list, index) => {
                 if let Some(list_ty @ Ty::List(_)) = self.path_ty(list) {
                     // Read in place: the variable keeps the list alive.
@@ -3145,12 +3362,15 @@ impl Native<'_> {
                 self.lea_label(RAX, free);
                 self.a.store(M(dst, FN_FREE), RAX);
                 let params = params.iter().zip(&param_tys).map(|(p, ty)| (p.name.clone(), p.span.start, *ty)).collect();
-                self.closures.push(Closure { code, free, bytes, params, captures: captured, ret, body: body.clone() });
+                let env = self.env.clone();
+                self.closures.push(Closure { code, free, bytes, params, captures: captured, ret, body: body.clone(), env });
                 Ok(ty)
             }
             ExprKind::FnRef(name) => {
                 // A function used as a value: a block with nothing captured,
                 // whose code passes the arguments on to the function.
+                let key = self.fn_key(name, e.span)?;
+                let name = &key;
                 let Some(info) = self.fns.get(name) else {
                     return unsupported(format!("the function `{name}` as a value"), e.span);
                 };
@@ -3491,7 +3711,7 @@ impl Native<'_> {
         if self.in_runtime && name.starts_with("__") && name != "__copy" {
             return self.intrinsic(name, args, dst, span);
         }
-        let key = if self.in_runtime { format!("%{name}") } else { name.to_string() };
+        let key = if self.in_runtime { format!("%{name}") } else { self.fn_key(name, span)? };
         if self.in_runtime {
             self.need_rt(name);
         }
@@ -3699,7 +3919,7 @@ impl Native<'_> {
                                 self.a.load(RAX, building);
                             }
                         }
-                        Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) => {
+                        Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_) => {
                             self.a.load(RCX, building);
                             self.a.load(RDX, slot);
                             self.repr_call(ty);
@@ -3851,7 +4071,7 @@ impl Native<'_> {
     /// A method call. Which methods there are depends on the receiver.
     fn method(&mut self, e: &Expr, recv: &Expr, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
         match (self.recv_ty(recv)?, name, args) {
-            (ty @ (Ty::List(_) | Ty::Struct(_) | Ty::Enum(_)), "to_string", []) => {
+            (ty @ (Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_)), "to_string", []) => {
                 self.eval(recv, dst)?;
                 let slot = self.push_spill();
                 self.a.store(slot, dst);
@@ -3871,7 +4091,43 @@ impl Native<'_> {
                 self.int_method(e, recv, name, name_span, args, dst)
             }
             (Ty::List(_), ..) => self.list_method(e, recv, name, name_span, args, dst),
+            (ty @ Ty::Map(_), ..) => self.map_method(e, recv, ty, name, name_span, args, dst),
             (ty @ Ty::Enum(_), ..) => self.enum_method(recv, ty, name, name_span, args, dst),
+            (Ty::Str, "to_lower" | "to_upper", []) => {
+                // Only the letters a-z and A-Z are converted here; text with
+                // anything else beyond ASCII is refused, not converted wrongly.
+                let d = Diagnostic::new(
+                    "E0902",
+                    format!("`{name}` on text outside ASCII is not supported by `--native` yet"),
+                    e.span,
+                );
+                let stub = self.fail_stub(d);
+                let (slot, owned, _) = self.park(recv, dst)?;
+                self.a.load(RCX, slot);
+                self.call_rt("str_is_ascii");
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_Z, stub);
+                self.a.load(RCX, slot);
+                self.a.mov_imm64(RDX, if name == "to_lower" { 65 } else { 97 });
+                self.call_rt("str_shift_case");
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.a.store(slot, RAX);
+                    self.call_rt("str_release");
+                    self.a.load(RAX, slot);
+                }
+                self.spill_depth -= 1;
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Str)
+            }
+            (Ty::Str, "split", [_]) | (Ty::Str, "chars", []) => {
+                let result = self.expr_ty(e)?;
+                let left = self.park(recv, dst)?;
+                let routine = if name == "split" { "str_split" } else { "str_chars_list" };
+                self.rt_op(routine, left, args.first(), None, None, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(result)
+            }
             (Ty::Str, "to_string", []) => self.eval(recv, dst),
             (Ty::Int, "to_string", []) => {
                 self.eval(recv, dst)?;
@@ -3906,6 +4162,268 @@ impl Native<'_> {
                 Ok(result)
             }
             _ => unsupported(format!("the method `{name}` here"), name_span),
+        }
+    }
+
+    /// `mov reg, [map + index * 16 + at]` (0x8B) or the store the other way
+    /// (0x89): the key or the value of the entry at `index`. Uses rax, so
+    /// `reg` and `map` must be other registers; `index` may be rax.
+    fn entry(&mut self, opcode: u8, reg: u8, map: u8, index: u8, at: u8) {
+        self.mov(RAX, index);
+        self.a.buf.extend_from_slice(&[0x48, 0xC1, 0xE0, 0x04]); // shl rax, 4
+        self.a.b(0x48 | (reg >> 3) << 2 | (map >> 3));
+        self.a.b(opcode);
+        self.a.b(0x44 | (reg & 7) << 3);
+        self.a.b(map & 7);
+        self.a.b(at);
+    }
+
+    fn map_def(&self, ty: Ty) -> (Ty, Ty) {
+        match ty {
+            Ty::Map(id) => match &self.defs[id as usize] {
+                Def::Map(k, v) => (*k, *v),
+                _ => (Ty::Never, Ty::Never),
+            },
+            _ => (Ty::Never, Ty::Never),
+        }
+    }
+
+    /// The label of generated code for the map type `id` (see `MAP_SET`).
+    fn map_label(&mut self, kind: u8, id: u32) -> usize {
+        self.uses_heap = true;
+        if let Some(label) = self.map_labels.get(&(kind, id)) {
+            return *label;
+        }
+        let label = self.a.label();
+        self.map_labels.insert((kind, id), label);
+        self.map_queue.push((kind, id));
+        label
+    }
+
+    /// `set(rcx = map, rdx = key, r8 = value) -> rax` and `remove(rcx = map,
+    /// rdx = key) -> rax` for one map type. Both take over the map and give
+    /// back the changed one; `set` takes over the key and the value too.
+    fn emit_map(&mut self, kind: u8, id: u32) {
+        let (key_ty, value_ty) = self.map_def(Ty::Map(id));
+        let (unique, absent, done) = (self.a.label(), self.a.label(), self.a.label());
+        self.a.bind(self.map_labels[&(kind, id)]);
+        self.a.push(RBX);
+        self.a.push(RSI);
+        self.a.push(RDI);
+        self.a.alu_imm(5, RSP, 32);
+        self.a.mov_rr(RBX, RCX);
+        self.a.mov_rr(RSI, RDX);
+        self.a.mov_rr(RDI, R8);
+        // A map that is shared is copied first; the other owners keep theirs.
+        self.a.cmp_imm(M(RBX, 0), 1);
+        self.a.jcc(CC_E, unique);
+        self.a.mov_rr(RCX, RBX);
+        let clone = self.clone_label(Ty::Map(id));
+        self.call_label(clone);
+        self.a.dec_mem(M(RBX, 0));
+        self.a.mov_rr(RBX, RAX);
+        self.a.bind(unique);
+        self.a.mov_rr(RCX, RBX);
+        self.a.mov_rr(RDX, RSI);
+        self.a.mov_imm64(R8, (key_ty == Ty::Str) as i64);
+        self.call_rt("map_find");
+        self.a.alu_rr(0x85, RAX, RAX);
+        self.a.jcc(CC_L, absent);
+        if kind == MAP_SET {
+            // The key is there: the value is replaced; the old value and the
+            // key that was passed are given up.
+            self.a.mov_rr(RCX, RBX);
+            self.a.mov_rr(RDX, RAX);
+            self.a.mov_rr(R8, RDI);
+            self.call_rt("map_swap");
+            if value_ty.heap() {
+                self.a.mov_rr(RCX, RAX);
+                self.drop_value(value_ty);
+            }
+            if key_ty.heap() {
+                self.a.mov_rr(RCX, RSI);
+                self.drop_value(key_ty);
+            }
+            self.a.mov_rr(RAX, RBX);
+            self.a.jmp(done);
+            // Not there: -1 - (where it belongs) came back.
+            self.a.bind(absent);
+            self.a.buf.extend_from_slice(&[0x48, 0xF7, 0xD0]); // not rax
+            self.a.mov_rr(RCX, RBX);
+            self.a.mov_rr(RDX, RAX);
+            self.a.mov_rr(R8, RSI);
+            self.a.mov_rr(R9, RDI);
+            self.call_rt("map_insert");
+        } else {
+            // The entry's key and value are given up, then the entry is closed over.
+            self.a.mov_rr(RDI, RAX);
+            if key_ty.heap() {
+                self.entry(0x8B, RCX, RBX, RDI, MAP_KEY);
+                self.drop_value(key_ty);
+            }
+            if value_ty.heap() {
+                self.entry(0x8B, RCX, RBX, RDI, MAP_VALUE);
+                self.drop_value(value_ty);
+            }
+            self.a.mov_rr(RCX, RBX);
+            self.a.mov_rr(RDX, RDI);
+            self.call_rt("map_close");
+            self.a.bind(absent);
+            self.a.mov_rr(RAX, RBX);
+        }
+        self.a.bind(done);
+        self.a.alu_imm(0, RSP, 32);
+        self.a.pop(RDI);
+        self.a.pop(RSI);
+        self.a.pop(RBX);
+        self.a.b(0xC3);
+    }
+
+    /// If `e` is `map.get(key)` on a map: the map and the key.
+    fn map_get<'e>(&mut self, e: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+        match &e.kind {
+            ExprKind::MethodCall { recv, name, args, .. } if name == "get" && args.len() == 1 => {
+                matches!(self.recv_ty(recv), Ok(Ty::Map(_))).then_some((&**recv, &args[0]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Looks `key` up in `map`: parks both (see `park`) and leaves in rax
+    /// the index of the entry, or a negative number if there is none.
+    fn map_find(&mut self, map: &Expr, key: &Expr, dst: u8) -> R<(M, bool, M, bool, Ty)> {
+        let (m, m_owned, ty) = self.park(map, dst)?;
+        let held = self.pending.len();
+        if m_owned {
+            self.hold(m, ty);
+        }
+        let (k, k_owned, _) = self.park(key, dst)?;
+        self.pending.truncate(held);
+        let (key_ty, _) = self.map_def(ty);
+        self.a.load(RCX, m);
+        self.a.load(RDX, k);
+        self.a.mov_imm64(R8, (key_ty == Ty::Str) as i64);
+        self.call_rt("map_find");
+        Ok((m, m_owned, k, k_owned, ty))
+    }
+
+    /// After `map_find`: gives up what was parked and frees the slots, without losing `keep`.
+    fn map_done(&mut self, m: M, m_owned: bool, k: M, k_owned: bool, ty: Ty, keep: u8) {
+        let (key_ty, _) = self.map_def(ty);
+        if k_owned && key_ty.heap() {
+            self.a.load(RCX, k);
+            self.release_keeping(keep, key_ty);
+        }
+        if m_owned {
+            self.a.load(RCX, m);
+            self.release_keeping(keep, ty);
+        }
+        self.spill_depth -= 2;
+    }
+
+    /// A method of a map.
+    #[allow(clippy::too_many_arguments)]
+    fn map_method(&mut self, e: &Expr, recv: &Expr, ty: Ty, name: &str, name_span: Span, args: &[Expr], dst: u8) -> R<Ty> {
+        let Ty::Map(id) = ty else { return unsupported("this method", name_span) };
+        let (key_ty, value_ty) = self.map_def(ty);
+        match (name, args) {
+            ("len" | "is_empty", []) => {
+                let (slot, owned, _) = self.park(recv, dst)?;
+                self.a.load(dst, M(dst, LENGTH));
+                if name == "is_empty" {
+                    self.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+                    self.a.alu_rr(0x85, dst, dst);
+                    self.a.buf.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                    self.a.mov_rr(dst, RAX);
+                }
+                if owned {
+                    self.a.load(RCX, slot);
+                    self.release_keeping(dst, ty);
+                }
+                self.spill_depth -= 1;
+                Ok(if name == "len" { Ty::Int } else { Ty::Bool })
+            }
+            ("has", [key]) => {
+                let (m, m_owned, k, k_owned, _) = self.map_find(recv, key, dst)?;
+                // Found if the index is not negative.
+                self.a.buf.extend_from_slice(&[0x48, 0xC1, 0xE8, 0x3F]); // shr rax, 63
+                self.a.buf.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
+                self.a.mov_rr(dst, RAX);
+                self.map_done(m, m_owned, k, k_owned, ty, dst);
+                Ok(Ty::Bool)
+            }
+            ("get", [key]) => {
+                let result = self.expr_ty(e)?;
+                let (m, m_owned, k, k_owned, _) = self.map_find(recv, key, dst)?;
+                let (none, done) = (self.a.label(), self.a.label());
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_L, none);
+                self.a.load(RCX, m);
+                self.entry(0x8B, dst, RCX, RAX, MAP_VALUE);
+                self.retain(dst, value_ty);
+                let value = self.push_spill();
+                self.a.store(value, dst);
+                self.fill_block(self.size_of(result), &[(value, 16)], dst);
+                self.a.store_imm(M(dst, 8), 1);
+                self.spill_depth -= 1;
+                self.a.jmp(done);
+                self.a.bind(none);
+                self.a.mov_imm64(dst, 0);
+                self.a.bind(done);
+                self.map_done(m, m_owned, k, k_owned, ty, dst);
+                Ok(result)
+            }
+            ("set", [key, value]) => {
+                // The map, the key and the value all go to `set`.
+                let held = self.pending.len();
+                self.eval(recv, dst)?;
+                let m = self.push_spill();
+                self.a.store(m, dst);
+                self.hold(m, ty);
+                self.eval(key, dst)?;
+                let k = self.push_spill();
+                self.a.store(k, dst);
+                self.hold(k, key_ty);
+                self.eval(value, dst)?;
+                self.pending.truncate(held);
+                self.a.mov_rr(R8, dst);
+                self.a.load(RDX, k);
+                self.a.load(RCX, m);
+                self.spill_depth -= 2;
+                let set = self.map_label(MAP_SET, id);
+                self.call_label(set);
+                self.a.mov_rr(dst, RAX);
+                Ok(ty)
+            }
+            ("remove", [key]) => {
+                let held = self.pending.len();
+                self.eval(recv, dst)?;
+                let m = self.push_spill();
+                self.a.store(m, dst);
+                self.hold(m, ty);
+                let (k, k_owned, _) = self.park(key, dst)?;
+                self.pending.truncate(held);
+                self.a.load(RDX, k);
+                self.a.load(RCX, m);
+                let remove = self.map_label(MAP_REMOVE, id);
+                self.call_label(remove);
+                self.a.mov_rr(dst, RAX);
+                if k_owned && key_ty.heap() {
+                    self.a.load(RCX, k);
+                    self.release_keeping(dst, key_ty);
+                }
+                self.spill_depth -= 2;
+                Ok(ty)
+            }
+            ("keys" | "values", []) => {
+                let result = self.expr_ty(e)?;
+                let left = self.park(recv, dst)?;
+                let (routine, item) = if name == "keys" { ("map_keys", key_ty) } else { ("map_values", value_ty) };
+                self.rt_op(routine, left, None, None, Some(item), dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(result)
+            }
+            _ => unsupported(format!("the method `{name}` of a Map"), name_span),
         }
     }
 
@@ -3960,12 +4478,12 @@ impl Native<'_> {
 
     /// Whether values of this type are compared and written part by part.
     fn deep(&self, ty: Ty) -> bool {
-        matches!(ty, Ty::List(_) | Ty::Struct(_)) || (matches!(ty, Ty::Enum(_)) && !self.plain_enum(ty))
+        matches!(ty, Ty::List(_) | Ty::Struct(_) | Ty::Map(_)) || (matches!(ty, Ty::Enum(_)) && !self.plain_enum(ty))
     }
 
     /// The label of the generated code that compares two values of type `ty`.
     fn eq_label(&mut self, ty: Ty) -> usize {
-        let (Ty::List(id) | Ty::Struct(id) | Ty::Enum(id)) = ty else { return self.rt_fail };
+        let (Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Map(id)) = ty else { return self.rt_fail };
         self.uses_heap = true;
         if let Some(label) = self.eq_labels.get(&id) {
             return *label;
@@ -4090,6 +4608,23 @@ impl Native<'_> {
                 self.a.alu_imm(0, RDI, 1);
                 self.a.jmp(top);
             }
+            Def::Map(k, v) => {
+                let top = self.a.label();
+                self.a.load(RAX, M(RBX, LENGTH));
+                self.a.alu_m(0x3B, RAX, M(RSI, LENGTH));
+                self.a.jcc(CC_NE, differ);
+                self.a.mov_imm64(RDI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RDI, M(RBX, LENGTH));
+                self.a.jcc(CC_GE, equal);
+                for (at, ty) in [(MAP_KEY, k), (MAP_VALUE, v)] {
+                    self.entry(0x8B, RCX, RBX, RDI, at);
+                    self.entry(0x8B, RDX, RSI, RDI, at);
+                    self.eq_values(ty, differ);
+                }
+                self.a.alu_imm(0, RDI, 1);
+                self.a.jmp(top);
+            }
             Def::Fn(..) => self.a.jmp(differ),
         }
         self.a.bind(equal);
@@ -4126,7 +4661,7 @@ impl Native<'_> {
                 self.a.bind(done);
                 self.call_rt("str_append");
             }
-            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) => {
+            Ty::List(id) | Ty::Struct(id) | Ty::Enum(id) | Ty::Map(id) => {
                 self.uses_heap = true;
                 let label = match self.repr_labels.get(&id) {
                     Some(label) => *label,
@@ -4239,6 +4774,39 @@ impl Native<'_> {
                 self.a.bind(end);
                 self.repr_text("]", RBX);
             }
+            Def::Map(k, v) => {
+                let (top, first, end, empty, done) =
+                    (self.a.label(), self.a.label(), self.a.label(), self.a.label(), self.a.label());
+                self.a.cmp_imm(M(RSI, LENGTH), 0);
+                self.a.jcc(CC_E, empty);
+                self.repr_text("Map { ", RBX);
+                self.a.mov_rr(RBX, RAX);
+                self.a.mov_imm64(RDI, 0);
+                self.a.bind(top);
+                self.a.alu_m(0x3B, RDI, M(RSI, LENGTH));
+                self.a.jcc(CC_GE, end);
+                self.a.alu_rr(0x85, RDI, RDI);
+                self.a.jcc(CC_Z, first);
+                self.repr_text(", ", RBX);
+                self.a.mov_rr(RBX, RAX);
+                self.a.bind(first);
+                self.a.mov_rr(RCX, RBX);
+                self.entry(0x8B, RDX, RSI, RDI, MAP_KEY);
+                self.repr_call(k);
+                self.repr_text(": ", RAX);
+                self.a.mov_rr(RCX, RAX);
+                self.entry(0x8B, RDX, RSI, RDI, MAP_VALUE);
+                self.repr_call(v);
+                self.a.mov_rr(RBX, RAX);
+                self.a.alu_imm(0, RDI, 1);
+                self.a.jmp(top);
+                self.a.bind(end);
+                self.repr_text(" }", RBX);
+                self.a.jmp(done);
+                self.a.bind(empty);
+                self.repr_text("Map {}", RBX);
+                self.a.bind(done);
+            }
             Def::Fn(..) => self.repr_text("<closure>", RBX),
         }
         self.a.alu_imm(0, RSP, 32);
@@ -4280,6 +4848,40 @@ impl Native<'_> {
                 self.a.mov_rr(dst, RAX);
                 Ok(Ty::Bool)
             }
+            ("unwrap_or", [default]) if self.map_get(recv).is_some() => {
+                // `map.get(key).unwrap_or(default)`: the value is taken
+                // straight from the map, without making a `Some` in between.
+                let Some((map, key)) = self.map_get(recv) else { return unsupported("this call", name_span) };
+                let (m, m_owned, k, k_owned, map_ty) = self.map_find(map, key, dst)?;
+                let found = self.push_spill();
+                self.a.store(found, RAX);
+                let held = self.pending.len();
+                if m_owned {
+                    self.hold(m, map_ty);
+                }
+                if k_owned {
+                    let (key_ty, _) = self.map_def(map_ty);
+                    self.hold(k, key_ty);
+                }
+                self.eval(default, dst)?;
+                self.pending.truncate(held);
+                let done = self.a.label();
+                self.a.load(RAX, found);
+                self.a.alu_rr(0x85, RAX, RAX);
+                self.a.jcc(CC_L, done);
+                if value_ty.heap() {
+                    self.a.mov_rr(RCX, dst);
+                    self.drop_value(value_ty);
+                }
+                self.a.load(RCX, m);
+                self.a.load(RAX, found);
+                self.entry(0x8B, dst, RCX, RAX, MAP_VALUE);
+                self.retain(dst, value_ty);
+                self.a.bind(done);
+                self.spill_depth -= 1;
+                self.map_done(m, m_owned, k, k_owned, map_ty, dst);
+                Ok(value_ty)
+            }
             ("unwrap_or", [default]) => {
                 let (slot, owned, _) = self.park(recv, dst)?;
                 // The default is an argument, so it is evaluated either way.
@@ -4319,6 +4921,60 @@ impl Native<'_> {
             }
             _ => unsupported(format!("the method `{name}` here"), name_span),
         }
+    }
+
+    /// Calls `routine` of the runtime on the parked value `left` (see
+    /// `park`) and, if given, `right` or the fixed number `extra`; the result
+    /// is left in rax. With `fresh`, the result is a new list that holds
+    /// items of that type taken from the arguments, which it must count.
+    /// Frees the slots and gives up owned references.
+    fn rt_op(
+        &mut self,
+        routine: &str,
+        left: (M, bool, Ty),
+        right: Option<&Expr>,
+        extra: Option<i64>,
+        fresh: Option<Ty>,
+        dst: u8,
+    ) -> R<()> {
+        let mut second = None;
+        if let Some(right) = right {
+            let held = self.pending.len();
+            if left.1 {
+                self.hold(left.0, left.2);
+            }
+            second = Some(self.park(right, dst)?);
+            self.pending.truncate(held);
+        }
+        self.a.load(RCX, left.0);
+        match (second, extra) {
+            (Some((slot, ..)), _) => self.a.load(RDX, slot),
+            (None, Some(n)) => self.a.mov_imm64(RDX, n),
+            _ => {}
+        }
+        self.call_rt(routine);
+        if let Some(item) = fresh.filter(|item| item.heap()) {
+            let (top, done) = (self.a.label(), self.a.label());
+            self.a.mov_imm64(RCX, 0);
+            self.a.bind(top);
+            self.a.alu_m(0x3B, RCX, M(RAX, LENGTH));
+            self.a.jcc(CC_GE, done);
+            self.element(0x8B, RDX, RAX, RCX);
+            self.retain(RDX, item);
+            self.a.alu_imm(0, RCX, 1);
+            self.a.jmp(top);
+            self.a.bind(done);
+        }
+        for (slot, owned, ty) in [Some(left), second].into_iter().flatten() {
+            if owned && ty.heap() {
+                self.a.load(RCX, slot);
+                self.a.store(slot, RAX);
+                self.drop_value(ty);
+                self.a.load(RAX, slot);
+            }
+        }
+        self.spill_depth -= 1 + second.is_some() as i32;
+        Ok(())
     }
 
     /// A method of a list.
@@ -4393,6 +5049,33 @@ impl Native<'_> {
                     self.release_keeping(dst, list_ty);
                 }
                 self.spill_depth -= 1;
+                Ok(result)
+            }
+            ("is_empty", []) => {
+                self.list_method(e, recv, "len", name_span, args, dst)?;
+                self.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+                self.a.alu_rr(0x85, dst, dst);
+                self.a.buf.extend_from_slice(&[0x0F, 0x94, 0xC0]); // sete al
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Bool)
+            }
+            ("concat" | "reverse" | "sort" | "join" | "contains", _) => {
+                let left = self.park(recv, dst)?;
+                let item = self.item_ty(left.2);
+                // The routine, a fixed second argument if it takes one, and
+                // whether the result is a new list of the same items.
+                let (routine, extra, fresh, result) = match (name, args.len(), item) {
+                    ("concat", 1, _) => ("list_concat", None, true, left.2),
+                    ("reverse", 0, _) => ("list_reversed", None, true, left.2),
+                    ("sort", 0, Ty::Int) => ("list_sorted", Some(0), true, left.2),
+                    ("sort", 0, Ty::Str) => ("list_sorted", Some(1), true, left.2),
+                    ("join", 1, Ty::Str) => ("list_join", None, false, Ty::Str),
+                    ("contains", 1, Ty::Int | Ty::Bool) => ("list_contains", None, false, Ty::Bool),
+                    ("contains", 1, Ty::Str) => ("list_contains_str", None, false, Ty::Bool),
+                    _ => return unsupported(format!("the method `{name}` on this list"), name_span),
+                };
+                self.rt_op(routine, left, args.first(), extra, fresh.then_some(item), dst)?;
+                self.a.mov_rr(dst, RAX);
                 Ok(result)
             }
             ("map" | "filter" | "any" | "all", [f]) => self.list_loop(e, recv, name, name_span, None, f, dst),
@@ -4721,7 +5404,7 @@ impl Native<'_> {
                 }
                 self.spill_depth -= 1;
             }
-            Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) => {
+            Ty::List(_) | Ty::Struct(_) | Ty::Enum(_) | Ty::Map(_) => {
                 // Written out as text first.
                 let slot = self.push_spill();
                 self.a.store(slot, t);

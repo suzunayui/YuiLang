@@ -379,3 +379,28 @@ Sieve の内訳（2 万回分）は、リストを作る 58 ms、読む 48 ms、
 まだ対応していないもの: ジェネリックな関数、`Map`、`Float`、`assert`、`panic`、`join` / `sort` / `reverse` /
 `contains` / `concat` / `slice` などのリストのメソッド、`trim` / `split` / `to_int` などの文字列のメソッド、
 `to_char`、関数値の引数 4 個以上、ファイル入出力とコマンドライン引数。
+
+## 19. 段階 5 の後半: ジェネリックな関数、Map、残りのメソッド（2026-11-26、Windows x64）
+
+`examples/` の `main` のあるもの 10 本中 9 本が、ネイティブで `yui run` と同じ出力になります。
+残りは `tour` で、`Float` を使うためです。
+
+入れたもの:
+
+- **ジェネリックな関数**: 使われた型の組み合わせごとに、別の関数として機械語にします（`id<Int>` と `id<String>` は別物）。
+  どの型で使われたかは、型チェッカが呼び出しごとに渡します。ジェネリックな関数の中から別のジェネリックな関数を呼ぶ場合も、
+  外側の型引数を当てはめてから実体を決めます。
+- **Map**: キーは `Int` / `String` / `Bool`。`[参照カウント][件数][容量]` のあとに `[キー][値]` をキーの昇順で並べ、二分探索で引きます。
+  `Map { .. }`、`m[k]`、`m[k] = v`、`get` / `has` / `set` / `remove` / `keys` / `values` / `len` / `is_empty`、表示、`==`。
+  値として扱うので、共有されている Map を書き換えるときは複製します。部品は `runtime.yui` に YuiLang で書いてあります。
+- **リストのメソッド**: `is_empty`、`concat`、`reverse`、`sort`（`Int` と `String`、ヒープソート）、`join`、`contains`（`Int` / `Bool` / `String`）。
+- **文字列のメソッド**: `split`、`chars`、`to_lower` / `to_upper`。
+  `to_lower` / `to_upper` は a〜z と A〜Z だけを変換します。ASCII 以外の文字を含む文字列に使うと、
+  `yui run` と違う結果を黙って出す代わりに、その旨を表示して止まります。
+
+`Map` を使うベンチマーク（40 万回の `counts[key] = counts.get(key).unwrap_or(0) + 1`、キーは 5,003 種類）は、
+`--native` 61 ms、Rust 17 ms、`yui run` 89 ms です。`m.get(k).unwrap_or(d)` は `Some` の入れ物を作らずに値を直接読みますが、
+1 回の更新で二分探索を 2 回行う（読むときと書くとき）のが残っています。
+
+まだ対応していないもの: `Float`、`assert`、`panic`、リストの `slice`、文字列の `trim` / `replace` / `slice` / `codes` / `to_int`、
+`to_char`、関数値の引数 4 個以上、ファイル入出力、コマンドライン引数、`read_line`、複数ファイル（`import`）。

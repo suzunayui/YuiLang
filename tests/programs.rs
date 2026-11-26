@@ -349,7 +349,7 @@ fn native_executables_match_yui_run() {
     let refused = out_dir.join("refused.exe");
     let result = Command::new(yui)
         .args(["build", "--native"])
-        .arg(root().join("examples/collections.yui"))
+        .arg(root().join("examples/tour.yui"))
         .arg("-o")
         .arg(&refused)
         .output()

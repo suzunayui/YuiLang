@@ -1,0 +1,7 @@
+fn main() uses io {
+  let ages = Map { "yui": 3, "mio": 5 }
+  let name = "yui"
+  print("{ages[name]}")
+  let other = "who \"else\""
+  print("{ages[other]}")
+}
