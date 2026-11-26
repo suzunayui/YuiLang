@@ -111,6 +111,8 @@ $ yui build games/blocks.yui -o blocks.exe  45 KB の実行ファイルにする
 
 - [games/square.yui](games/square.yui): 四角を矢印キーで動かす、いちばん小さな例
 - [games/blocks.yui](games/blocks.yui): 横から見たブロックの世界。歩く・跳ぶ・掘る・置く
+- [games/blocks3d.yui](games/blocks3d.yui): 3 次元のブロックの世界。歩き回って、壊したり置いたりできる。
+  計算が多いので `yui build` で実行ファイルにしてから遊ぶ（63 KB、1 秒に約 76 コマ）
 
 使える関数は [SPEC.md](SPEC.md) の「ウィンドウ・入力・時刻・乱数」にあります。
 
