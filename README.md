@@ -56,7 +56,7 @@ yui check   <file> [--json]              型チェック（import したモジ�
 yui run     <file> [--json] [-- 引数...]  main を実行
 yui test    <file> [--json]              test ブロックを実行
 yui fmt     <file> [--check]             整形して上書き
-yui build   <file> [-o <出力>]            単体の実行ファイルを作る
+yui build   <file> [-o <出力>]            単体の実行ファイルを作る（--native / --bundle で方式を指定）
 yui outline <file>                       宣言のシグネチャだけを表示
 ```
 
@@ -81,18 +81,25 @@ x64（Windows / Linux / Intel Mac）では、プログラムを機械語に変�
 プログラムは単体の実行ファイルにできます。`yui` を入れていない環境にも、この1ファイルだけで配れます。
 
 ```
-$ yui build examples/hello.yui -o hello
-built: hello (914 KB)
+$ yui build examples/hello.yui -o hello.exe
+built: hello.exe (3584 bytes, native)
 
-$ ./hello
+$ ./hello.exe
 result: 5
 error: division by zero
 ```
 
-実験的な機能として、`--native` を付けると、インタプリタを含まない実行ファイルを機械語から直接作れます。
-いまは Windows x64 が対象で、[examples](examples) のプログラムはすべてこの方法でビルドできます（数 KB〜十数 KB になります）。
-まだ対応していない機能（文字列から小数への変換など、ごく一部）を使うプログラムは、その旨を表示して断ります。
-設計と進み具合は [docs/native-backend.md](docs/native-backend.md) にあります。
+Windows x64 では、プログラムを機械語に変換して、インタプリタを含まない実行ファイルを直接書き出します
+（数 KB〜十数 KB）。コード生成も実行ファイルの書き出しも自前で、外部のコンパイラやリンカは使いません。
+
+次の場合は、`yui` 自身にプログラムを同梱した実行ファイルになります（約 1.3 MB）。動作は同じです。
+
+- Windows x64 以外（Linux、macOS）
+- 機械語への変換がまだ対応していない機能を使うプログラム（文字列から小数への変換など、ごく一部）。
+  このときは、理由を1行表示してから同梱方式でビルドします
+
+`--native` を付けると、同梱方式に切り替える代わりにエラーにします。`--bundle` を付けると、常に同梱方式にします。
+設計と実測は [docs/native-backend.md](docs/native-backend.md) にあります。
 
 エラーは修正のヒント付きで表示されます。
 

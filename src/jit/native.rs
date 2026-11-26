@@ -1844,9 +1844,10 @@ impl Native<'_> {
         label
     }
 
-    /// The text `yui run` prints for a runtime error.
+    /// The text an executable made by `yui build` prints for a runtime
+    /// error, whichever way it was built.
     fn error_text(&self, d: &Diagnostic) -> String {
-        format!("{}\n1 error(s)\n", render_human(d, self.sources))
+        format!("{}\n", render_human(d, self.sources))
     }
 
     /// Reserves code that reports a fixed error and returns its label. The

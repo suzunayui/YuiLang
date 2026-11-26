@@ -25,9 +25,12 @@ Usage:
                                       run `main`; arguments after `--` are returned by args()
   yui test    <file> [--json]         run the `test` blocks of a file
   yui fmt     <file> [--check]        format a file in place (--check: only report)
-  yui build   <file> [-o <output>]    make a stand-alone executable of the program
-              [--native]              (experimental) compile to machine code, without
-                                      the interpreter; Windows x64, Int and Bool only
+  yui build   <file> [-o <output>]    make a stand-alone executable of the program:
+                                      machine code on Windows x64 (a few KB), otherwise
+                                      this interpreter with the program inside
+              [--native]              fail instead of bundling the interpreter when
+                                      the program cannot be compiled to machine code
+              [--bundle]              always bundle the interpreter
   yui outline <file>                  print declarations without bodies
   yui --version                       print the version
 
@@ -60,6 +63,7 @@ struct Options {
     root: Option<String>,
     out: Option<String>,
     native: bool,
+    bundle: bool,
     program_args: Vec<String>,
 }
 
@@ -157,11 +161,11 @@ fn run_embedded(units: Vec<SourceUnit>) -> i32 {
     }
 }
 
-/// `yui build --native`: compiles the program to machine code and writes an
-/// executable that contains no interpreter. Only part of the language is
-/// supported so far; see `docs/native-backend.md`.
+/// Compiles the program to machine code and writes an executable that
+/// contains no interpreter. `Err` says what in the program the native
+/// compiler cannot handle yet, and where; nothing is written then.
 #[cfg(all(windows, target_arch = "x86_64"))]
-fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
+fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> Result<i32, Option<(String, yuilang::diag::Span)>> {
     let source = Path::new(&opts.file);
     let name = source.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "main.yui".to_string());
     // Runtime errors name the files relative to the program, as in a bundled
@@ -173,16 +177,7 @@ fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
     }
     let bytes = match yuilang::jit::native::build(&loaded.program, &sources) {
         Ok(bytes) => bytes,
-        Err(reason) => {
-            let d = Diagnostic::new(
-                "E0902",
-                format!("the native compiler does not support {} yet", reason.what),
-                reason.span,
-            )
-            .hint("build without `--native` to bundle the interpreter instead");
-            eprintln!("{}", render_human(&d, &loaded.sources));
-            return 1;
-        }
+        Err(reason) => return Err(Some((reason.what, reason.span))),
     };
     let out = match &opts.out {
         Some(out) => out.clone(),
@@ -190,23 +185,42 @@ fn build_native(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
     };
     if let Err(e) = std::fs::write(&out, &bytes) {
         eprintln!("cannot write `{}`: {e}", out.replace('\\', "/"));
-        return 2;
+        return Ok(2);
     }
     println!("built: {} ({} bytes, native)", out.replace('\\', "/"), bytes.len());
-    0
+    Ok(0)
 }
 
+/// No native compiler for this platform yet.
 #[cfg(not(all(windows, target_arch = "x86_64")))]
-fn build_native(_loaded: &yuilang::Loaded, _opts: &Options) -> i32 {
-    eprintln!("`--native` is only available on Windows x64 so far");
-    1
+fn build_native(_loaded: &yuilang::Loaded, _opts: &Options) -> Result<i32, Option<(String, yuilang::diag::Span)>> {
+    Err(None)
 }
 
-/// Writes a copy of this executable with the program appended.
+/// `yui build`: makes a stand-alone executable. Machine code where that is
+/// possible; otherwise (another platform, or a program that uses something
+/// the native compiler does not handle yet) a copy of this executable with
+/// the program appended, which behaves the same and is larger.
 fn build(loaded: &yuilang::Loaded, opts: &Options) -> i32 {
     use std::io::Write;
-    if opts.native {
-        return build_native(loaded, opts);
+    if !opts.bundle {
+        match build_native(loaded, opts) {
+            Ok(code) => return code,
+            Err(Some((what, span))) if opts.native => {
+                let d = Diagnostic::new("E0902", format!("the native compiler does not support {what} yet"), span)
+                    .hint("build without `--native` to bundle the interpreter instead");
+                eprintln!("{}", render_human(&d, &loaded.sources));
+                return 1;
+            }
+            Err(None) if opts.native => {
+                eprintln!("`--native` is only available on Windows x64 so far");
+                return 1;
+            }
+            Err(Some((what, _))) => {
+                eprintln!("note: bundling the interpreter, because the native compiler does not support {what} yet");
+            }
+            Err(None) => {}
+        }
     }
     let source = Path::new(&opts.file);
     // Store file names relative to the program, not as paths on this machine.
@@ -255,6 +269,7 @@ fn parse_args() -> Option<Options> {
         root: None,
         out: None,
         native: false,
+        bundle: false,
         program_args: Vec::new(),
     };
     while let Some(arg) = args.next() {
@@ -264,6 +279,7 @@ fn parse_args() -> Option<Options> {
             "--root" => opts.root = Some(args.next()?),
             "-o" | "--output" => opts.out = Some(args.next()?),
             "--native" => opts.native = true,
+            "--bundle" => opts.bundle = true,
             "--" => {
                 opts.program_args = args.collect();
                 break;
@@ -328,7 +344,8 @@ fn real_main() -> i32 {
     let json_to_stdout = opts.cmd != "run";
     let root = opts.root.as_deref().map(Path::new);
     // The native compiler works from the types of all expressions.
-    yuilang::checker::RECORD_EXPR_TYPES.store(opts.native, std::sync::atomic::Ordering::Relaxed);
+    let native = opts.cmd == "build" && !opts.bundle && cfg!(all(windows, target_arch = "x86_64"));
+    yuilang::checker::RECORD_EXPR_TYPES.store(native, std::sync::atomic::Ordering::Relaxed);
     let loaded = match yuilang::load_path(Path::new(&opts.file), root) {
         Ok(l) => l,
         Err((diags, sources)) => {

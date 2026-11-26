@@ -306,8 +306,9 @@ fn selfhosted_parser_matches_the_rust_parser() {
     });
 }
 
-/// `yui build --native` must produce executables that behave exactly like
-/// `yui run`: same output, same error text, same exit code.
+/// The two ways `yui build` makes an executable must agree: machine code
+/// (the default here) and the interpreter with the program inside (`--bundle`)
+/// print the same, fail with the same text, and exit with the same code.
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[test]
 fn native_executables_match_yui_run() {
@@ -321,19 +322,23 @@ fn native_executables_match_yui_run() {
         let name = path.file_name().unwrap();
         let exe = out_dir.join(path.file_stem().unwrap()).with_extension("exe");
         // Both run from the program's directory, so error messages name the file the same way.
-        let expected = Command::new(yui).current_dir(&dir).arg("run").arg(name).output().unwrap();
+        let bundled = out_dir.join("bundled.exe");
+        let built = Command::new(yui).current_dir(&dir).args(["build", "--bundle"]).arg(name).arg("-o").arg(&bundled).output().unwrap();
+        assert!(built.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&built.stderr));
+        let expected = Command::new(&bundled).output().unwrap();
         // Built to count its heap blocks: one that is still allocated when `main`
         // returns is reported on stderr, which then differs from `yui run`.
         let built = Command::new(yui)
             .current_dir(&dir)
             .env("YUI_NATIVE_CHECK_HEAP", "1")
-            .args(["build", "--native"])
+            .arg("build")
             .arg(name)
             .arg("-o")
             .arg(&exe)
             .output()
             .unwrap();
         assert!(built.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&built.stderr));
+        assert!(String::from_utf8_lossy(&built.stdout).contains("native"), "{} was not compiled to machine code", path.display());
         let actual = Command::new(&exe).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout), "{}", path.display());
         assert_eq!(String::from_utf8_lossy(&actual.stderr), String::from_utf8_lossy(&expected.stderr), "{}", path.display());
@@ -357,6 +362,19 @@ fn native_executables_match_yui_run() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("E0902"));
     assert!(!refused.exists());
+
+    // Without `--native`, such a program is still built: with the interpreter inside.
+    let result = Command::new(yui)
+        .arg("build")
+        .arg(root().join("tests/refused/to_float.yui"))
+        .arg("-o")
+        .arg(&refused)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("note: bundling the interpreter"));
+    let ran = Command::new(&refused).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "Some(3.5)\n");
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 /// Standard input, command-line arguments and files: the native executable
