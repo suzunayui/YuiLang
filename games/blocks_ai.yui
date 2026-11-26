@@ -25,6 +25,8 @@ import json
 // ユイにしてもらうこと
 struct Plan {
   say: String,
+  // 建てるものの短い名前（建てないなら空）
+  title: String,
   // 集めるブロックの種類と数（集めないなら 0 個）
   collect_kind: Int,
   collect_count: Int,
@@ -77,6 +79,7 @@ fn system_prompt() -> String {
     "",
     "返事は JSON で、次の項目を持ちます。",
     "- say: プレイヤーへのひとこと（プレイヤーと同じ言語で、40 文字以内）。",
+    "- title: 建てるものの短い名前（例: お城、赤い屋根のおうち）。プレイヤーと同じ言語で、12 文字以内。建てないときは空の文字列。",
     "- collect_kind と collect_count: 集めてくるブロックの種類と数。集めないときは \"none\" と 0。",
     "  集められるのは dirt（土）、stone（石）、wood（木の幹）、leaves（葉）。数は 1 から 40 まで。",
     "- build: 建てるものを、部品の並びで表します。建てないときは空の並び。",
@@ -134,14 +137,14 @@ fn schema() -> String {
   let shapes = quoted(shape_names())
   let number = "\{\"type\":\"integer\"}"
   let parts = [
-    "\{\"type\":\"object\",\"properties\":\{\"say\":\{\"type\":\"string\"}",
+    "\{\"type\":\"object\",\"properties\":\{\"say\":\{\"type\":\"string\"},\"title\":\{\"type\":\"string\"}",
     "\"collect_kind\":\{\"type\":\"string\",\"enum\":[\"none\",\"dirt\",\"stone\",\"wood\",\"leaves\"]}",
     "\"collect_count\":{number}",
     "\"build\":\{\"type\":\"array\",\"items\":\{\"type\":\"object\",\"properties\":\{\"shape\":\{\"type\":\"string\",\"enum\":[{shapes}]}",
     "\"kind\":\{\"type\":\"string\",\"enum\":[{kinds}]}",
     "\"x1\":{number},\"y1\":{number},\"z1\":{number},\"x2\":{number},\"y2\":{number},\"z2\":{number}}",
     "\"required\":[\"shape\",\"kind\",\"x1\",\"y1\",\"z1\",\"x2\",\"y2\",\"z2\"],\"additionalProperties\":false}}}",
-    "\"required\":[\"say\",\"collect_kind\",\"collect_count\",\"build\"],\"additionalProperties\":false}",
+    "\"required\":[\"say\",\"title\",\"collect_kind\",\"collect_count\",\"build\"],\"additionalProperties\":false}",
   ]
   parts.join(",")
 }
@@ -164,6 +167,7 @@ fn plan_from(reply: String) -> Result<Plan, String> {
   let count = json.int_of(json.get(v, "collect_count")).max(0).min(40)
   Ok(Plan {
     say: json.text_of(json.get(v, "say")),
+    title: json.text_of(json.get(v, "title")),
     collect_kind: collect_kind,
     collect_count: if collect_kind >= 1 && collect_kind <= 4 { count } else { 0 },
     boxes: boxes,
@@ -226,7 +230,7 @@ fn canned_castle() -> String {
     parts = parts.push(part_text("cone", "roof_blue", x, 11, z, x + 4, 15, z + 4))
   }
   let joined = parts.join(",")
-  "\{\"say\":\"りっぱなお城、建てるね！\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
+  "\{\"say\":\"りっぱなお城、建てるね！\",\"title\":\"お城\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
 }
 
 // API キーがないときの、決まった返事
@@ -253,12 +257,12 @@ fn canned(request: String) -> String {
       box_text("pink", 5, 0, 0, 5, 0, 0),
     ]
     let joined = boxes.join(",")
-    return "\{\"say\":\"かわいいおうち、建てるね！\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
+    return "\{\"say\":\"かわいいおうち、建てるね！\",\"title\":\"おうち\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
   }
   if request.contains("木") || request.contains("wood") {
-    return "\{\"say\":\"木を集めてくるね！\",\"collect_kind\":\"wood\",\"collect_count\":12,\"build\":[]}"
+    return "\{\"say\":\"木を集めてくるね！\",\"title\":\"\",\"collect_kind\":\"wood\",\"collect_count\":12,\"build\":[]}"
   }
-  "\{\"say\":\"API キーがないから、木集めと、おうち・お城作りだけ手伝えるよ\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
+  "\{\"say\":\"API キーがないから、木集めと、おうち・お城作りだけ手伝えるよ\",\"title\":\"\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
 }
 
 // ---- してもらうことを、ブロック 1 つずつの作業に直す ----
@@ -680,6 +684,10 @@ fn main() uses io, net {
   let mut escape_held = false
   let mut draft = ""
   let mut request = 0
+  // 料金（円）: 起動してからの合計、いま建てているものの分とその名前
+  let mut total_cost = 0.0
+  let mut built_cost = 0.0
+  let mut built_title = ""
   let mut placed = 0
   let mut broken = 0
   // 置いたブロックの場所の合計（動作確認のとき、建てたものが見える所へ視点を移すのに使う）
@@ -749,12 +757,27 @@ fn main() uses io, net {
 
     // ---- 返事が届いたら、作業に直す ----
     if request != 0 && http_done(request) {
-      match claude.answer(http_result(request)) {
+      let result = http_result(request)
+      // この 1 回にかかった料金（円）
+      let cost = match result {
+        Ok(raw) => claude.cost_yen(raw)
+        Err(_) => 0.0
+      }
+      total_cost = total_cost + cost
+      match claude.answer(result) {
         Ok(reply) => {
           match plan_from(reply) {
             Ok(plan) => {
-              log = log.push("ユイ: {plan.say}")
-              jobs = jobs.concat(jobs_for(world, plan, p, fx, fz))
+              let added = jobs_for(world, plan, p, fx, fz)
+              if added.is_empty() || plan.title.is_empty() {
+                // 建てないとき（おしゃべりや木集め）は、その場で料金を添える
+                log = log.push("ユイ: {plan.say}（{claude.yen_text(cost)} 円くらい）")
+              } else {
+                log = log.push("ユイ: {plan.say}")
+                built_title = plan.title
+                built_cost = cost
+              }
+              jobs = jobs.concat(added)
             }
             Err(why) => {
               log = log.push("（返事を読めなかった: {why}）")
@@ -925,7 +948,12 @@ fn main() uses io, net {
       if job >= jobs.len() {
         jobs = []
         job = 0
-        log = log.push("ユイ: できたよ！")
+        if built_cost > 0.0 {
+          log = log.push("ユイ: できたよ！ {built_title}を建てるのに {claude.yen_text(built_cost)} 円くらいかかったよ（これまでの合計 {claude.yen_text(total_cost)} 円くらい）")
+          built_cost = 0.0
+        } else {
+          log = log.push("ユイ: できたよ！")
+        }
       }
     }
 
