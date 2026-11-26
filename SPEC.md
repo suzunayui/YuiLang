@@ -277,6 +277,44 @@ fn parse_pair(a: String, b: String) -> Option<Int> {
 | `write_file(path, text)` | `(String, String) -> Result<Unit, String> uses fs` |
 | `panic(msg)` | `(String) -> Never` |
 
+**ウィンドウ・入力・時刻・乱数**（いまは Windows だけ。ほかの OS では `window_open` が実行時エラーになる）
+
+| 関数 | 型と意味 |
+| --- | --- |
+| `window_open(title, width, height, scale)` | `(String, Int, Int, Int) -> Unit uses io`。横 `width` × 縦 `height` の点（画素）を持つウィンドウを開く。1 点は画面上で `scale` 倍の大きさに表示される |
+| `window_update()` | `() -> Bool uses io`。描いた内容を表示し、ウィンドウへの操作を取り込む。ウィンドウが閉じられたら `false` |
+| `window_close()` | `() -> Unit uses io` |
+| `draw_clear(color)` | `(Int) -> Unit uses io`。全体を 1 色で塗る |
+| `draw_pixel(x, y, color)` | `(Int, Int, Int) -> Unit uses io`。左上が `(0, 0)`。範囲の外は無視する |
+| `draw_rect(x, y, width, height, color)` | `(Int, Int, Int, Int, Int) -> Unit uses io`。長方形を塗る（はみ出した部分は無視） |
+| `rgb(r, g, b)` | `(Int, Int, Int) -> Int`。色。各成分は 0〜255 に切り詰める |
+| `key_down(key)` | `(String) -> Bool uses io`。そのキーが押されているか。`"a"`〜`"z"`、`"0"`〜`"9"`、`"left"` `"right"` `"up"` `"down"` `"space"` `"enter"` `"escape"` `"shift"` `"ctrl"` `"tab"`。知らない名前は `false` |
+| `mouse_x()`, `mouse_y()` | `() -> Int uses io`。マウスの位置（点の単位）。ウィンドウがなければ `-1` |
+| `mouse_down(button)` | `(Int) -> Bool uses io`。0 = 左、1 = 右、2 = 中 |
+| `time_ms()` | `() -> Int uses io`。経過時間（ミリ秒）。差を取って使う |
+| `sleep_ms(ms)` | `(Int) -> Unit uses io`。指定した時間だけ待つ |
+| `random(limit)` | `(Int) -> Int uses io`。0 以上 `limit` 未満の乱数（`limit` が 0 以下なら 0） |
+| `random_seed(seed)` | `(Int) -> Unit uses io`。乱数の種を決める。同じ種なら同じ並びになる |
+
+描画は、ウィンドウの持つ点の表に色を書き込むだけで、`window_update()` を呼んだときに画面に出る。
+キーとマウスは、そのウィンドウが手前にあるときだけ反応する。ゲームの基本の形:
+
+```
+fn main() uses io {
+  window_open("game", 160, 120, 4)
+  let mut x = 76
+  let mut running = true
+  while running {
+    if key_down("left") { x = x - 1 }
+    if key_down("right") { x = x + 1 }
+    draw_clear(rgb(20, 20, 40))
+    draw_rect(x, 56, 8, 8, rgb(240, 200, 60))
+    if !window_update() || key_down("escape") { running = false }
+    sleep_ms(16)
+  }
+}
+```
+
 ### メソッド
 
 すべての型: `to_string() -> String`

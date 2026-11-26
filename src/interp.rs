@@ -1430,7 +1430,54 @@ impl<'a> Interp<'a> {
                         .map_err(|e| format!("cannot write `{path}`: {e}")),
                 ))
             }
-            _ => Err(internal(span)),
+            // The window, input, the clock and random numbers (see `window.rs`).
+            _ => {
+                use crate::window;
+                let int = |i: usize| match args.get(i) {
+                    Some(Value::Int(n)) => *n,
+                    _ => 0,
+                };
+                let name_of = |i: usize| args.get(i).map(|v| v.display()).unwrap_or_default();
+                Ok(match name {
+                    "window_open" => match window::open(&name_of(0), int(1), int(2), int(3)) {
+                        Ok(()) => Value::Unit,
+                        Err(why) => return Err(panic("E0510", why, span)),
+                    },
+                    "window_update" => Value::Bool(window::update()),
+                    "window_close" => {
+                        window::close();
+                        Value::Unit
+                    }
+                    "draw_clear" => {
+                        window::clear(int(0));
+                        Value::Unit
+                    }
+                    "draw_pixel" => {
+                        window::pixel(int(0), int(1), int(2));
+                        Value::Unit
+                    }
+                    "draw_rect" => {
+                        window::rect(int(0), int(1), int(2), int(3), int(4));
+                        Value::Unit
+                    }
+                    "rgb" => Value::Int(window::rgb(int(0), int(1), int(2))),
+                    "key_down" => Value::Bool(window::key_down(&name_of(0))),
+                    "mouse_x" => Value::Int(window::mouse(0)),
+                    "mouse_y" => Value::Int(window::mouse(1)),
+                    "mouse_down" => Value::Bool(window::mouse_down(int(0))),
+                    "time_ms" => Value::Int(window::time_ms()),
+                    "sleep_ms" => {
+                        window::sleep_ms(int(0));
+                        Value::Unit
+                    }
+                    "random" => Value::Int(window::random(int(0))),
+                    "random_seed" => {
+                        window::random_seed(int(0));
+                        Value::Unit
+                    }
+                    _ => return Err(internal(span)),
+                })
+            }
         }
     }
 

@@ -7,7 +7,30 @@
 use crate::diag::Span;
 use std::rc::Rc;
 
-pub const BUILTIN_FNS: &[&str] = &["print", "read_line", "panic", "read_file", "write_file", "args"];
+pub const BUILTIN_FNS: &[&str] = &[
+    "print",
+    "read_line",
+    "panic",
+    "read_file",
+    "write_file",
+    "args",
+    // A window to draw in, input, the clock and random numbers.
+    "window_open",
+    "window_update",
+    "window_close",
+    "draw_clear",
+    "draw_pixel",
+    "draw_rect",
+    "rgb",
+    "key_down",
+    "mouse_x",
+    "mouse_y",
+    "mouse_down",
+    "time_ms",
+    "sleep_ms",
+    "random",
+    "random_seed",
+];
 pub const BUILTIN_TYPES: &[&str] =
     &["Int", "Float", "Bool", "String", "Unit", "List", "Option", "Result", "Map"];
 pub const EFFECTS: &[&str] = &["io", "fs"];

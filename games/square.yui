@@ -1,0 +1,62 @@
+// 四角を矢印キーで動かす。Esc か、ウィンドウを閉じると終わる。
+// 引数に数を渡すと、そのコマ数だけ動かして自動で終わる（動作確認用）:
+//   yui run games/square.yui -- 120
+
+fn limit_from(xs: List<String>) -> Int {
+  match xs.first() {
+    Some(text) => text.to_int().unwrap_or(0)
+    None => 0
+  }
+}
+
+fn main() uses io {
+  let width = 160
+  let height = 120
+  let limit = limit_from(args())
+  window_open("YuiLang: square", width, height, 4)
+  let sky = rgb(40, 60, 110)
+  let ground = rgb(70, 140, 60)
+  let player = rgb(240, 200, 60)
+  let mut x = 76
+  let mut y = 56
+  let mut frame = 0
+  let mut running = true
+  while running {
+    if key_down("left") {
+      x = x - 2
+    }
+    if key_down("right") {
+      x = x + 2
+    }
+    if key_down("up") {
+      y = y - 2
+    }
+    if key_down("down") {
+      y = y + 2
+    }
+    if limit > 0 {
+      // 自動で動かす: 右へ進み、端で折り返す
+      x = frame * 2 % (width - 8)
+    }
+    x = x.max(0).min(width - 8)
+    y = y.max(0).min(height - 28)
+
+    draw_clear(sky)
+    draw_rect(0, height - 20, width, 20, ground)
+    // 星: 毎コマ同じ場所に出るよう、種を固定する
+    random_seed(7)
+    for i in 0..40 {
+      draw_pixel(random(width), random(height - 30), rgb(255, 255, 255))
+    }
+    draw_rect(x, y, 8, 8, player)
+    if mouse_down(0) { draw_rect(mouse_x() - 2, mouse_y() - 2, 4, 4, rgb(255, 80, 80)) }
+
+    frame = frame + 1
+    if !window_update() || key_down("escape") || limit > 0 && frame >= limit {
+      running = false
+    }
+    sleep_ms(16)
+  }
+  window_close()
+  print("frames: {frame}")
+}

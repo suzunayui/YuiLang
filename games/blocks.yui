@@ -1,0 +1,193 @@
+// 横から見たブロックの世界。土・石・木を掘ったり置いたりできる。
+//
+//   A / D または ← / →   歩く
+//   スペース または W / ↑  跳ぶ
+//   マウスの左ボタン       ブロックを壊す
+//   マウスの右ボタン       選んだブロックを置く
+//   1 / 2 / 3             置くブロックを選ぶ（土 / 石 / 木）
+//   Esc                   終わる
+//
+// 引数に数を渡すと、そのコマ数だけ動かして自動で終わる（動作確認用）:
+//   yui run games/blocks.yui -- 120
+
+// 世界は横 40 × 縦 30 マス。1 マスは 8 × 8 の点。
+// マスの中身: 0 = 空、1 = 土、2 = 石、3 = 木
+
+fn tile(world: List<Int>, tx: Int, ty: Int) -> Int {
+  // 世界の外は石として扱う（外へは出られない）
+  if tx < 0 || ty < 0 || tx >= 40 || ty >= 30 { return 2 }
+  world[ty * 40 + tx]
+}
+
+// 点 (x, y) が空いているか
+fn open(world: List<Int>, x: Int, y: Int) -> Bool {
+  if x < 0 || y < 0 { return false }
+  tile(world, x / 8, y / 8) == 0
+}
+
+// 左上が (x, y) の人（幅 6、高さ 14）が、どのブロックにも重ならないか
+fn fits(world: List<Int>, x: Int, y: Int) -> Bool {
+  open(world, x, y) && open(world, x + 5, y) && open(world, x, y + 7) && open(world, x + 5, y + 7) && open(world, x, y + 13) && open(world, x + 5, y + 13)
+}
+
+// なだらかな地面を作り、ところどころに木を生やす
+fn make_world(seed: Int) -> List<Int> uses io {
+  random_seed(seed)
+  let mut world = []
+  for i in 0..1200 {
+    world = world.push(0)
+  }
+  let mut height = 18
+  for tx in 0..40 {
+    height = (height + random(3) - 1).max(12).min(24)
+    for ty in height..30 {
+      world[ty * 40 + tx] = if ty > height + 3 { 2 } else { 1 }
+    }
+    if random(6) == 0 && tx > 1 && tx < 38 {
+      for k in 1..4 {
+        world[(height - k) * 40 + tx] = 3
+      }
+    }
+  }
+  world
+}
+
+fn color_of(kind: Int) -> Int {
+  match kind {
+    1 => rgb(134, 96, 67)
+    2 => rgb(128, 128, 136)
+    3 => rgb(104, 74, 40)
+    _ => rgb(120, 180, 240)
+  }
+}
+
+fn draw_world(world: List<Int>) uses io {
+  let grass = rgb(88, 160, 72)
+  let shade = rgb(0, 0, 0)
+  for ty in 0..30 {
+    for tx in 0..40 {
+      let kind = world[ty * 40 + tx]
+      if kind != 0 {
+        draw_rect(tx * 8, ty * 8, 8, 8, color_of(kind))
+        // 上が空いている土には草を生やす
+        if kind == 1 && tile(world, tx, ty - 1) == 0 { draw_rect(tx * 8, ty * 8, 8, 2, grass) }
+        if kind == 2 {
+          draw_pixel(tx * 8 + 2, ty * 8 + 5, shade)
+          draw_pixel(tx * 8 + 5, ty * 8 + 2, shade)
+        }
+      }
+    }
+  }
+}
+
+// 置くブロックの見本を左上に並べ、選んでいるものを白い枠で囲む
+fn draw_choices(selected: Int) uses io {
+  for kind in 1..4 {
+    let x = 4 + (kind - 1) * 12
+    if kind == selected { draw_rect(x - 1, 3, 10, 10, rgb(255, 255, 255)) }
+    draw_rect(x, 4, 8, 8, color_of(kind))
+  }
+}
+
+fn limit_from(xs: List<String>) -> Int {
+  match xs.first() {
+    Some(text) => text.to_int().unwrap_or(0)
+    None => 0
+  }
+}
+
+fn main() uses io {
+  let limit = limit_from(args())
+  window_open("YuiLang: blocks", 320, 240, 3)
+  let mut world = make_world(if limit > 0 { 7 } else { time_ms() })
+  let mut x = 157
+  let mut y = 8
+  let mut speed = 0
+  let mut selected = 1
+  let mut frame = 0
+  let mut running = true
+  while running {
+    // 歩く
+    let mut step = 0
+    if key_down("a") || key_down("left") {
+      step = -2
+    }
+    if key_down("d") || key_down("right") {
+      step = 2
+    }
+    if limit > 0 {
+      step = 1
+    }
+    if step != 0 && fits(world, x + step, y) {
+      x = x + step
+    }
+
+    // 跳ぶ: 足の下にブロックがあるときだけ
+    let standing = !fits(world, x, y + 1)
+    let jump = key_down("space") || key_down("w") || key_down("up") || limit > 0 && frame % 40 == 20
+    if standing && jump {
+      speed = -7
+    }
+
+    // 落ちる・上がる: 1 点ずつ動かし、ぶつかったら止まる
+    speed = (speed + 1).min(6)
+    let direction = if speed > 0 { 1 } else { -1 }
+    let mut left = speed.abs()
+    while left > 0 {
+      if fits(world, x, y + direction) {
+        y = y + direction
+        left = left - 1
+      } else {
+        speed = 0
+        left = 0
+      }
+    }
+
+    // 置くブロックを選ぶ
+    if key_down("1") {
+      selected = 1
+    }
+    if key_down("2") {
+      selected = 2
+    }
+    if key_down("3") {
+      selected = 3
+    }
+
+    // 壊す・置く
+    let tx = mouse_x() / 8
+    let ty = mouse_y() / 8
+    let inside = mouse_x() >= 0 && mouse_y() >= 0 && tx < 40 && ty < 30
+    if inside && mouse_down(0) {
+      world[ty * 40 + tx] = 0
+    }
+    if inside && mouse_down(1) && world[ty * 40 + tx] == 0 {
+      world[ty * 40 + tx] = selected
+      // 自分に重なる場所には置けない
+      if !fits(world, x, y) {
+        world[ty * 40 + tx] = 0
+      }
+    }
+
+    // 描く
+    draw_clear(rgb(120, 180, 240))
+    draw_world(world)
+    draw_rect(x, y, 6, 14, rgb(230, 80, 60))
+    draw_rect(x + 1, y + 2, 4, 3, rgb(250, 220, 190))
+    if inside {
+      draw_rect(tx * 8, ty * 8, 8, 1, rgb(255, 255, 255))
+      draw_rect(tx * 8, ty * 8 + 7, 8, 1, rgb(255, 255, 255))
+      draw_rect(tx * 8, ty * 8, 1, 8, rgb(255, 255, 255))
+      draw_rect(tx * 8 + 7, ty * 8, 1, 8, rgb(255, 255, 255))
+    }
+    draw_choices(selected)
+
+    frame = frame + 1
+    if !window_update() || key_down("escape") || limit > 0 && frame >= limit {
+      running = false
+    }
+    sleep_ms(16)
+  }
+  window_close()
+  print("frames: {frame}, position: {x}, {y}")
+}

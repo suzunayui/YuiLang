@@ -99,6 +99,21 @@ Windows x64 では、プログラムを機械語に変換して、インタプ�
 `--native` を付けると、同梱方式に切り替える代わりにエラーにします。`--bundle` を付けると、常に同梱方式にします。
 設計と実測は [docs/native-backend.md](docs/native-backend.md) にあります。
 
+### ゲームを作る
+
+ウィンドウを開いて点を描き、キーボードとマウスを読む関数が組み込みで入っています（いまは Windows だけ）。
+[games](games) に見本があります。
+
+```
+$ yui run games/blocks.yui                  その場で動かす
+$ yui build games/blocks.yui -o blocks.exe  45 KB の実行ファイルにする
+```
+
+- [games/square.yui](games/square.yui): 四角を矢印キーで動かす、いちばん小さな例
+- [games/blocks.yui](games/blocks.yui): 横から見たブロックの世界。歩く・跳ぶ・掘る・置く
+
+使える関数は [SPEC.md](SPEC.md) の「ウィンドウ・入力・時刻・乱数」にあります。
+
 エラーは修正のヒント付きで表示されます。
 
 ```

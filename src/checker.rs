@@ -1442,6 +1442,18 @@ impl Checker {
             "panic" => Some((vec![string()], Type::Never, &[])),
             "read_file" => Some((vec![string()], result(string()), &["fs"])),
             "write_file" => Some((vec![string(), string()], result(Type::Unit), &["fs"])),
+            "window_open" => Some((vec![string(), Type::Int, Type::Int, Type::Int], Type::Unit, &["io"])),
+            "window_update" => Some((vec![], Type::Bool, &["io"])),
+            "window_close" => Some((vec![], Type::Unit, &["io"])),
+            "draw_clear" => Some((vec![Type::Int], Type::Unit, &["io"])),
+            "draw_pixel" => Some((vec![Type::Int; 3], Type::Unit, &["io"])),
+            "draw_rect" => Some((vec![Type::Int; 5], Type::Unit, &["io"])),
+            "rgb" => Some((vec![Type::Int; 3], Type::Int, &[])),
+            "key_down" => Some((vec![string()], Type::Bool, &["io"])),
+            "mouse_x" | "mouse_y" | "time_ms" => Some((vec![], Type::Int, &["io"])),
+            "mouse_down" => Some((vec![Type::Int], Type::Bool, &["io"])),
+            "sleep_ms" | "random_seed" => Some((vec![Type::Int], Type::Unit, &["io"])),
+            "random" => Some((vec![Type::Int], Type::Int, &["io"])),
             _ => None,
         };
         let (params, ret, effects) = match builtin {

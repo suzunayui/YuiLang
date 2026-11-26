@@ -37,7 +37,7 @@
 //! r8-r11; rax, rcx and rdx are scratch. Functions follow the Windows x64
 //! calling convention, so they can call the operating system directly.
 
-use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_BE, CC_E, CC_G, CC_GE, CC_L, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
+use super::{condition, Asm, CC_A, CC_AE, CC_B, CC_BE, CC_E, CC_G, CC_GE, CC_L, CC_LE, CC_NE, CC_O, M, R10, R11, R12, R13, R14, R15, R8, R9, RAX, RBX, RCX, RDI, RDX, RSI};
 use crate::ast::*;
 use crate::diag::{render_human, Diagnostic, SourceMap, Span};
 use std::collections::HashMap;
@@ -64,25 +64,52 @@ const STDOUT: i64 = -11;
 const STDERR: i64 = -12;
 
 /// Functions imported from kernel32.dll, in the order of the import table.
-const IMPORTS: [&str; 13] = [
-    "GetStdHandle",
-    "WriteFile",
-    "ExitProcess",
-    "HeapAlloc",
-    "HeapFree",
-    "HeapReAlloc",
-    "ReadFile",
-    "GetCommandLineW",
-    "CreateFileW",
-    "GetFileSizeEx",
-    "CloseHandle",
-    "GetLastError",
-    "FormatMessageW",
+/// Functions of the operating system that the generated code may call: the
+/// library and the name. An executable imports the ones it actually uses.
+const IMPORTS: [(&str, &str); 37] = [
+    ("KERNEL32.dll", "GetStdHandle"),
+    ("KERNEL32.dll", "WriteFile"),
+    ("KERNEL32.dll", "ExitProcess"),
+    ("KERNEL32.dll", "HeapAlloc"),
+    ("KERNEL32.dll", "HeapFree"),
+    ("KERNEL32.dll", "HeapReAlloc"),
+    ("KERNEL32.dll", "ReadFile"),
+    ("KERNEL32.dll", "GetCommandLineW"),
+    ("KERNEL32.dll", "CreateFileW"),
+    ("KERNEL32.dll", "GetFileSizeEx"),
+    ("KERNEL32.dll", "CloseHandle"),
+    ("KERNEL32.dll", "GetLastError"),
+    ("KERNEL32.dll", "FormatMessageW"),
+    ("KERNEL32.dll", "GetModuleHandleW"),
+    ("KERNEL32.dll", "GetTickCount64"),
+    ("KERNEL32.dll", "Sleep"),
+    ("KERNEL32.dll", "QueryPerformanceCounter"),
+    ("KERNEL32.dll", "CreateWaitableTimerExW"),
+    ("KERNEL32.dll", "SetWaitableTimer"),
+    ("KERNEL32.dll", "WaitForSingleObject"),
+    ("USER32.dll", "RegisterClassExW"),
+    ("USER32.dll", "CreateWindowExW"),
+    ("USER32.dll", "DefWindowProcW"),
+    ("USER32.dll", "PeekMessageW"),
+    ("USER32.dll", "TranslateMessage"),
+    ("USER32.dll", "DispatchMessageW"),
+    ("USER32.dll", "IsWindow"),
+    ("USER32.dll", "DestroyWindow"),
+    ("USER32.dll", "AdjustWindowRect"),
+    ("USER32.dll", "GetDC"),
+    ("USER32.dll", "ReleaseDC"),
+    ("USER32.dll", "GetAsyncKeyState"),
+    ("USER32.dll", "GetCursorPos"),
+    ("USER32.dll", "ScreenToClient"),
+    ("USER32.dll", "LoadCursorW"),
+    ("USER32.dll", "GetForegroundWindow"),
+    ("GDI32.dll", "StretchDIBits"),
 ];
 /// The imports `runtime.yui` may call as `__os_<name>(...)`, with how many
 /// arguments each takes. They follow the same calling convention as the
-/// code this compiler makes, so a call is an ordinary call.
-const OS_CALLS: [(&str, usize); 9] = [
+/// code this compiler makes, so a call is an ordinary call. (The address of
+/// any import can also be had with `__import_<name>()`.)
+const OS_CALLS: [(&str, usize); 32] = [
     ("GetStdHandle", 1),
     ("WriteFile", 5),
     ("ReadFile", 5),
@@ -92,6 +119,29 @@ const OS_CALLS: [(&str, usize); 9] = [
     ("CloseHandle", 1),
     ("GetLastError", 0),
     ("FormatMessageW", 7),
+    ("GetModuleHandleW", 1),
+    ("GetTickCount64", 0),
+    ("Sleep", 1),
+    ("QueryPerformanceCounter", 1),
+    ("CreateWaitableTimerExW", 4),
+    ("SetWaitableTimer", 6),
+    ("WaitForSingleObject", 2),
+    ("RegisterClassExW", 1),
+    ("CreateWindowExW", 12),
+    ("PeekMessageW", 5),
+    ("TranslateMessage", 1),
+    ("DispatchMessageW", 1),
+    ("IsWindow", 1),
+    ("DestroyWindow", 1),
+    ("AdjustWindowRect", 3),
+    ("GetDC", 1),
+    ("ReleaseDC", 2),
+    ("GetAsyncKeyState", 1),
+    ("GetCursorPos", 1),
+    ("ScreenToClient", 2),
+    ("LoadCursorW", 2),
+    ("GetForegroundWindow", 0),
+    ("StretchDIBits", 13),
 ];
 const GET_STD_HANDLE: usize = 0;
 const WRITE_FILE: usize = 1;
@@ -152,8 +202,12 @@ const LIVE_BLOCKS: usize = 0;
 const POOL_HEADS: usize = 8;
 const POOL_NEXT: usize = 88;
 const POOL_END: usize = 96;
+/// Cells the runtime keeps things in between calls (`__global(i)`): the
+/// window, its pixels and size, the state of the random numbers.
+const GLOBALS: usize = 104;
+const GLOBAL_SCALE: usize = 4;
 /// Where the rest of the writable memory starts: tables of remembered results.
-const BSS_FIXED: usize = 104;
+const BSS_FIXED: usize = GLOBALS + 8 * 8;
 /// How many results a function remembers.
 const MEMO_ENTRIES: usize = 1024;
 /// Blocks up to this size come from the small-block allocator.
@@ -1752,7 +1806,7 @@ impl Native<'_> {
         // The operating system's functions that the runtime calls: a jump each.
         for (i, (name, _)) in OS_CALLS.iter().enumerate() {
             if self.rt_seen.contains(&format!("__os_{name}")) {
-                let import = IMPORTS.iter().position(|import| import == name).unwrap_or(0);
+                let import = IMPORTS.iter().position(|(_, import)| import == name).unwrap_or(0);
                 self.a.bind(self.os_labels[i]);
                 self.a.buf.extend_from_slice(&[0xFF, 0x25]); // jmp [rip + import]
                 self.iat_fixups.push((self.a.buf.len(), import));
@@ -4307,8 +4361,98 @@ impl Native<'_> {
                 self.spill_depth -= 3;
                 Ok(Some(ty))
             }
+            ("window_open", [_, _, _, _])
+            | ("window_close", [])
+            | ("draw_clear", [_])
+            | ("draw_pixel", [_, _, _])
+            | ("draw_rect", [_, _, _, _, _])
+            | ("sleep_ms" | "random_seed", [_]) => {
+                self.call_rt_with(name, args, dst)?;
+                Ok(Some(Ty::Unit))
+            }
+            ("rgb", [_, _, _]) | ("time_ms", []) => {
+                self.call_rt_with(name, args, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Int))
+            }
+            ("window_update", []) | ("key_down" | "mouse_down", [_]) => {
+                self.call_rt_with(name, args, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Bool))
+            }
+            ("mouse_x" | "mouse_y", []) => {
+                // The place in the window, divided by how large a pixel is shown.
+                let (none, done) = (self.a.label(), self.a.label());
+                self.a.mov_imm64(RCX, (name == "mouse_y") as i64);
+                self.call_rt("mouse_raw");
+                self.rip_bss(&[0x48, 0x8B, 0x0D], GLOBALS + 8 * GLOBAL_SCALE); // mov rcx, [scale]
+                self.a.alu_imm(7, RCX, 0);
+                self.a.jcc(CC_LE, none);
+                self.a.buf.extend_from_slice(&[0x48, 0x99]); // cqo
+                self.a.buf.extend_from_slice(&[0x48, 0xF7, 0xF9]); // idiv rcx
+                self.a.jmp(done);
+                self.a.bind(none);
+                self.a.mov_imm64(RAX, -1);
+                self.a.bind(done);
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Int))
+            }
+            ("random", [limit]) => {
+                // The next number of the sequence, reduced to 0 .. limit - 1.
+                self.eval(limit, dst)?;
+                let slot = self.push_spill();
+                self.a.store(slot, dst);
+                self.call_rt("random_next");
+                let (zero, done) = (self.a.label(), self.a.label());
+                self.a.load(RCX, slot);
+                self.spill_depth -= 1;
+                self.a.alu_imm(7, RCX, 0);
+                self.a.jcc(CC_LE, zero);
+                self.a.buf.extend_from_slice(&[0x31, 0xD2]); // xor edx, edx
+                self.a.buf.extend_from_slice(&[0x48, 0xF7, 0xF1]); // div rcx
+                self.a.mov_rr(RAX, RDX);
+                self.a.jmp(done);
+                self.a.bind(zero);
+                self.a.mov_imm64(RAX, 0);
+                self.a.bind(done);
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Int))
+            }
             _ => Ok(None),
         }
+    }
+
+    /// Calls `routine` of the runtime with the values of `args`, and leaves
+    /// its result in rax. Strings and the like are only lent to the routine.
+    fn call_rt_with(&mut self, routine: &str, args: &[Expr], dst: u8) -> R<()> {
+        let held = self.pending.len();
+        let mut parked: Vec<(M, bool, Ty)> = Vec::new();
+        for arg in args {
+            if let Some((slot, true, ty)) = parked.last().copied() {
+                self.hold(slot, ty);
+            }
+            parked.push(self.park(arg, dst)?);
+        }
+        self.pending.truncate(held);
+        for (i, (slot, ..)) in parked.iter().enumerate() {
+            if i < 4 {
+                self.a.load(ARG_REGS[i], *slot);
+            } else {
+                self.a.load(RAX, *slot);
+                self.a.store(M(RSP, 32 + 8 * (i as i32 - 4)), RAX);
+            }
+        }
+        self.call_rt(routine);
+        for (slot, owned, ty) in &parked {
+            if *owned && ty.heap() {
+                self.a.load(RCX, *slot);
+                self.a.store(*slot, RAX);
+                self.drop_value(*ty);
+                self.a.load(RAX, *slot);
+            }
+        }
+        self.spill_depth -= parked.len() as i32;
+        Ok(())
     }
 
     /// Direct access to memory, for `runtime.yui` only.
@@ -4328,7 +4472,43 @@ impl Native<'_> {
                 self.release(temp, spilled);
                 Ok(Ty::Unit)
             }
-            ("__shr" | "__shl" | "__and", [value, by]) => {
+            ("__global", [index]) => {
+                let ExprKind::Int(index) = index.kind else {
+                    return unsupported("`__global` with anything but a number", span);
+                };
+                // lea dst, [cell]
+                self.rip_bss(&[0x48 | (dst >> 3) << 2, 0x8D, 0x05 | (dst & 7) << 3], GLOBALS + 8 * index as usize);
+                Ok(Ty::Int)
+            }
+            (_, []) if name.starts_with("__import_") => {
+                // The address of a function of the operating system.
+                let wanted = &name["__import_".len()..];
+                let Some(import) = IMPORTS.iter().position(|(_, import)| *import == wanted) else {
+                    return unsupported(format!("the import `{wanted}`"), span);
+                };
+                self.a.buf.extend_from_slice(&[0x48, 0x8B, 0x05]); // mov rax, [rip + import]
+                self.iat_fixups.push((self.a.buf.len(), import));
+                self.a.d32(0);
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            ("__load32", [address]) => {
+                self.eval(address, dst)?;
+                self.a.mov_rr(RAX, dst);
+                self.a.buf.extend_from_slice(&[0x8B, 0x00]); // mov eax, [rax]
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
+            ("__store32", [address, value]) => {
+                self.eval(address, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, value)?;
+                self.load_opnd(RCX, a);
+                self.load_opnd(RAX, b);
+                self.a.buf.extend_from_slice(&[0x89, 0x01]); // mov [rcx], eax
+                self.release(temp, spilled);
+                Ok(Ty::Unit)
+            }
+            ("__shr" | "__shl" | "__and" | "__xor", [value, by]) => {
                 self.eval(value, dst)?;
                 let (a, b, _, temp, spilled) = self.operands(dst, by)?;
                 self.load_opnd(RAX, a);
@@ -4336,6 +4516,7 @@ impl Native<'_> {
                 match name {
                     "__shr" => self.a.buf.extend_from_slice(&[0x48, 0xD3, 0xE8]), // shr rax, cl
                     "__shl" => self.a.buf.extend_from_slice(&[0x48, 0xD3, 0xE0]), // shl rax, cl
+                    "__xor" => self.a.buf.extend_from_slice(&[0x48, 0x31, 0xC8]), // xor rax, rcx
                     _ => self.a.buf.extend_from_slice(&[0x48, 0x21, 0xC8]),        // and rax, rcx
                 }
                 self.a.mov_rr(dst, RAX);
@@ -6445,36 +6626,55 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usi
     let text_rva = SECTION_ALIGN;
     let idata_rva = text_rva + align(code.len().max(1), SECTION_ALIGN);
 
-    // The import section: directory, lookup table, address table, names.
-    let count = IMPORTS.len();
-    let ilt = 40;
-    let iat = ilt + 8 * (count + 1);
-    let mut names = iat + 8 * (count + 1);
-    let mut idata = vec![0u8; names];
-    let mut entries = Vec::new();
-    for name in IMPORTS {
-        entries.push(idata_rva + names);
-        idata.extend([0, 0]);
-        idata.extend(name.as_bytes());
+    // The import section: a directory with one entry per library, then for
+    // each library a lookup table and an address table (the loader fills the
+    // second in), then the names. Only what the code refers to is imported:
+    // a program that opens no window does not load the libraries for windows.
+    let used: std::collections::BTreeSet<usize> = iat_fixups.iter().map(|(_, import)| *import).collect();
+    let mut libraries: Vec<&str> = Vec::new();
+    for import in &used {
+        if !libraries.contains(&IMPORTS[*import].0) {
+            libraries.push(IMPORTS[*import].0);
+        }
+    }
+    let directory = 20 * (libraries.len() + 1);
+    let tables = 8 * (used.len() + libraries.len());
+    let (lookup, address) = (directory, directory + tables);
+    let mut idata = vec![0u8; address + tables];
+    let mut slots: HashMap<usize, usize> = HashMap::new();
+    let mut at = 0;
+    for (n, library) in libraries.iter().enumerate() {
+        let (ilt, iat) = (lookup + at, address + at);
+        let mut count = 0;
+        for import in used.iter().filter(|import| IMPORTS[**import].0 == *library) {
+            let name = (idata_rva + idata.len()) as u64;
+            idata.extend([0, 0]);
+            idata.extend(IMPORTS[*import].1.as_bytes());
+            idata.push(0);
+            if idata.len() % 2 == 1 {
+                idata.push(0);
+            }
+            idata[ilt + 8 * count..ilt + 8 * count + 8].copy_from_slice(&name.to_le_bytes());
+            idata[iat + 8 * count..iat + 8 * count + 8].copy_from_slice(&name.to_le_bytes());
+            slots.insert(*import, iat + 8 * count);
+            count += 1;
+        }
+        let library_name = idata_rva + idata.len();
+        idata.extend(library.as_bytes());
         idata.push(0);
         if idata.len() % 2 == 1 {
             idata.push(0);
         }
-        names = idata.len();
+        let entry = 20 * n;
+        idata[entry..entry + 4].copy_from_slice(&((idata_rva + ilt) as u32).to_le_bytes());
+        idata[entry + 12..entry + 16].copy_from_slice(&(library_name as u32).to_le_bytes());
+        idata[entry + 16..entry + 20].copy_from_slice(&((idata_rva + iat) as u32).to_le_bytes());
+        at += 8 * (count + 1);
     }
-    let dll_name = idata_rva + idata.len();
-    idata.extend(b"KERNEL32.dll\0");
-    for (i, entry) in entries.iter().enumerate() {
-        idata[ilt + 8 * i..ilt + 8 * i + 8].copy_from_slice(&(*entry as u64).to_le_bytes());
-        idata[iat + 8 * i..iat + 8 * i + 8].copy_from_slice(&(*entry as u64).to_le_bytes());
-    }
-    idata[0..4].copy_from_slice(&((idata_rva + ilt) as u32).to_le_bytes());
-    idata[12..16].copy_from_slice(&(dll_name as u32).to_le_bytes());
-    idata[16..20].copy_from_slice(&((idata_rva + iat) as u32).to_le_bytes());
 
     // Calls to imports are relative to the instruction that follows them.
     for (at, import) in iat_fixups {
-        let target = (idata_rva + iat + 8 * import) as i64;
+        let target = (idata_rva + slots[import]) as i64;
         let rel = (target - (text_rva + at + 4) as i64) as i32;
         code[*at..*at + 4].copy_from_slice(&rel.to_le_bytes());
     }
@@ -6539,8 +6739,8 @@ fn write_pe(mut code: Vec<u8>, iat_fixups: &[(usize, usize)], bss_fixups: &[(usi
     u32le(&mut out, 16); // data directories
     for directory in 0..16 {
         let (rva, size) = match directory {
-            1 => (idata_rva, 40),
-            12 => (idata_rva + iat, 8 * (count + 1)),
+            1 => (idata_rva, directory),
+            12 => (idata_rva + address, tables),
             _ => (0, 0),
         };
         u32le(&mut out, rva);

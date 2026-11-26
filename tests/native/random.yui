@@ -1,0 +1,32 @@
+// 乱数（種を決めれば同じ並び）、色、時刻。ウィンドウを開かなくても使える
+
+fn main() uses io {
+  random_seed(42)
+  let mut line = ""
+  for i in 0..12 {
+    line = "{line}{random(100)} "
+  }
+  print(line)
+  random_seed(42)
+  print("{random(100)} {random(1)} {random(0)} {random(-5)} {random(1000000007)} {random(9223372036854775807)}")
+  random_seed(0)
+  let mut counts = [0, 0, 0, 0, 0, 0]
+  for i in 0..6000 {
+    let face = random(6)
+    counts[face] = counts[face] + 1
+  }
+  print("{counts} {counts.fold(0, |acc, c| acc + c)}")
+  print("{rgb(255, 128, 0)} {rgb(0, 0, 0)} {rgb(255, 255, 255)} {rgb(300, -5, 256)} {rgb(1, 2, 3)}")
+  let started = time_ms()
+  sleep_ms(20)
+  let passed = time_ms() - started
+  print("{started >= 0} {passed >= 15} {passed < 2000}")
+  // ウィンドウがないときの描画と入力は、何もしない / 押されていない
+  draw_clear(0)
+  draw_pixel(1, 1, 255)
+  draw_rect(0, 0, 4, 4, 255)
+  let left = "left"
+  let unknown = "no such key"
+  print("{key_down(left)} {key_down(unknown)} {mouse_down(0)} {mouse_x()} {mouse_y()} {window_update()}")
+  window_close()
+}

@@ -12,6 +12,11 @@
 //   __shr(value, bits) -> Int     右に bits ビットずらす（上は 0 で埋める）
 //   __shl(value, bits) -> Int     左に bits ビットずらす
 //   __and(a, b) -> Int            ビットごとの AND
+//   __xor(a, b) -> Int            ビットごとの XOR
+//   __load32(address) -> Int      その番地の 4 バイトを読む（0 以上の数として）
+//   __store32(address, value)     その番地に 4 バイトを書く
+//   __global(番号) -> Int          呼び出しをまたいで値を置いておくマス（8 バイト、最初は 0）の番地
+//   __import_<名前>() -> Int       OS の関数の番地
 //   __os_<名前>(...) -> Int        OS（kernel32）の関数を呼ぶ。使えるものは native.rs の OS_CALLS にある。
 //                                 32 ビットの結果を返す関数は、上位に何が入っているか決まっていないので
 //                                 __and(結果, 4294967295) で取り出す
@@ -1312,4 +1317,334 @@ fn file_write(path: Int, content: Int) -> Int {
   __free(cell)
   let closed = __os_CloseHandle(handle)
   0
+}
+
+// ここからウィンドウ、入力、時刻、乱数。`yui run` 側の同じ機能は src/window.rs にある。
+// __global のマス: 0 = ウィンドウ、1 = 画素の置き場所、2 = 幅、3 = 高さ、4 = 1 画素の表示倍率、5 = 乱数の状態
+
+fn zero_bytes(address: Int, bytes: Int) {
+  let mut i = 0
+  while i < bytes {
+    __store(address + i, 0)
+    i = i + 8
+  }
+}
+
+// 色。赤・緑・青をそれぞれ 0〜255 に切り詰める
+fn rgb(r: Int, g: Int, b: Int) -> Int {
+  color_part(r) * 65536 + color_part(g) * 256 + color_part(b)
+}
+
+fn color_part(value: Int) -> Int {
+  if value < 0 { 0 } else if value > 255 { 255 } else { value }
+}
+
+fn window_open(title: Int, width: Int, height: Int, scale: Int) {
+  window_close()
+  let mut w = width
+  if w < 1 {
+    w = 1
+  }
+  if w > 4096 {
+    w = 4096
+  }
+  let mut h = height
+  if h < 1 {
+    h = 1
+  }
+  if h > 4096 {
+    h = 4096
+  }
+  let mut size = scale
+  if size < 1 {
+    size = 1
+  }
+  if size > 64 {
+    size = 64
+  }
+  let instance = __os_GetModuleHandleW(0)
+  let class_name = wide_copy("YuiLangWindow")
+  // ウィンドウの種類の登録。届いた出来事は OS の標準の処理にまかせる
+  let class = __alloc(80)
+  zero_bytes(class, 80)
+  __store(class, 80)
+  __store(class + 8, __import_DefWindowProcW())
+  __store(class + 24, instance)
+  __store(class + 40, __os_LoadCursorW(0, 32512))
+  __store(class + 64, class_name)
+  let registered = __os_RegisterClassExW(class)
+  // 281673728 = タイトルバー・閉じるボタン・最小化ボタンつき、大きさは変えられない、表示する
+  let style = 281673728
+  // 中身が w * size × h * size になるような外枠の大きさ
+  let rect = __alloc(16)
+  __store32(rect, 0)
+  __store32(rect + 4, 0)
+  __store32(rect + 8, w * size)
+  __store32(rect + 12, h * size)
+  let adjusted = __os_AdjustWindowRect(rect, style, 0)
+  let outer_width = __and(__load32(rect + 8) - __load32(rect), 4294967295)
+  let outer_height = __and(__load32(rect + 12) - __load32(rect + 4), 4294967295)
+  let wide_title = wide_copy(title)
+  // 2147483648 = 場所は OS にまかせる
+  let window = __os_CreateWindowExW(
+    0,
+    class_name,
+    wide_title,
+    style,
+    2147483648,
+    2147483648,
+    outer_width,
+    outer_height,
+    0,
+    0,
+    instance,
+    0,
+  )
+  __free(rect)
+  __free(class)
+  __free(wide_title)
+  __free(class_name)
+  if window == 0 { return }
+  let pixels = __alloc(w * h * 4)
+  let mut i = 0
+  while i < w * h {
+    __store32(pixels + i * 4, 0)
+    i = i + 1
+  }
+  __store(__global(0), window)
+  __store(__global(1), pixels)
+  __store(__global(2), w)
+  __store(__global(3), h)
+  __store(__global(4), size)
+}
+
+fn window_forget() {
+  let pixels = __load(__global(1))
+  if pixels != 0 { __free(pixels) }
+  __store(__global(0), 0)
+  __store(__global(1), 0)
+  __store(__global(2), 0)
+  __store(__global(3), 0)
+  __store(__global(4), 0)
+}
+
+fn window_close() {
+  let window = __load(__global(0))
+  if window == 0 { return }
+  let destroyed = __os_DestroyWindow(window)
+  window_forget()
+}
+
+// ウィンドウに届いた出来事を処理して、画素を表示する。閉じられていたら 0
+fn window_update() -> Int {
+  let window = __load(__global(0))
+  if window == 0 { return 0 }
+  let message = __alloc(48)
+  while __and(__os_PeekMessageW(message, 0, 0, 0, 1), 4294967295) != 0 {
+    let translated = __os_TranslateMessage(message)
+    let dispatched = __os_DispatchMessageW(message)
+  }
+  __free(message)
+  if __and(__os_IsWindow(window), 4294967295) == 0 {
+    window_forget()
+    return 0
+  }
+  let w = __load(__global(2))
+  let h = __load(__global(3))
+  let size = __load(__global(4))
+  // 画素の並びの説明: 1 画素 32 ビット、高さを負にすると上の行が先頭
+  let info = __alloc(48)
+  zero_bytes(info, 48)
+  __store32(info, 40)
+  __store32(info + 4, w)
+  __store32(info + 8, 4294967296 - h)
+  __store32(info + 12, 2097153)
+  let dc = __os_GetDC(window)
+  // 13369376 = そのまま写す
+  let drawn = __os_StretchDIBits(
+    dc,
+    0,
+    0,
+    w * size,
+    h * size,
+    0,
+    0,
+    w,
+    h,
+    __load(__global(1)),
+    info,
+    0,
+    13369376,
+  )
+  let released = __os_ReleaseDC(window, dc)
+  __free(info)
+  1
+}
+
+fn draw_clear(color: Int) {
+  let pixels = __load(__global(1))
+  if pixels == 0 { return }
+  let count = __load(__global(2)) * __load(__global(3))
+  let mut i = 0
+  while i < count {
+    __store32(pixels + i * 4, color)
+    i = i + 1
+  }
+}
+
+// 範囲の外は何もしない
+fn draw_pixel(x: Int, y: Int, color: Int) {
+  let pixels = __load(__global(1))
+  if pixels == 0 { return }
+  let w = __load(__global(2))
+  if x < 0 || y < 0 || x >= w || y >= __load(__global(3)) { return }
+  __store32(pixels + (y * w + x) * 4, color)
+}
+
+// 長方形のうち、ウィンドウに入る部分を塗る
+fn draw_rect(x: Int, y: Int, width: Int, height: Int, color: Int) {
+  let pixels = __load(__global(1))
+  if pixels == 0 { return }
+  let w = __load(__global(2))
+  let h = __load(__global(3))
+  let mut left = x
+  if left < 0 {
+    left = 0
+  }
+  let mut top = y
+  if top < 0 {
+    top = 0
+  }
+  let mut right = x + width
+  if right > w {
+    right = w
+  }
+  let mut bottom = y + height
+  if bottom > h {
+    bottom = h
+  }
+  let mut row = top
+  while row < bottom {
+    let mut at = pixels + (row * w + left) * 4
+    let end = pixels + (row * w + right) * 4
+    while at < end {
+      __store32(at, color)
+      at = at + 4
+    }
+    row = row + 1
+  }
+}
+
+// キーの名前から OS のキーの番号。知らない名前は 0
+fn key_code(name: Int) -> Int {
+  if __load(name + 8) == 1 {
+    let byte = __load8(name + 24)
+    if byte >= 97 && byte <= 122 { return byte - 32 }
+    if byte >= 65 && byte <= 90 || byte >= 48 && byte <= 57 || byte == 32 { return byte }
+    return 0
+  }
+  if str_eq(name, "left") == 1 { return 37 }
+  if str_eq(name, "up") == 1 { return 38 }
+  if str_eq(name, "right") == 1 { return 39 }
+  if str_eq(name, "down") == 1 { return 40 }
+  if str_eq(name, "space") == 1 { return 32 }
+  if str_eq(name, "enter") == 1 { return 13 }
+  if str_eq(name, "escape") == 1 { return 27 }
+  if str_eq(name, "shift") == 1 { return 16 }
+  if str_eq(name, "ctrl") == 1 { return 17 }
+  if str_eq(name, "tab") == 1 { return 9 }
+  0
+}
+
+// このウィンドウが手前にあって操作を受けているか
+fn window_focused() -> Int {
+  let window = __load(__global(0))
+  if window != 0 && __os_GetForegroundWindow() == window { 1 } else { 0 }
+}
+
+fn key_down(name: Int) -> Int {
+  let code = key_code(name)
+  if code == 0 || window_focused() == 0 { return 0 }
+  if __and(__os_GetAsyncKeyState(code), 32768) != 0 { 1 } else { 0 }
+}
+
+// 0 = 左ボタン、1 = 右ボタン、2 = 中ボタン
+fn mouse_down(button: Int) -> Int {
+  let mut code = 0
+  if button == 0 {
+    code = 1
+  } else if button == 1 {
+    code = 2
+  } else if button == 2 {
+    code = 4
+  }
+  if code == 0 || window_focused() == 0 { return 0 }
+  if __and(__os_GetAsyncKeyState(code), 32768) != 0 { 1 } else { 0 }
+}
+
+// マウスの位置（ウィンドウの中での点の数。axis: 0 = 横、1 = 縦）。表示倍率で割るのは呼び出し側
+fn mouse_raw(axis: Int) -> Int {
+  let window = __load(__global(0))
+  if window == 0 { return 0 }
+  let point = __alloc(8)
+  let found = __os_GetCursorPos(point)
+  let moved = __os_ScreenToClient(window, point)
+  let mut value = __load32(point + axis * 4)
+  __free(point)
+  if value >= 2147483648 {
+    value = value - 4294967296
+  }
+  value
+}
+
+fn time_ms() -> Int {
+  __os_GetTickCount64()
+}
+
+// 指定した時間だけ待つ。OS の Sleep は 16 ミリ秒を頼んでも 30 ミリ秒ほど待つことがあるので、
+// 精度の高いタイマーを使う（古い Windows で作れなければ Sleep にする）
+fn sleep_ms(ms: Int) {
+  if ms <= 0 { return }
+  // 2 = 精度の高いタイマー、2031619 = すべての操作を許す
+  let timer = __os_CreateWaitableTimerExW(0, 0, 2, 2031619)
+  if timer == 0 {
+    let slept = __os_Sleep(ms)
+    return
+  }
+  // 待つ長さは 100 ナノ秒単位で、負の数にすると「今から」の意味になる
+  let due = __alloc(8)
+  __store(due, 0 - ms * 10000)
+  let set = __os_SetWaitableTimer(timer, due, 0, 0, 0, 0)
+  // 4294967295 = 終わるまで待つ
+  let waited = __os_WaitForSingleObject(timer, 4294967295)
+  __free(due)
+  let closed = __os_CloseHandle(timer)
+}
+
+// 乱数の種を決める。同じ種なら同じ並びになる（src/window.rs と同じ計算）
+fn random_seed(seed: Int) {
+  let mut state = __xor(seed, 88172645463325252)
+  if state == 0 {
+    state = 88172645463325252
+  }
+  __store(__global(5), state)
+}
+
+// 次の乱数（0 以上）。範囲に収めるのは呼び出し側
+fn random_next() -> Int {
+  let mut x = __load(__global(5))
+  if x == 0 {
+    let cell = __alloc(8)
+    let counted = __os_QueryPerformanceCounter(cell)
+    x = __xor(__load(cell), 88172645463325252)
+    __free(cell)
+    if x == 0 {
+      x = 88172645463325252
+    }
+  }
+  x = __xor(x, __shr(x, 12))
+  x = __xor(x, __shl(x, 25))
+  x = __xor(x, __shr(x, 27))
+  __store(__global(5), x)
+  __shr(x * 2685821657736338717, 1)
 }
