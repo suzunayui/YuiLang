@@ -39,10 +39,17 @@ pub const BUILTIN_FNS: &[&str] = &[
     "gpu_draw",
     "gpu_free",
     "gpu_rect",
+    "gpu_text",
+    "text_input",
+    // The environment, and requests over the network.
+    "env",
+    "http_start",
+    "http_done",
+    "http_result",
 ];
 pub const BUILTIN_TYPES: &[&str] =
     &["Int", "Float", "Bool", "String", "Unit", "List", "Option", "Result", "Map"];
-pub const EFFECTS: &[&str] = &["io", "fs"];
+pub const EFFECTS: &[&str] = &["io", "fs", "net"];
 
 pub struct Program {
     pub imports: Vec<Import>,

@@ -1429,6 +1429,10 @@ fn window_make(title: Int, w: Int, h: Int) -> Int {
 fn window_forget() {
   let pixels = __load(__global(1))
   if pixels != 0 { __free(pixels) }
+  let typed = __load(__global(16))
+  if typed != 0 { __free(typed) }
+  __store(__global(16), 0)
+  gpu_fonts_forget()
   __store(__global(0), 0)
   __store(__global(1), 0)
   __store(__global(2), 0)
@@ -1449,6 +1453,10 @@ fn window_update() -> Int {
   if window == 0 { return 0 }
   let message = __alloc(48)
   while __and(__os_PeekMessageW(message, 0, 0, 0, 1), 4294967295) != 0 {
+    // 258 = 文字が打たれた
+    if __load32(message + 8) == 258 {
+      typed_add(__and(__load(message + 16), 65535))
+    }
     let translated = __os_TranslateMessage(message)
     let dispatched = __os_DispatchMessageW(message)
   }
@@ -1492,6 +1500,269 @@ fn window_update() -> Int {
   let released = __os_ReleaseDC(window, dc)
   __free(info)
   1
+}
+
+// ---- 環境変数と、ネットワーク越しの依頼（HTTP / HTTPS） ----
+
+// 環境変数の値。なければ空の文字列
+fn env_get(name: Int) -> Int {
+  let wide = wide_copy(name)
+  let buffer = __alloc(65536)
+  let units = __and(__os_GetEnvironmentVariableW(wide, buffer, 32767), 4294967295)
+  __free(wide)
+  let mut out = str_new(16)
+  if units < 32767 {
+    out = str_append_wide(out, buffer, units)
+  }
+  __free(buffer)
+  out
+}
+
+// 依頼は裏で進む。OS は 1 段階終わるごとに、native.rs の小さな機械語（__http_callback）を別のスレッドから呼び、
+// それが依頼ごとの置き場に「何が終わったか」を書き込む。http_done がそれを読んで次の段階を頼む。
+// 同時に 8 件まで。置き場の番地は __global(8)〜__global(15) に入れる。
+//
+// 置き場（104 バイト）:
+//   +0  終わった段階（OS が書く。読んだら 0 に戻す）   +8 その長さ   +16 待っているデータの量、または失敗の番号
+//   +24 セッション  +32 接続  +40 依頼
+//   +48 状態（0 = 進行中、4 = 終わった、5 = 失敗）
+//   +56 送る本文の写し  +64 受け取った本文（文字列）  +72 HTTP の状態番号  +80 失敗の番号
+
+fn http_slot(id: Int) -> Int {
+  if id < 1 || id > 8 { return 0 }
+  __global(8) + (id - 1) * 8
+}
+
+fn http_fail(st: Int, code: Int) {
+  __store(st + 48, 5)
+  __store(st + 80, code)
+  http_close(st)
+}
+
+fn http_close(st: Int) {
+  let request = __load(st + 40)
+  if request != 0 {
+    let closed = __os_WinHttpCloseHandle(request)
+  }
+  let connection = __load(st + 32)
+  if connection != 0 {
+    let closed = __os_WinHttpCloseHandle(connection)
+  }
+  let session = __load(st + 24)
+  if session != 0 {
+    let closed = __os_WinHttpCloseHandle(session)
+  }
+  let body = __load(st + 56)
+  if body != 0 { __free(body) }
+  __store(st + 24, 0)
+  __store(st + 32, 0)
+  __store(st + 40, 0)
+  __store(st + 56, 0)
+}
+
+// 依頼を始めて、その番号（1〜8）を返す。同時に進められる数を超えていたら 0
+fn http_start(method: Int, url: Int, headers: Int, body: Int) -> Int {
+  let mut id = 1
+  while id <= 8 && __load(http_slot(id)) != 0 {
+    id = id + 1
+  }
+  if id > 8 { return 0 }
+  let st = __alloc(104)
+  zero_bytes(st, 104)
+  __store(http_slot(id), st)
+  // 行き先を、種類・相手の名前・ポート・道筋に分ける
+  let wide_url = wide_copy(url)
+  let parts = __alloc(104)
+  zero_bytes(parts, 104)
+  __store32(parts, 104)
+  __store32(parts + 16, 4294967295)
+  __store32(parts + 32, 4294967295)
+  __store32(parts + 80, 4294967295)
+  __store32(parts + 96, 4294967295)
+  if __and(__os_WinHttpCrackUrl(wide_url, 0, 0, parts), 4294967295) == 0 {
+    let code = last_error()
+    __free(parts)
+    __free(wide_url)
+    http_fail(st, code)
+    return id
+  }
+  let secure = __load32(parts + 20) == 2
+  let host_units = __load32(parts + 32)
+  let host = __alloc(host_units * 2 + 2)
+  __copy(host, __load(parts + 24), host_units * 2)
+  __store8(host + host_units * 2, 0)
+  __store8(host + host_units * 2 + 1, 0)
+  let port = __load8(parts + 36) + __load8(parts + 37) * 256
+  // 道筋は行き先の文字列の残り全部。空なら OS にまかせる（"/" になる）
+  let mut path = __load(parts + 72)
+  if __load8(path) == 0 && __load8(path + 1) == 0 {
+    path = 0
+  }
+  __free(parts)
+  let agent = wide_copy("YuiLang")
+  // 4 = システムに設定された中継を使う、268435456 = 裏で進める
+  let session = __os_WinHttpOpen(agent, 4, 0, 0, 268435456)
+  __free(agent)
+  __store(st + 24, session)
+  let mut failed = 0
+  if session == 0 {
+    failed = last_error()
+  }
+  if failed == 0 {
+    // 8257536 = 段階が終わったときだけ知らせてもらう
+    let watched = __os_WinHttpSetStatusCallback(session, __http_callback(), 8257536, 0)
+    // 返事が始まるまで何分もかかることがある（言語モデルが考えている間）
+    let timed = __os_WinHttpSetTimeouts(session, 0, 60000, 60000, 600000)
+    let connection = __os_WinHttpConnect(session, host, port, 0)
+    __store(st + 32, connection)
+    if connection == 0 {
+      failed = last_error()
+    }
+  }
+  if failed == 0 {
+    let verb = wide_copy(method)
+    // 8388608 = 暗号化する
+    let request = __os_WinHttpOpenRequest(__load(st + 32), verb, path, 0, 0, 0, if secure { 8388608 } else { 0 })
+    if request == 0 {
+      failed = last_error()
+    }
+    __free(verb)
+    __store(st + 40, request)
+  }
+  if failed == 0 && __load(headers + 8) > 0 {
+    let mut lines = str_new(256)
+    let mut i = 0
+    while i < __load(headers + 8) {
+      if i > 0 {
+        lines = str_push(lines, 13)
+        lines = str_push(lines, 10)
+      }
+      lines = str_append_str(lines, __load(headers + 24 + i * 8))
+      i = i + 1
+    }
+    let wide_lines = wide_copy(lines)
+    __free(lines)
+    // 536870912 = 見出しを足す
+    if __and(__os_WinHttpAddRequestHeaders(__load(st + 40), wide_lines, 4294967295, 536870912), 4294967295) == 0 {
+      failed = last_error()
+    }
+    __free(wide_lines)
+  }
+  if failed == 0 {
+    // 本文は送り終わるまで動かせないので、写しを持っておく
+    let size = __load(body + 8)
+    let copy = __alloc(size + 8)
+    __copy(copy, body + 24, size)
+    __store(st + 56, copy)
+    if __and(__os_WinHttpSendRequest(__load(st + 40), 0, 0, copy, size, size, st), 4294967295) == 0 {
+      failed = last_error()
+    }
+  }
+  __free(host)
+  __free(wide_url)
+  if failed != 0 {
+    http_fail(st, failed)
+  }
+  id
+}
+
+// 依頼が終わったか。終わっていなければ、進められる分だけ進める
+fn http_done(id: Int) -> Int {
+  let slot = http_slot(id)
+  if slot == 0 { return 1 }
+  let st = __load(slot)
+  if st == 0 { return 1 }
+  while __load(st + 48) < 4 {
+    let finished = __load(st)
+    if finished == 0 { return 0 }
+    let length = __and(__load(st + 8), 4294967295)
+    let extra = __and(__load(st + 16), 4294967295)
+    __store(st, 0)
+    let request = __load(st + 40)
+    if finished == 4194304 {
+      // 送り終わった → 返事を待つ
+      if __and(__os_WinHttpReceiveResponse(request, 0), 4294967295) == 0 {
+        http_fail(st, last_error())
+      }
+    } else if finished == 131072 {
+      // 返事の見出しが届いた → 状態番号を読み、本文を待つ
+      let cell = __alloc(16)
+      __store(cell, 0)
+      __store(cell + 8, 4)
+      // 536870931 = 状態番号を数として
+      let asked = __os_WinHttpQueryHeaders(request, 536870931, 0, cell, cell + 8, 0)
+      __store(st + 72, __load32(cell))
+      __free(cell)
+      __store(st + 64, str_new(4096))
+      if __and(__os_WinHttpQueryDataAvailable(request, 0), 4294967295) == 0 {
+        http_fail(st, last_error())
+      }
+    } else if finished == 262144 {
+      // 本文が extra バイト待っている（0 なら終わり）
+      if extra == 0 {
+        __store(st + 48, 4)
+        http_close(st)
+      } else {
+        let text = str_reserve(__load(st + 64), extra)
+        __store(st + 64, text)
+        if __and(__os_WinHttpReadData(request, text + 24 + __load(text + 8), extra, 0), 4294967295) == 0 {
+          http_fail(st, last_error())
+        }
+      }
+    } else if finished == 524288 {
+      // length バイト読めた
+      if length == 0 {
+        __store(st + 48, 4)
+        http_close(st)
+      } else {
+        let text = __load(st + 64)
+        __store(text + 8, __load(text + 8) + length)
+        if __and(__os_WinHttpQueryDataAvailable(request, 0), 4294967295) == 0 {
+          http_fail(st, last_error())
+        }
+      }
+    } else if finished == 2097152 {
+      http_fail(st, extra)
+    }
+  }
+  1
+}
+
+// 返ってきたものを 1 回だけ受け取る。本文なら ok に 1、失敗の説明なら 0 を入れる。
+// 説明の文面は src/net.rs と同じにしてある
+fn http_take(id: Int, ok: Int) -> Int {
+  __store(ok, 0)
+  let slot = http_slot(id)
+  if slot == 0 { return str_append_str(str_new(32), "no such request") }
+  let st = __load(slot)
+  if st == 0 { return str_append_str(str_new(32), "no such request") }
+  if http_done(id) == 0 { return str_append_str(str_new(32), "the request has not finished") }
+  __store(slot, 0)
+  let text = __load(st + 64)
+  let state = __load(st + 48)
+  let status = __load(st + 72)
+  let code = __load(st + 80)
+  __free(st)
+  if state == 5 {
+    if text != 0 { __free(text) }
+    let mut out = str_append_str(str_new(48), "the request failed (os error ")
+    out = str_append_int(out, code)
+    return str_push(out, 41)
+  }
+  if utf8_valid(text + 24, __load(text + 8)) == 0 {
+    __free(text)
+    return str_append_str(str_new(40), "the response was not valid UTF-8")
+  }
+  if status >= 200 && status < 300 {
+    __store(ok, 1)
+    return text
+  }
+  let mut out = str_append_str(str_new(32 + __load(text + 8)), "HTTP ")
+  out = str_append_int(out, status)
+  out = str_append_str(out, ": ")
+  out = str_append_str(out, text)
+  __free(text)
+  out
 }
 
 // ---- GPU（OpenGL の古い方式）で描く ----
@@ -1703,6 +1974,20 @@ fn gpu_rect(x: Int, y: Int, width: Int, height: Int, color: Int) {
   let top = gpu_limit(y)
   let right = left + gpu_limit(width)
   let bottom = top + gpu_limit(height)
+  gpu_overlay_begin()
+  let j = __os_glColor3ub(__and(__shr(color, 16), 255), __and(__shr(color, 8), 255), __and(color, 255))
+  // 7 = 四角形
+  let k = __os_glBegin(7)
+  let l = __os_glVertex2i(left, top)
+  let m = __os_glVertex2i(right, top)
+  let n = __os_glVertex2i(right, bottom)
+  let o = __os_glVertex2i(left, bottom)
+  let p = __os_glEnd()
+  gpu_overlay_end()
+}
+
+// 絵の上に平らに重ねて描く準備（左上からの点の数で場所を決められるようにする）と、その片づけ
+fn gpu_overlay_begin() {
   let one = float_bits(1)
   // 8192 = 入・切の設定を覚えておく
   let saved = __os_glPushAttrib(8192)
@@ -1715,19 +2000,148 @@ fn gpu_rect(x: Int, y: Int, width: Int, height: Int, color: Int) {
   let g = __os_glMatrixMode(5888)
   let h = __os_glPushMatrix()
   let i = __os_glLoadIdentity()
-  let j = __os_glColor3ub(__and(__shr(color, 16), 255), __and(__shr(color, 8), 255), __and(color, 255))
-  // 7 = 四角形
-  let k = __os_glBegin(7)
-  let l = __os_glVertex2i(left, top)
-  let m = __os_glVertex2i(right, top)
-  let n = __os_glVertex2i(right, bottom)
-  let o = __os_glVertex2i(left, bottom)
-  let p = __os_glEnd()
+}
+
+fn gpu_overlay_end() {
   let q = __os_glPopMatrix()
   let r = __os_glMatrixMode(5889)
   let s = __os_glPopMatrix()
   let t = __os_glMatrixMode(5888)
   let u = __os_glPopAttrib()
+}
+
+// 文字。大きさごとに、文字 1 つずつの絵を GPU に覚えさせておく（初めて使う文字だけ、その場で作る）。
+// 大きさは 4 種類まで覚える。表の番地は __global(17)、1 種類 48 バイト:
+//   +0 大きさ  +8 書体  +16 絵の番号の先頭（文字コードを足す）  +24 作った文字の印（65,536 バイト）
+//   +32 文字の上端から基準の線まで  +40 行の高さ
+fn gpu_fonts_forget() {
+  let table = __load(__global(17))
+  if table == 0 { return }
+  let mut i = 0
+  while i < 4 {
+    let entry = table + i * 48
+    if __load(entry) != 0 {
+      let deleted = __os_DeleteObject(__load(entry + 8))
+      __free(__load(entry + 24))
+    }
+    i = i + 1
+  }
+  __free(table)
+  __store(__global(17), 0)
+}
+
+fn gpu_font(size: Int) -> Int {
+  let mut table = __load(__global(17))
+  if table == 0 {
+    table = __alloc(192)
+    zero_bytes(table, 192)
+    __store(__global(17), table)
+  }
+  let mut i = 0
+  while i < 4 && __load(table + i * 48) != 0 {
+    if __load(table + i * 48) == size { return table + i * 48 }
+    i = i + 1
+  }
+  let mut entry = table + i * 48
+  if i == 4 {
+    // 5 種類目は、最初の 1 種類と入れ替える
+    entry = table
+    let deleted = __os_glDeleteLists(__load(entry + 16), 65536)
+    let dropped = __os_DeleteObject(__load(entry + 8))
+    __free(__load(entry + 24))
+  }
+  let dc = __load(__global(6))
+  let face = wide_copy("Yu Gothic UI")
+  let font = __os_CreateFontW(0 - size, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face)
+  __free(face)
+  let old = __os_SelectObject(dc, font)
+  let metrics = __alloc(64)
+  zero_bytes(metrics, 64)
+  let measured = __os_GetTextMetricsW(dc, metrics)
+  let flags = __alloc(65536)
+  zero_bytes(flags, 65536)
+  __store(entry, size)
+  __store(entry + 8, font)
+  __store(entry + 16, __and(__os_glGenLists(65536), 4294967295))
+  __store(entry + 24, flags)
+  __store(entry + 32, __load32(metrics + 4))
+  __store(entry + 40, __load32(metrics))
+  __free(metrics)
+  entry
+}
+
+// 絵の上に重ねる文字。左上が (x, y)、文字の高さが size 点。改行で次の行へ進む
+fn gpu_text(x: Int, y: Int, size: Int, color: Int, text: Int) {
+  if gpu_ready() == 0 { return }
+  let mut height = size
+  if height < 6 {
+    height = 6
+  }
+  if height > 200 {
+    height = 200
+  }
+  let entry = gpu_font(height)
+  let base = __load(entry + 16)
+  if base == 0 { return }
+  let flags = __load(entry + 24)
+  let dc = __load(__global(6))
+  let left = gpu_limit(x)
+  let mut line = gpu_limit(y) + __load(entry + 32)
+  gpu_overlay_begin()
+  let colored = __os_glColor3ub(__and(__shr(color, 16), 255), __and(__shr(color, 8), 255), __and(color, 255))
+  let placed = __os_glRasterPos2i(left, line)
+  let count = __load(text + 8)
+  let mut selected = 0
+  let mut i = 0
+  while i < count {
+    let code = utf8_code(text + 24 + i)
+    i = i + utf8_width(__load8(text + 24 + i))
+    if code == 10 {
+      line = line + __load(entry + 40)
+      let moved = __os_glRasterPos2i(left, line)
+    } else if code >= 32 && code < 65536 {
+      if __load8(flags + code) == 0 {
+        if selected == 0 {
+          let old = __os_SelectObject(dc, __load(entry + 8))
+          selected = 1
+        }
+        // 最初の 1 回は失敗することがあるので、失敗したらもう一度頼む
+        if __and(__os_wglUseFontBitmapsW(dc, code, 1, base + code), 4294967295) == 0 {
+          let again = __os_wglUseFontBitmapsW(dc, code, 1, base + code)
+        }
+        __store8(flags + code, 1)
+      }
+      let drawn = __os_glCallList(base + code)
+    }
+  }
+  gpu_overlay_end()
+}
+
+// 打たれた文字をためておく場所: [個数][16 ビットの単位が 256 個まで]。番地は __global(16)
+fn typed_add(unit: Int) {
+  let mut typed = __load(__global(16))
+  if typed == 0 {
+    typed = __alloc(8 + 512)
+    __store(typed, 0)
+    __store(__global(16), typed)
+  }
+  let count = __load(typed)
+  if count >= 256 { return }
+  // Enter は改行にする
+  let kept = if unit == 13 { 10 } else { unit }
+  __store8(typed + 8 + count * 2, kept % 256)
+  __store8(typed + 9 + count * 2, kept / 256)
+  __store(typed, count + 1)
+}
+
+// 前に呼んでから打たれた文字
+fn text_input() -> Int {
+  let typed = __load(__global(16))
+  let mut out = str_new(16)
+  if typed == 0 { return out }
+  out = str_append_wide(out, typed + 8, __load(typed))
+  __store(typed, 0)
+  out
 }
 
 fn draw_clear(color: Int) {

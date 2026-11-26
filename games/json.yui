@@ -1,0 +1,360 @@
+// JSON を読む・書く。
+//
+//   let v = json.parse(text)?                  文字列 → 値
+//   json.text_of(json.get(v, "name"))          項目を取り出す（なければ空の文字列）
+//   json.int_of(json.at(json.get(v, "xs"), 0)) 並びの 0 番目を整数として
+//   json.quote("a\"b")                         文字列を JSON の文字列（引用符つき）にする
+//   json.write(v)                              値 → 文字列
+//
+// 取り出す関数は、形が合わないときに失敗せず、空の値（Null、""、0、false、[]）を返す。
+
+enum Value {
+  Null,
+  Flag(Bool),
+  Number(Float),
+  Text(String),
+  Items(List<Value>),
+  Fields(Map<String, Value>),
+}
+
+// 読んだ値と、その次の位置
+struct Step {
+  value: Value,
+  at: Int,
+}
+
+struct TextStep {
+  text: String,
+  at: Int,
+}
+
+fn parse(text: String) -> Result<Value, String> {
+  let codes = text.codes()
+  let step = parse_value(text, codes, skip_space(codes, 0), 0)?
+  let end = skip_space(codes, step.at)
+  if end < codes.len() { return Err("JSON: unexpected text at position {end}") }
+  Ok(step.value)
+}
+
+fn skip_space(codes: List<Int>, start: Int) -> Int {
+  let mut at = start
+  while at < codes.len() && (codes[at] == ' ' || codes[at] == '\n' || codes[at] == '\r' || codes[at] == '\t') {
+    at = at + 1
+  }
+  at
+}
+
+// codes[at..] が word で始まるか
+fn starts(codes: List<Int>, at: Int, word: String) -> Bool {
+  let wanted = word.codes()
+  if at + wanted.len() > codes.len() { return false }
+  for i in 0..wanted.len() {
+    if codes[at + i] != wanted[i] { return false }
+  }
+  true
+}
+
+fn parse_value(text: String, codes: List<Int>, at: Int, depth: Int) -> Result<Step, String> {
+  if depth > 200 { return Err("JSON: nested too deeply") }
+  if at >= codes.len() { return Err("JSON: unexpected end") }
+  let c = codes[at]
+  if c == '"' {
+    let s = parse_string(text, codes, at)?
+    return Ok(Step { value: Value.Text(s.text), at: s.at })
+  }
+  if c == '[' { return parse_items(text, codes, at, depth) }
+  if c == '{' { return parse_fields(text, codes, at, depth) }
+  if starts(codes, at, "true") { return Ok(Step { value: Value.Flag(true), at: at + 4 }) }
+  if starts(codes, at, "false") { return Ok(Step { value: Value.Flag(false), at: at + 5 }) }
+  if starts(codes, at, "null") { return Ok(Step { value: Value.Null, at: at + 4 }) }
+  if c == '-' || c >= '0' && c <= '9' { return parse_number(codes, at) }
+  Err("JSON: unexpected character at position {at}")
+}
+
+fn parse_items(text: String, codes: List<Int>, start: Int, depth: Int) -> Result<Step, String> {
+  let mut items: List<Value> = []
+  let mut at = skip_space(codes, start + 1)
+  if at < codes.len() && codes[at] == ']' { return Ok(Step { value: Value.Items(items), at: at + 1 }) }
+  while true {
+    let step = parse_value(text, codes, at, depth + 1)?
+    items = items.push(step.value)
+    at = skip_space(codes, step.at)
+    if at >= codes.len() { return Err("JSON: unexpected end in a list") }
+    if codes[at] == ']' { return Ok(Step { value: Value.Items(items), at: at + 1 }) }
+    if codes[at] != ',' { return Err("JSON: expected `,` or `]` at position {at}") }
+    at = skip_space(codes, at + 1)
+  }
+  Err("JSON: unexpected end in a list")
+}
+
+fn parse_fields(text: String, codes: List<Int>, start: Int, depth: Int) -> Result<Step, String> {
+  let mut fields: Map<String, Value> = Map {}
+  let mut at = skip_space(codes, start + 1)
+  if at < codes.len() && codes[at] == '}' { return Ok(Step { value: Value.Fields(fields), at: at + 1 }) }
+  while true {
+    if at >= codes.len() || codes[at] != '"' { return Err("JSON: expected a name at position {at}") }
+    let name = parse_string(text, codes, at)?
+    at = skip_space(codes, name.at)
+    if at >= codes.len() || codes[at] != ':' { return Err("JSON: expected `:` at position {at}") }
+    let step = parse_value(text, codes, skip_space(codes, at + 1), depth + 1)?
+    fields = fields.set(name.text, step.value)
+    at = skip_space(codes, step.at)
+    if at >= codes.len() { return Err("JSON: unexpected end in an object") }
+    if codes[at] == '}' { return Ok(Step { value: Value.Fields(fields), at: at + 1 }) }
+    if codes[at] != ',' { return Err("JSON: expected `,` or `\}` at position {at}") }
+    at = skip_space(codes, at + 1)
+  }
+  Err("JSON: unexpected end in an object")
+}
+
+fn hex_digit(code: Int) -> Int {
+  if code >= '0' && code <= '9' { return code - '0' }
+  if code >= 'a' && code <= 'f' { return code - 'a' + 10 }
+  if code >= 'A' && code <= 'F' { return code - 'A' + 10 }
+  -1
+}
+
+// codes[at..at + 4] を 16 進数として読む。読めなければ -1
+fn hex4(codes: List<Int>, at: Int) -> Int {
+  if at + 4 > codes.len() { return -1 }
+  let mut value = 0
+  for i in 0..4 {
+    let digit = hex_digit(codes[at + i])
+    if digit < 0 { return -1 }
+    value = value * 16 + digit
+  }
+  value
+}
+
+// 引用符で始まる文字列を読む。そのままの部分はまとめて切り出し、最後につなぐ
+fn parse_string(text: String, codes: List<Int>, start: Int) -> Result<TextStep, String> {
+  let mut pieces: List<String> = []
+  let mut at = start + 1
+  let mut plain = at
+  while at < codes.len() {
+    let c = codes[at]
+    if c == '"' {
+      pieces = pieces.push(text.slice(plain, at))
+      return Ok(TextStep { text: pieces.join(""), at: at + 1 })
+    }
+    if c == '\\' {
+      pieces = pieces.push(text.slice(plain, at))
+      if at + 1 >= codes.len() { return Err("JSON: unexpected end in a string") }
+      let e = codes[at + 1]
+      at = at + 2
+      if e == 'u' {
+        let mut code = hex4(codes, at)
+        if code < 0 { return Err("JSON: bad \\u escape at position {at}") }
+        at = at + 4
+        // 上位と下位の 2 つで 1 文字を表す書き方
+        if code >= 55296 && code <= 56319 && starts(codes, at, "\\u") {
+          let low = hex4(codes, at + 2)
+          if low >= 56320 && low <= 57343 {
+            code = 65536 + (code - 55296) * 1024 + low - 56320
+            at = at + 6
+          }
+        }
+        // 片方だけでは文字にならないので、置き換え用の文字にする
+        if code >= 55296 && code <= 57343 {
+          code = 65533
+        }
+        pieces = pieces.push(code.to_char())
+      } else if e == 'n' {
+        pieces = pieces.push("\n")
+      } else if e == 't' {
+        pieces = pieces.push("\t")
+      } else if e == 'r' {
+        pieces = pieces.push("\r")
+      } else if e == 'b' {
+        pieces = pieces.push(8.to_char())
+      } else if e == 'f' {
+        pieces = pieces.push(12.to_char())
+      } else if e == '"' || e == '\\' || e == '/' {
+        pieces = pieces.push(e.to_char())
+      } else {
+        return Err("JSON: bad escape at position {at}")
+      }
+      plain = at
+    } else {
+      at = at + 1
+    }
+  }
+  Err("JSON: unexpected end in a string")
+}
+
+fn parse_number(codes: List<Int>, start: Int) -> Result<Step, String> {
+  let mut at = start
+  let negative = codes[at] == '-'
+  if negative {
+    at = at + 1
+  }
+  let first = at
+  let mut value = 0.0
+  while at < codes.len() && codes[at] >= '0' && codes[at] <= '9' {
+    value = value * 10.0 + (codes[at] - '0').to_float()
+    at = at + 1
+  }
+  if at == first { return Err("JSON: bad number at position {start}") }
+  if at < codes.len() && codes[at] == '.' {
+    at = at + 1
+    let mut unit = 0.1
+    while at < codes.len() && codes[at] >= '0' && codes[at] <= '9' {
+      value = value + (codes[at] - '0').to_float() * unit
+      unit = unit / 10.0
+      at = at + 1
+    }
+  }
+  if at < codes.len() && (codes[at] == 'e' || codes[at] == 'E') {
+    at = at + 1
+    let mut down = false
+    if at < codes.len() && (codes[at] == '-' || codes[at] == '+') {
+      down = codes[at] == '-'
+      at = at + 1
+    }
+    let mut power = 0
+    while at < codes.len() && codes[at] >= '0' && codes[at] <= '9' {
+      power = (power * 10 + codes[at] - '0').min(400)
+      at = at + 1
+    }
+    for i in 0..power {
+      value = if down { value / 10.0 } else { value * 10.0 }
+    }
+  }
+  Ok(Step { value: Value.Number(if negative { -value } else { value }), at: at })
+}
+
+// ---- 取り出す ----
+
+// 項目 name の値。なければ（または v が項目の集まりでなければ）Null
+fn get(v: Value, name: String) -> Value {
+  match v {
+    Value.Fields(fields) => fields.get(name).unwrap_or(Value.Null)
+    _ => Value.Null
+  }
+}
+
+// 並びの index 番目。なければ Null
+fn at(v: Value, index: Int) -> Value {
+  match v {
+    Value.Items(items) => items.get(index).unwrap_or(Value.Null)
+    _ => Value.Null
+  }
+}
+
+fn items(v: Value) -> List<Value> {
+  match v {
+    Value.Items(found) => found
+    _ => []
+  }
+}
+
+fn text_of(v: Value) -> String {
+  match v {
+    Value.Text(text) => text
+    _ => ""
+  }
+}
+
+fn int_of(v: Value) -> Int {
+  match v {
+    Value.Number(n) => if n > -1000000000000000.0 && n < 1000000000000000.0 { n.round().to_int() } else { 0 }
+    _ => 0
+  }
+}
+
+fn float_of(v: Value) -> Float {
+  match v {
+    Value.Number(n) => n
+    _ => 0.0
+  }
+}
+
+fn flag_of(v: Value) -> Bool {
+  match v {
+    Value.Flag(b) => b
+    _ => false
+  }
+}
+
+// ---- 書く ----
+
+// 文字列を、引用符つきの JSON の文字列にする
+fn quote(text: String) -> String {
+  let codes = text.codes()
+  let mut pieces = ["\""]
+  let mut plain = 0
+  for i in 0..codes.len() {
+    let c = codes[i]
+    if c == '"' || c == '\\' || c < 32 {
+      pieces = pieces.push(text.slice(plain, i))
+      plain = i + 1
+      if c == '"' {
+        pieces = pieces.push("\\\"")
+      } else if c == '\\' {
+        pieces = pieces.push("\\\\")
+      } else if c == '\n' {
+        pieces = pieces.push("\\n")
+      } else if c == '\r' {
+        pieces = pieces.push("\\r")
+      } else if c == '\t' {
+        pieces = pieces.push("\\t")
+      } else {
+        let high = c / 16
+        let low = c % 16
+        let digits = "0123456789abcdef"
+        pieces = pieces.push("\\u00{digits.slice(high, high + 1)}{digits.slice(low, low + 1)}")
+      }
+    }
+  }
+  pieces = pieces.push(text.slice(plain, codes.len()))
+  pieces = pieces.push("\"")
+  pieces.join("")
+}
+
+fn write(v: Value) -> String {
+  match v {
+    Value.Null => "null"
+    Value.Flag(b) => if b { "true" } else { "false" }
+    Value.Number(n) => if n == n.round() && n > -1000000000000000.0 && n < 1000000000000000.0 { "{n.to_int()}" } else { "{n}" }
+    Value.Text(text) => quote(text)
+    Value.Items(found) => {
+      let joined = found.map(|item| write(item)).join(",")
+      "[{joined}]"
+    }
+    Value.Fields(fields) => {
+      let mut parts: List<String> = []
+      for name in fields.keys() {
+        parts = parts.push("{quote(name)}:{write(get(v, name))}")
+      }
+      let joined = parts.join(",")
+      "\{{joined}}"
+    }
+  }
+}
+
+test "json を読んで取り出す" {
+  let v = parse(" \{\"name\": \"ユイ\", \"xs\": [1, -2.5, 3e2], \"ok\": true, \"none\": null, \"in\": \{\"a\": \"b\\n\\u3042\\ud83d\\ude00\\\"\"}} ").unwrap_or(Value.Null)
+  assert text_of(get(v, "name")) == "ユイ"
+  assert int_of(at(get(v, "xs"), 0)) == 1
+  assert float_of(at(get(v, "xs"), 1)) == -2.5
+  assert int_of(at(get(v, "xs"), 2)) == 300
+  assert flag_of(get(v, "ok"))
+  assert items(get(v, "xs")).len() == 3
+  assert text_of(get(get(v, "in"), "a")) == "b\nあ😀\""
+  assert text_of(get(v, "missing")) == ""
+  assert int_of(at(get(v, "xs"), 9)) == 0
+}
+
+test "json を書く" {
+  assert quote("a\"b\\c\nd") == "\"a\\\"b\\\\c\\nd\""
+  let text = "\{\"a\":[1,2.5,\"x\"],\"b\":\{\"c\":null,\"d\":false}}"
+  assert write(parse(text).unwrap_or(Value.Null)) == text
+}
+
+test "json の間違いは Err になる" {
+  assert parse("[1, 2").is_err()
+  assert parse("\{\"a\" 1}").is_err()
+  assert parse("\"abc").is_err()
+  assert parse("[1] x").is_err()
+  assert parse("").is_err()
+}

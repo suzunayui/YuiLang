@@ -115,7 +115,11 @@ $ yui build games/blocks.yui -o blocks.exe  45 KB の実行ファイルにする
 - [games/blocks3d.yui](games/blocks3d.yui): 3 次元のブロックの世界。歩き回って、壊したり置いたりできる。
   計算が多いので `yui build` で実行ファイルにしてから遊ぶ（63 KB、1 秒に約 76 コマ）
 - [games/blocks_gpu.yui](games/blocks_gpu.yui): 同じ世界を GPU で描く版。世界は 16 倍の広さ（128 × 128 マス）、
-  絵は 1280 × 720（引数で 1920 × 1080 にもできる）で、1 秒に 60 コマ。実行ファイルは 84 KB
+  絵は 1280 × 720（引数で 1920 × 1080 にもできる）で、1 秒に 60 コマ。実行ファイルは 86 KB
+- [games/blocks_ai.yui](games/blocks_ai.yui): AI の仲間「ユイ」と一緒に遊ぶ版。Enter でお願いを書くと
+  （「木を集めてきてー」「かわいいおうち建ててー」）、ユイが木を集めたり家を建てたりする。
+  ユイの頭脳は Claude で、環境変数 `ANTHROPIC_API_KEY` に API キーが要る（なければ決まった返事だけ）。
+  通信も JSON も文字の表示も YuiLang だけで書いてあり、ほかの言語や道具は使わない
 
 使える関数は [SPEC.md](SPEC.md) の「ウィンドウ・入力・時刻・乱数」と「GPU で 3 次元の絵を描く」にあります。
 
@@ -138,7 +142,7 @@ error[E0305]: unused value of type `List<Int>`
 - `struct` / `enum` とパターンマッチ（網羅性と到達不能な腕を検査）
 - クロージャと関数型（`|x| x + 1`、`fn(Int) -> Int`）
 - `Option` / `Result` と `?` 演算子（null と例外はない）
-- 副作用の宣言（`uses io`、`uses fs`）
+- 副作用の宣言（`uses io`、`uses fs`、`uses net`）
 - 契約（`requires` / `ensures`）と言語組み込みの `test` / `assert`
 - モジュール（`import geometry.shapes` → `shapes.area(...)`）
 - `List` / `Map` / `String` の標準メソッド

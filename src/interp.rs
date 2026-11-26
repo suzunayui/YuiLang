@@ -1521,6 +1521,21 @@ impl<'a> Interp<'a> {
                         window::gpu_rect(int(0), int(1), int(2), int(3), int(4));
                         Value::Unit
                     }
+                    "gpu_text" => {
+                        window::gpu_text(int(0), int(1), int(2), int(3), &name_of(4));
+                        Value::Unit
+                    }
+                    "text_input" => Value::str(&window::text_input()),
+                    "env" => Value::str(&std::env::var(name_of(0)).unwrap_or_default()),
+                    "http_start" => {
+                        let headers: Vec<String> = match args.get(2) {
+                            Some(Value::List(items)) => items.iter().map(|v| v.display()).collect(),
+                            _ => Vec::new(),
+                        };
+                        Value::Int(crate::net::start(&name_of(0), &name_of(1), &headers, &name_of(3)))
+                    }
+                    "http_done" => Value::Bool(crate::net::done(int(0))),
+                    "http_result" => result(crate::net::take(int(0)).map(|text| Value::str(&text))),
                     _ => return Err(internal(span)),
                 })
             }

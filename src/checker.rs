@@ -1464,6 +1464,15 @@ impl Checker {
             }
             "gpu_draw" => Some((vec![Type::Int, Type::Float, Type::Float, Type::Float], Type::Unit, &["io"])),
             "gpu_rect" => Some((vec![Type::Int; 5], Type::Unit, &["io"])),
+            "gpu_text" => Some((vec![Type::Int, Type::Int, Type::Int, Type::Int, string()], Type::Unit, &["io"])),
+            "text_input" => Some((vec![], string(), &["io"])),
+            "env" => Some((vec![string()], string(), &["io"])),
+            "http_start" => {
+                let params = vec![string(), string(), Type::List(Box::new(string())), string()];
+                Some((params, Type::Int, &["net"]))
+            }
+            "http_done" => Some((vec![Type::Int], Type::Bool, &["net"])),
+            "http_result" => Some((vec![Type::Int], result(string()), &["net"])),
             _ => None,
         };
         let (params, ret, effects) = match builtin {

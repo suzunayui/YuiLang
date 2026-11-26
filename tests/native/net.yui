@@ -1,0 +1,35 @@
+// 通信・環境変数・文字の入力のうち、ネットワークもウィンドウも要らない部分
+
+fn show(id: Int) uses io, net {
+  let mut spins = 0
+  while !http_done(id) && spins < 2000 {
+    sleep_ms(5)
+    spins = spins + 1
+  }
+  match http_result(id) {
+    Ok(text) => print("ok {text.len()}")
+    Err(why) => print("err {why}")
+  }
+}
+
+fn main() uses io, net {
+  // 行き先として読めない文字列は、つなぎに行く前に失敗する
+  let id = http_start("GET", "not a url", ["Accept: text/plain"], "")
+  print("{id} {http_done(99)} {http_done(0)} {http_done(-3)}")
+  show(id)
+  // 受け取った番号は使い終わり。知らない番号も同じ扱い
+  show(id)
+  show(0)
+  show(9)
+  // 番号は使い回される
+  let again = http_start("POST", "", [], "body")
+  print("{again}")
+  show(again)
+  let missing = env("YUILANG_NO_SUCH_VARIABLE")
+  let path = env("PATH")
+  print("{missing.len()} {path.len() > 0}")
+  // ウィンドウがなければ、打たれた文字はなく、文字を描いても何も起きない
+  let typed = text_input()
+  gpu_text(10, 10, 24, rgb(255, 255, 255), "こんにちは")
+  print("{typed.len()}")
+}

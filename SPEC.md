@@ -143,8 +143,9 @@ fn save(path: String, text: String) -> Result<Unit, String> uses fs {
 
 | 効果 | 意味 |
 | --- | --- |
-| `io` | 標準入出力、コマンドライン引数 |
+| `io` | 標準入出力、コマンドライン引数、ウィンドウ、時刻、乱数、環境変数 |
 | `fs` | ファイルの読み書き |
+| `net` | ネットワーク越しの通信 |
 
 - 宣言していない効果を持つ関数を呼ぶとコンパイルエラーになる。複数あるときは `uses io, fs`。
 - クロージャの効果は本体から推論され、関数型に現れる（`|x| print(x)` は `fn(String) uses io`）。
@@ -295,6 +296,8 @@ fn parse_pair(a: String, b: String) -> Option<Int> {
 | `sleep_ms(ms)` | `(Int) -> Unit uses io`。指定した時間だけ待つ |
 | `random(limit)` | `(Int) -> Int uses io`。0 以上 `limit` 未満の乱数（`limit` が 0 以下なら 0） |
 | `random_seed(seed)` | `(Int) -> Unit uses io`。乱数の種を決める。同じ種なら同じ並びになる |
+| `text_input()` | `() -> String uses io`。前に呼んでからウィンドウに打たれた文字（日本語入力で確定した文字も届く）。Enter は改行 `"\n"`、Backspace は文字コード 8、Esc は 27 の文字として入る。ウィンドウがなければ空 |
+| `env(name)` | `(String) -> String uses io`。環境変数の値。なければ空の文字列 |
 
 描画は、ウィンドウの持つ点の表に色を書き込むだけで、`window_update()` を呼んだときに画面に出る。
 キーとマウスは、そのウィンドウが手前にあるときだけ反応する。ゲームの基本の形:
@@ -331,6 +334,7 @@ fn main() uses io {
 | `gpu_free(mesh)` | `(Int) -> Unit uses io`。覚えさせた三角形を捨てる（作り直す前に呼ぶ） |
 | `gpu_fog(color, start, end)` | `(Int, Int, Int) -> Unit uses io`。距離 `start` から `end` にかけて、遠いものを `color` に溶け込ませる。`end <= start` なら霧なし |
 | `gpu_rect(x, y, width, height, color)` | `(Int, Int, Int, Int, Int) -> Unit uses io`。絵の上に重ねる長方形（照準や持ち物の表示用）。左上が `(0, 0)`、単位は画面の点 |
+| `gpu_text(x, y, size, color, text)` | `(Int, Int, Int, Int, String) -> Unit uses io`。絵の上に重ねる文字。左上が `(x, y)`、文字の高さが `size` 点（6〜200）。日本語も描ける。`"\n"` で次の行へ進む。`x` や `y` が負だと描かれない。同時に使える大きさは 4 種類まで（5 種類目は古いものと入れ替わる） |
 
 GPU のウィンドウを開いていないとき、これらは何もしない（`gpu_mesh` は 0 を返す）。
 形が変わらないものは `gpu_mesh` を 1 回だけ呼び、毎コマは `gpu_draw` だけを呼ぶ。基本の形:
@@ -352,6 +356,33 @@ fn main() uses io {
   }
 }
 ```
+
+**通信（HTTP / HTTPS）**（いまは Windows だけ。ほかの OS では、どの依頼も失敗として返る）
+
+依頼は裏で進む。始めたら番号を受け取り、終わったかを調べ、終わっていたら結果を受け取る。
+待っている間もプログラムは止まらないので、ゲームは描き続けられる。
+
+| 関数 | 型と意味 |
+| --- | --- |
+| `http_start(method, url, headers, body)` | `(String, String, List<String>, String) -> Int uses net`。依頼を始めて、その番号（1 以上）を返す。`headers` は `"名前: 値"` の並び。同時に進められるのは 8 件までで、超えると 0 |
+| `http_done(id)` | `(Int) -> Bool uses net`。その依頼が終わったか。毎コマ呼んでよい（進められる分だけ進める）。知らない番号には `true` |
+| `http_result(id)` | `(Int) -> Result<String, String> uses net`。結果を 1 回だけ受け取る。相手が 200 番台で答えたら `Ok(本文)`。それ以外は `Err`: `"HTTP 404: 本文"`、`"the request failed (os error 番号)"`（つながらなかった）、`"the request has not finished"`、`"no such request"`、`"the response was not valid UTF-8"` |
+
+```
+fn main() uses io, net {
+  let id = http_start("GET", "https://example.com/", ["Accept: text/html"], "")
+  while !http_done(id) {
+    sleep_ms(10)
+  }
+  match http_result(id) {
+    Ok(text) => print("{text.len()} 文字")
+    Err(why) => print(why)
+  }
+}
+```
+
+JSON の読み書きは、YuiLang で書いた部品 [games/json.yui](games/json.yui) にある（`import json`）。
+Claude（Anthropic の API）を呼ぶ部品は [games/claude.yui](games/claude.yui) にある。
 
 ### メソッド
 

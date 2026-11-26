@@ -66,7 +66,7 @@ const STDERR: i64 = -12;
 /// Functions imported from kernel32.dll, in the order of the import table.
 /// Functions of the operating system that the generated code may call: the
 /// library and the name. An executable imports the ones it actually uses.
-const IMPORTS: [(&str, &str); 72] = [
+const IMPORTS: [(&str, &str); 92] = [
     ("KERNEL32.dll", "GetStdHandle"),
     ("KERNEL32.dll", "WriteFile"),
     ("KERNEL32.dll", "ExitProcess"),
@@ -87,6 +87,7 @@ const IMPORTS: [(&str, &str); 72] = [
     ("KERNEL32.dll", "CreateWaitableTimerExW"),
     ("KERNEL32.dll", "SetWaitableTimer"),
     ("KERNEL32.dll", "WaitForSingleObject"),
+    ("KERNEL32.dll", "GetEnvironmentVariableW"),
     ("USER32.dll", "RegisterClassExW"),
     ("USER32.dll", "CreateWindowExW"),
     ("USER32.dll", "DefWindowProcW"),
@@ -139,12 +140,31 @@ const IMPORTS: [(&str, &str); 72] = [
     ("OPENGL32.dll", "glPopAttrib"),
     ("OPENGL32.dll", "glFogi"),
     ("OPENGL32.dll", "glFogfv"),
+    ("WINHTTP.dll", "WinHttpOpen"),
+    ("WINHTTP.dll", "WinHttpSetStatusCallback"),
+    ("WINHTTP.dll", "WinHttpSetTimeouts"),
+    ("WINHTTP.dll", "WinHttpCrackUrl"),
+    ("WINHTTP.dll", "WinHttpConnect"),
+    ("WINHTTP.dll", "WinHttpOpenRequest"),
+    ("WINHTTP.dll", "WinHttpAddRequestHeaders"),
+    ("WINHTTP.dll", "WinHttpSendRequest"),
+    ("WINHTTP.dll", "WinHttpReceiveResponse"),
+    ("WINHTTP.dll", "WinHttpQueryHeaders"),
+    ("WINHTTP.dll", "WinHttpQueryDataAvailable"),
+    ("WINHTTP.dll", "WinHttpReadData"),
+    ("WINHTTP.dll", "WinHttpCloseHandle"),
+    ("GDI32.dll", "CreateFontW"),
+    ("GDI32.dll", "SelectObject"),
+    ("GDI32.dll", "DeleteObject"),
+    ("GDI32.dll", "GetTextMetricsW"),
+    ("OPENGL32.dll", "glRasterPos2i"),
+    ("OPENGL32.dll", "wglUseFontBitmapsW"),
 ];
 /// The imports `runtime.yui` may call as `__os_<name>(...)`, with how many
 /// arguments each takes. They follow the same calling convention as the
 /// code this compiler makes, so a call is an ordinary call. (The address of
 /// any import can also be had with `__import_<name>()`.)
-const OS_CALLS: [(&str, usize); 67] = [
+const OS_CALLS: [(&str, usize); 87] = [
     ("GetStdHandle", 1),
     ("WriteFile", 5),
     ("ReadFile", 5),
@@ -212,6 +232,26 @@ const OS_CALLS: [(&str, usize); 67] = [
     ("glPopAttrib", 0),
     ("glFogi", 2),
     ("glFogfv", 2),
+    ("GetEnvironmentVariableW", 3),
+    ("WinHttpOpen", 5),
+    ("WinHttpSetStatusCallback", 4),
+    ("WinHttpSetTimeouts", 5),
+    ("WinHttpCrackUrl", 4),
+    ("WinHttpConnect", 4),
+    ("WinHttpOpenRequest", 7),
+    ("WinHttpAddRequestHeaders", 4),
+    ("WinHttpSendRequest", 7),
+    ("WinHttpReceiveResponse", 2),
+    ("WinHttpQueryHeaders", 6),
+    ("WinHttpQueryDataAvailable", 2),
+    ("WinHttpReadData", 4),
+    ("WinHttpCloseHandle", 1),
+    ("CreateFontW", 14),
+    ("SelectObject", 2),
+    ("DeleteObject", 1),
+    ("GetTextMetricsW", 2),
+    ("glRasterPos2i", 2),
+    ("wglUseFontBitmapsW", 4),
 ];
 /// Those of `OS_CALLS` that take floats. Windows wants a float argument in an
 /// xmm register rather than a general one, so the first four arguments are
@@ -279,11 +319,12 @@ const POOL_NEXT: usize = 88;
 const POOL_END: usize = 96;
 /// Cells the runtime keeps things in between calls (`__global(i)`): the
 /// window, its pixels and size, the state of the random numbers, what the
-/// graphics card draws on and its OpenGL context.
+/// graphics card draws on and its OpenGL context, the requests over the
+/// network that are under way (cells 8 to 15), what was typed, the letters.
 const GLOBALS: usize = 104;
 const GLOBAL_SCALE: usize = 4;
 /// Where the rest of the writable memory starts: tables of remembered results.
-const BSS_FIXED: usize = GLOBALS + 8 * 8;
+const BSS_FIXED: usize = GLOBALS + 8 * 24;
 /// How many results a function remembers.
 const MEMO_ENTRIES: usize = 1024;
 /// Blocks up to this size come from the small-block allocator.
@@ -475,6 +516,10 @@ struct Native<'a> {
     rt_contract: usize,
     /// For each of `OS_CALLS`: the label of a jump to the import.
     os_labels: Vec<usize>,
+    /// What the system calls when a step of a request over the network has
+    /// finished, and whether the program needs it.
+    rt_http_callback: usize,
+    uses_http_callback: bool,
     /// Whether those two are needed.
     uses_errors: bool,
     /// Closures to compile, and for each function used as a value, the code
@@ -567,6 +612,7 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
     let (rt_alloc, rt_realloc, rt_free) = (a.label(), a.label(), a.label());
     let (rt_pool_alloc, rt_pool_free) = (a.label(), a.label());
     let (rt_number, rt_contract) = (a.label(), a.label());
+    let rt_http_callback = a.label();
     let mut os_labels = Vec::new();
     for (name, params) in OS_CALLS {
         let label = a.label();
@@ -600,6 +646,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         rt_number,
         rt_contract,
         os_labels,
+        rt_http_callback,
+        uses_http_callback: false,
         uses_errors: false,
         closures: Vec::new(),
         thunks: HashMap::new(),
@@ -1894,6 +1942,31 @@ impl Native<'_> {
                 self.iat_fixups.push((self.a.buf.len(), import));
                 self.a.d32(0);
             }
+        }
+
+        // The system calls this, on a thread of its own, when a step of a
+        // request has finished: callback(handle, rdx = the request's block,
+        // r8d = what finished, r9 = more about it, [rsp + 40] = its length).
+        // It only notes that down for `http_done` to act on: the length at
+        // block + 8, a number at block + 16 (how much data is waiting, or the
+        // error code), and last, at block + 0, what finished.
+        if self.uses_http_callback {
+            self.a.bind(self.rt_http_callback);
+            self.a.buf.extend_from_slice(&[0x48, 0x85, 0xD2]); // test rdx, rdx
+            self.a.buf.extend_from_slice(&[0x74, 45]); // jz done
+            self.a.buf.extend_from_slice(&[0x45, 0x89, 0xC0]); // mov r8d, r8d
+            self.a.buf.extend_from_slice(&[0x8B, 0x44, 0x24, 0x28]); // mov eax, [rsp + 40]
+            self.a.buf.extend_from_slice(&[0x48, 0x89, 0x42, 0x08]); // mov [rdx + 8], rax
+            self.a.buf.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+            self.a.buf.extend_from_slice(&[0x41, 0x81, 0xF8, 0x00, 0x00, 0x04, 0x00]); // cmp r8d, data available
+            self.a.buf.extend_from_slice(&[0x75, 0x03]); // jne +3
+            self.a.buf.extend_from_slice(&[0x41, 0x8B, 0x01]); // mov eax, [r9]
+            self.a.buf.extend_from_slice(&[0x41, 0x81, 0xF8, 0x00, 0x00, 0x20, 0x00]); // cmp r8d, request error
+            self.a.buf.extend_from_slice(&[0x75, 0x04]); // jne +4
+            self.a.buf.extend_from_slice(&[0x41, 0x8B, 0x41, 0x08]); // mov eax, [r9 + 8]
+            self.a.buf.extend_from_slice(&[0x48, 0x89, 0x42, 0x10]); // mov [rdx + 16], rax
+            self.a.buf.extend_from_slice(&[0x4C, 0x89, 0x02]); // mov [rdx], r8
+            self.a.b(0xC3); // done: ret
         }
 
         // Reached with the stack as inside the routines above.
@@ -4389,15 +4462,15 @@ impl Native<'_> {
                 self.a.mov_rr(dst, RAX);
                 Ok(Some(ty))
             }
-            ("read_file", [path]) => {
+            ("read_file" | "http_result", [path]) => {
                 // The routine gives the text, or the message of the error,
                 // and says which it is in `ok`.
                 let ty = self.ty_text("Result<String, String>", &[], span)?;
-                let (p, owned, _) = self.park(path, dst)?;
+                let (p, owned, given) = self.park(path, dst)?;
                 let ok = self.push_spill();
                 self.a.load(RCX, p);
                 self.a.lea(RDX, ok);
-                self.call_rt("file_read");
+                self.call_rt(if name == "read_file" { "file_read" } else { "http_take" });
                 let text = self.push_spill();
                 self.a.store(text, RAX);
                 self.fill_block(self.size_of(ty), &[(text, 16)], dst);
@@ -4405,7 +4478,7 @@ impl Native<'_> {
                 self.a.load(RAX, ok);
                 self.a.buf.extend_from_slice(&[0x48, 0x83, 0xF0, 0x01]); // xor rax, 1
                 self.a.store(M(dst, 8), RAX);
-                if owned {
+                if owned && given.heap() {
                     self.a.load(RCX, p);
                     self.release_keeping(dst, Ty::Str);
                 }
@@ -4454,14 +4527,29 @@ impl Native<'_> {
             | ("gpu_camera", [_, _, _, _, _])
             | ("gpu_fog", [_, _, _])
             | ("gpu_draw", [_, _, _, _])
-            | ("gpu_rect", [_, _, _, _, _]) => {
+            | ("gpu_rect" | "gpu_text", [_, _, _, _, _]) => {
                 self.call_rt_with(name, args, dst)?;
                 Ok(Some(Ty::Unit))
             }
-            ("gpu_mesh", [_, _]) => {
+            ("gpu_mesh", [_, _]) | ("http_start", [_, _, _, _]) => {
                 self.call_rt_with(name, args, dst)?;
                 self.a.mov_rr(dst, RAX);
                 Ok(Some(Ty::Int))
+            }
+            ("text_input", []) => {
+                self.call_rt("text_input");
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Str))
+            }
+            ("env", [_]) => {
+                self.call_rt_with("env_get", args, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Str))
+            }
+            ("http_done", [_]) => {
+                self.call_rt_with(name, args, dst)?;
+                self.a.mov_rr(dst, RAX);
+                Ok(Some(Ty::Bool))
             }
             ("rgb", [_, _, _]) | ("time_ms", []) => {
                 self.call_rt_with(name, args, dst)?;
@@ -4571,6 +4659,11 @@ impl Native<'_> {
                 };
                 // lea dst, [cell]
                 self.rip_bss(&[0x48 | (dst >> 3) << 2, 0x8D, 0x05 | (dst & 7) << 3], GLOBALS + 8 * index as usize);
+                Ok(Ty::Int)
+            }
+            ("__http_callback", []) => {
+                self.uses_http_callback = true;
+                self.lea_label(dst, self.rt_http_callback);
                 Ok(Ty::Int)
             }
             (_, []) if name.starts_with("__import_") => {

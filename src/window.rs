@@ -23,6 +23,9 @@ struct Window {
     /// OpenGL context.
     #[cfg(windows)]
     gpu: Option<(isize, isize)>,
+    /// What was typed into the window since `text_input` was last called.
+    #[cfg(windows)]
+    typed: Vec<u16>,
 }
 
 thread_local! {
@@ -168,6 +171,10 @@ mod os {
     pub fn gpu_draw(_mesh: i64, _x: f64, _y: f64, _z: f64) {}
     pub fn gpu_free(_mesh: i64) {}
     pub fn gpu_rect(_x: i64, _y: i64, _width: i64, _height: i64, _color: i64) {}
+    pub fn gpu_text(_x: i64, _y: i64, _size: i64, _color: i64, _text: &str) {}
+    pub fn text_input() -> String {
+        String::new()
+    }
 }
 
 #[cfg(windows)]
@@ -285,6 +292,26 @@ mod os {
         fn ChoosePixelFormat(dc: isize, format: *const PixelFormat) -> i32;
         fn SetPixelFormat(dc: isize, index: i32, format: *const PixelFormat) -> i32;
         fn SwapBuffers(dc: isize) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        fn CreateFontW(
+            height: i32,
+            width: i32,
+            escapement: i32,
+            orientation: i32,
+            weight: i32,
+            italic: u32,
+            underline: u32,
+            strike_out: u32,
+            char_set: u32,
+            out_precision: u32,
+            clip_precision: u32,
+            quality: u32,
+            pitch_and_family: u32,
+            face: *const u16,
+        ) -> isize;
+        fn SelectObject(dc: isize, object: isize) -> isize;
+        fn DeleteObject(object: isize) -> i32;
+        fn GetTextMetricsW(dc: isize, metrics: *mut [i32; 16]) -> i32;
     }
 
     /// What kind of surface OpenGL is to draw on (PIXELFORMATDESCRIPTOR).
@@ -335,6 +362,37 @@ mod os {
         fn glPopAttrib();
         fn glFogi(name: u32, value: i32);
         fn glFogfv(name: u32, values: *const f32);
+        fn glRasterPos2i(x: i32, y: i32);
+        fn wglUseFontBitmapsW(dc: isize, first: u32, count: u32, list_base: u32) -> i32;
+    }
+
+    /// Letters of one size, as pictures the graphics card keeps: the font,
+    /// the number of the first of 65,536 lists (one per character), which of
+    /// them have been made, and how far the top and the next line are from
+    /// the line the letters stand on.
+    struct Font {
+        size: i64,
+        handle: isize,
+        base: u32,
+        made: Vec<bool>,
+        ascent: i32,
+        height: i32,
+    }
+
+    thread_local! {
+        static FONTS: std::cell::RefCell<Vec<Font>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Forgets the letters (their pictures went with the window they were made for).
+    fn forget_fonts() {
+        FONTS.with(|f| {
+            for font in f.borrow_mut().drain(..) {
+                // Safety: a font this module created.
+                unsafe {
+                    DeleteObject(font.handle);
+                }
+            }
+        });
     }
 
     const DEPTH_TEST: u32 = 0x0B71;
@@ -360,7 +418,7 @@ mod os {
         let (width, height, scale) = (width.clamp(1, 4096), height.clamp(1, 4096), scale.clamp(1, 64));
         let handle = create(title, width * scale, height * scale)?;
         let pixels = vec![0u32; (width * height) as usize];
-        WINDOW.with(|w| *w.borrow_mut() = Some(Window { handle, width, height, scale, pixels, gpu: None }));
+        WINDOW.with(|w| *w.borrow_mut() = Some(Window { handle, width, height, scale, pixels, gpu: None, typed: Vec::new() }));
         Ok(())
     }
 
@@ -462,7 +520,7 @@ mod os {
             glLoadIdentity();
             (dc, context)
         };
-        let window = Window { handle, width, height, scale: 1, pixels: Vec::new(), gpu: Some(gpu) };
+        let window = Window { handle, width, height, scale: 1, pixels: Vec::new(), gpu: Some(gpu), typed: Vec::new() };
         WINDOW.with(|w| *w.borrow_mut() = Some(window));
         Ok(())
     }
@@ -560,22 +618,38 @@ mod os {
         })
     }
 
+    /// Sets things up to draw flat, on top of the picture, in pixels from the top left.
+    unsafe fn overlay_begin(window: &Window) {
+        glPushAttrib(0x2000);
+        glDisable(DEPTH_TEST);
+        glDisable(FOG);
+        glMatrixMode(PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0.0, window.width as f64, window.height as f64, 0.0, -1.0, 1.0);
+        glMatrixMode(MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+    }
+
+    unsafe fn overlay_end() {
+        glPopMatrix();
+        glMatrixMode(PROJECTION);
+        glPopMatrix();
+        glMatrixMode(MODELVIEW);
+        glPopAttrib();
+    }
+
+    fn limit(n: i64) -> i32 {
+        n.clamp(-(1 << 20), 1 << 20) as i32
+    }
+
     /// A rectangle on top of the picture, in pixels from the top left.
     pub fn gpu_rect(x: i64, y: i64, width: i64, height: i64, color: i64) {
         with_gpu(|window| unsafe {
-            let limit = |n: i64| n.clamp(-(1 << 20), 1 << 20) as i32;
             let (left, top, right, bottom) = (limit(x), limit(y), limit(x) + limit(width), limit(y) + limit(height));
             let [r, g, b] = parts(color);
-            glPushAttrib(0x2000);
-            glDisable(DEPTH_TEST);
-            glDisable(FOG);
-            glMatrixMode(PROJECTION);
-            glPushMatrix();
-            glLoadIdentity();
-            glOrtho(0.0, window.width as f64, window.height as f64, 0.0, -1.0, 1.0);
-            glMatrixMode(MODELVIEW);
-            glPushMatrix();
-            glLoadIdentity();
+            overlay_begin(window);
             glColor3ub(r, g, b);
             glBegin(7);
             glVertex2i(left, top);
@@ -583,11 +657,77 @@ mod os {
             glVertex2i(right, bottom);
             glVertex2i(left, bottom);
             glEnd();
-            glPopMatrix();
-            glMatrixMode(PROJECTION);
-            glPopMatrix();
-            glMatrixMode(MODELVIEW);
-            glPopAttrib();
+            overlay_end();
+        })
+    }
+
+    /// Text on top of the picture: its top left at (x, y), letters `size`
+    /// pixels high. A line feed starts a new line.
+    pub fn gpu_text(x: i64, y: i64, size: i64, color: i64, text: &str) {
+        with_gpu(|window| unsafe {
+            let Some((dc, _)) = window.gpu else { return };
+            let size = size.clamp(6, 200);
+            FONTS.with(|f| {
+                let mut fonts = f.borrow_mut();
+                let index = match fonts.iter().position(|font| font.size == size) {
+                    Some(index) => index,
+                    None => {
+                        // Four sizes are kept; a fifth replaces the first.
+                        if fonts.len() == 4 {
+                            let old = fonts.remove(0);
+                            glDeleteLists(old.base, 65536);
+                            DeleteObject(old.handle);
+                        }
+                        let face = wide("Yu Gothic UI");
+                        let handle = CreateFontW(-(size as i32), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.as_ptr());
+                        SelectObject(dc, handle);
+                        let mut metrics = [0i32; 16];
+                        GetTextMetricsW(dc, &mut metrics);
+                        let base = glGenLists(65536);
+                        fonts.push(Font { size, handle, base, made: vec![false; 65536], ascent: metrics[1], height: metrics[0] });
+                        fonts.len() - 1
+                    }
+                };
+                let font = &mut fonts[index];
+                if font.base == 0 {
+                    return;
+                }
+                let [r, g, b] = parts(color);
+                overlay_begin(window);
+                glColor3ub(r, g, b);
+                let (left, mut line) = (limit(x), limit(y) + font.ascent);
+                glRasterPos2i(left, line);
+                let mut selected = false;
+                for ch in text.chars() {
+                    let code = ch as u32;
+                    if code == 10 {
+                        line += font.height;
+                        glRasterPos2i(left, line);
+                    } else if (32..65536).contains(&code) {
+                        if !font.made[code as usize] {
+                            if !selected {
+                                SelectObject(dc, font.handle);
+                                selected = true;
+                            }
+                            // The first call is known to fail now and then.
+                            if wglUseFontBitmapsW(dc, code, 1, font.base + code) == 0 {
+                                wglUseFontBitmapsW(dc, code, 1, font.base + code);
+                            }
+                            font.made[code as usize] = true;
+                        }
+                        glCallList(font.base + code);
+                    }
+                }
+                overlay_end();
+            });
+        })
+    }
+
+    /// What was typed into the window since the last call. Enter is a line feed.
+    pub fn text_input() -> String {
+        WINDOW.with(|w| match w.borrow_mut().as_mut() {
+            Some(window) => String::from_utf16_lossy(&std::mem::take(&mut window.typed)),
+            None => String::new(),
         })
     }
 
@@ -596,16 +736,22 @@ mod os {
     pub fn update() -> bool {
         WINDOW.with(|w| {
             let mut slot = w.borrow_mut();
-            let Some(window) = slot.as_ref() else { return false };
+            let Some(window) = slot.as_mut() else { return false };
             // Safety: `Message` and `BitmapInfo` are laid out as Windows
             // expects; the pixels outlive the call that reads them.
             unsafe {
                 let mut message: Message = std::mem::zeroed();
                 while PeekMessageW(&mut message, 0, 0, 0, 1) != 0 {
+                    // 0x0102 = a character was typed (Enter arrives as 13).
+                    if message.message == 0x0102 && window.typed.len() < 256 {
+                        let unit = message.w as u16;
+                        window.typed.push(if unit == 13 { 10 } else { unit });
+                    }
                     TranslateMessage(&message);
                     DispatchMessageW(&message);
                 }
                 if IsWindow(window.handle) == 0 {
+                    forget_fonts();
                     *slot = None;
                     return false;
                 }
@@ -652,6 +798,7 @@ mod os {
                 // Safety: the handle is one this module created.
                 unsafe {
                     if let Some((_, context)) = window.gpu {
+                        forget_fonts();
                         wglMakeCurrent(0, 0);
                         wglDeleteContext(context);
                     }
@@ -704,4 +851,4 @@ mod os {
 }
 
 pub use os::{close, key_down, mouse, mouse_down, open, update};
-pub use os::{gpu_camera, gpu_clear, gpu_draw, gpu_fog, gpu_free, gpu_mesh, gpu_open, gpu_rect};
+pub use os::{gpu_camera, gpu_clear, gpu_draw, gpu_fog, gpu_free, gpu_mesh, gpu_open, gpu_rect, gpu_text, text_input};

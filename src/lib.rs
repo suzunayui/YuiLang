@@ -10,6 +10,7 @@ pub mod interp;
 pub mod jit;
 pub mod lexer;
 pub mod parser;
+pub mod net;
 pub mod window;
 
 use diag::{Diagnostic, SourceMap, Span};

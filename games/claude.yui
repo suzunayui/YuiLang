@@ -1,0 +1,117 @@
+// Claude（Anthropic の API）に話しかける。
+//
+//   let id = claude.ask(key, system, user, schema)   依頼を始める（裏で進むので、待つ間もゲームは止まらない）
+//   if http_done(id) {                               終わったか毎コマ調べる
+//     match claude.answer(http_result(id)) {         返事の本文（schema どおりの JSON の文字列）を取り出す
+//       Ok(text) => ...
+//       Err(why) => ...
+//     }
+//   }
+//
+// key は API キー。環境変数 ANTHROPIC_API_KEY から env("ANTHROPIC_API_KEY") で読む。
+// schema は、返事の形を決める JSON スキーマ（JSON の文字列）。返事は必ずその形の JSON になる。
+
+import json
+
+// 使うモデル。速さと賢さのつり合いで選ぶ（"claude-sonnet-5-5" や "claude-haiku-5-5" にすると速く安くなる）
+fn model() -> String {
+  "claude-opus-5-5"
+}
+
+// どのくらい深く考えさせるか: "low" / "medium" / "high"。深いほど返事が遅く、高くなる
+fn effort() -> String {
+  "low"
+}
+
+// 送る本文（JSON）を組み立てる
+fn body(system: String, user: String, schema: String) -> String {
+  let parts = [
+    "\{\"model\":{json.quote(model())}",
+    "\"max_tokens\":16000",
+    // 安全上の理由で断られたときは、別のモデルで続ける
+    "\"fallbacks\":\"default\"",
+    "\"output_config\":\{\"effort\":{json.quote(effort())},\"format\":\{\"type\":\"json_schema\",\"schema\":{schema}}}",
+    "\"system\":{json.quote(system)}",
+    "\"messages\":[\{\"role\":\"user\",\"content\":{json.quote(user)}}]}",
+  ]
+  parts.join(",")
+}
+
+// 依頼を始めて、その番号を返す（http_done / http_result に渡す）
+fn ask(key: String, system: String, user: String, schema: String) -> Int uses net {
+  let headers = [
+    "Content-Type: application/json",
+    "x-api-key: {key}",
+    "anthropic-version: 2026-10-21",
+    "anthropic-beta: server-side-fallback-2026-07-01",
+  ]
+  http_start("POST", "https://api.anthropic.com/v1/messages", headers, body(system, user, schema))
+}
+
+// http_result の結果から、返事の本文を取り出す
+fn answer(result: Result<String, String>) -> Result<String, String> {
+  match result {
+    Ok(text) => reply_text(text)
+    Err(why) => Err(explain(why))
+  }
+}
+
+// 失敗の説明を、何をすればよいか分かる文にする
+fn explain(why: String) -> String {
+  if why.starts_with("HTTP 401") { return "API キーが正しくないようです（ANTHROPIC_API_KEY を確かめてください）" }
+  if why.starts_with("HTTP 429") { return "いま混み合っているか、利用の上限に達しています。少し待ってからもう一度どうぞ" }
+  if why.starts_with("HTTP 529") || why.starts_with("HTTP 5") { return "Claude の側が一時的に応答できません。少し待ってからもう一度どうぞ" }
+  if why.starts_with("the request failed") { return "ネットワークにつながりませんでした（{why}）" }
+  // API が返した説明があれば、それを見せる
+  let parts = why.split(": ")
+  if parts.len() >= 2 {
+    let rest = why.slice(parts[0].len() + 2, why.len())
+    match json.parse(rest) {
+      Ok(v) => {
+        let message = json.text_of(json.get(json.get(v, "error"), "message"))
+        if !message.is_empty() { return "{parts[0]}: {message}" }
+      }
+      Err(_) => {}
+    }
+  }
+  why
+}
+
+// API の返事（JSON）から、文章の部分をつないで取り出す
+fn reply_text(response: String) -> Result<String, String> {
+  let v = json.parse(response)?
+  let reason = json.text_of(json.get(v, "stop_reason"))
+  if reason == "refusal" { return Err("そのお願いには応えられないそうです") }
+  if reason == "max_tokens" { return Err("返事が長すぎて途中で切れました。もう少し小さなお願いにしてみてください") }
+  let mut pieces: List<String> = []
+  for block in json.items(json.get(v, "content")) {
+    if json.text_of(json.get(block, "type")) == "text" {
+      pieces = pieces.push(json.text_of(json.get(block, "text")))
+    }
+  }
+  if pieces.is_empty() { return Err("返事に文章がありませんでした") }
+  Ok(pieces.join(""))
+}
+
+test "送る本文は正しい JSON になる" {
+  let text = body("あなたは\"仲間\"です", "木を集めて\nきて", "\{\"type\":\"object\"}")
+  let v = json.parse(text).unwrap_or(json.Value.Null)
+  assert json.text_of(json.get(v, "model")) == model()
+  assert json.text_of(json.get(v, "system")) == "あなたは\"仲間\"です"
+  assert json.text_of(json.get(json.at(json.get(v, "messages"), 0), "content")) == "木を集めて\nきて"
+  assert json.text_of(json.get(json.get(json.get(json.get(v, "output_config"), "format"), "schema"), "type")) == "object"
+  assert json.text_of(json.get(json.get(v, "output_config"), "effort")) == effort()
+}
+
+test "返事から文章を取り出す" {
+  let response = "\{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[\{\"type\":\"thinking\",\"thinking\":\"\"},\{\"type\":\"text\",\"text\":\"\{\\\"say\\\":\\\"はーい\\\"}\"}],\"stop_reason\":\"end_turn\"}"
+  assert reply_text(response) == Ok("\{\"say\":\"はーい\"}")
+  assert reply_text("\{\"content\":[],\"stop_reason\":\"refusal\"}").is_err()
+  assert reply_text("not json").is_err()
+}
+
+test "失敗の説明" {
+  assert explain("HTTP 401: \{\"type\":\"error\"}").starts_with("API キー")
+  assert explain("HTTP 400: \{\"type\":\"error\",\"error\":\{\"type\":\"invalid_request_error\",\"message\":\"bad field\"}}") == "HTTP 400: bad field"
+  assert explain("the request failed (os error 12007)").starts_with("ネットワーク")
+}
