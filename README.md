@@ -43,8 +43,6 @@ fn main() uses io {
 | macOS (Apple Silicon) | `yui-macos-arm64` |
 | macOS (Intel) | `yui-macos-x64` |
 
-`v2026.1125.2` までのリリースでは、x64 用のファイル名が `x86_64` 表記です（例: `yui-windows-x86_64.exe`）。中身は同じ64ビット用です。
-
 好きな場所に置いて `yui`（Windows は `yui.exe`）という名前にすれば使えます。
 Linux と macOS では `chmod +x yui` で実行権限を付けてください。
 ほかに必要なものはありません（Windows 版は VC++ ランタイム不要、Linux 版は静的リンク）。
