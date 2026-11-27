@@ -3,6 +3,8 @@
 //
 //   Enter                  お願いを書き始める（もう一度 Enter で送る、Esc でやめる）
 //                          例: 「木を集めてきてー」「かわいいおうち建ててー」
+//                          建物は、自由な形の部品を組んだ 3D モデルとして、少しずつ組み上がる。
+//                          「/undo」と送ると、いちばん新しい建物を取り消す。
 //                          「/sonnet」「/haiku」「/opus」と送ると、ユイの頭脳（モデル）を切り替える。
 //                          opus がいちばん賢くて高く、sonnet は半額、haiku は 40 分の 1
 //   W / A / S / D          歩く
@@ -23,6 +25,7 @@
 import blocks_gpu
 import claude
 import json
+import models
 
 // ユイにしてもらうこと
 struct Plan {
@@ -32,8 +35,10 @@ struct Plan {
   // 集めるブロックの種類と数（集めないなら 0 個）
   collect_kind: Int,
   collect_count: Int,
-  // 建てるもの。部品 1 つにつき 8 個の数: 形, 種類, x1, y1, z1, x2, y2, z2（種類 0 は「空ける」）
+  // ブロックで建てるもの。部品 1 つにつき 8 個の数: 形, 種類, x1, y1, z1, x2, y2, z2（種類 0 は「空ける」）
   boxes: List<Int>,
+  // 3D モデルとして建てるもの。部品 1 つにつき 9 個の小数（models.yui を参照）
+  parts: List<Float>,
 }
 
 // ブロックの種類の名前（番号は blocks_gpu.kind_color と同じ）
@@ -75,54 +80,51 @@ fn kind_label(kind: Int) -> String {
 
 fn system_prompt() -> String {
   let lines = [
-    "あなたは、ブロックでできた 3 次元の世界で遊ぶゲームの中の仲間「ユイ」です。",
-    "プレイヤーのお願いを聞いて、木を集めたり、建物を建てたりして手伝います。明るく、親しみやすく、短く話します。",
-    "建築がとても得意で、頼まれたものを、見ごたえのある凝った作りに仕上げます。",
+    "あなたは、3 次元の世界で遊ぶゲームの中の仲間「ユイ」です。",
+    "プレイヤーのお願いを聞いて、木を集めたり、建物や物を作ったりして手伝います。明るく、親しみやすく、短く話します。",
+    "立体を作るのがとても得意で、頼まれたものを、見ごたえのある凝った作りに仕上げます。",
     "",
     "返事は JSON で、次の項目を持ちます。",
     "- say: プレイヤーへのひとこと（プレイヤーと同じ言語で、40 文字以内）。",
-    "- title: 建てるものの短い名前（例: お城、赤い屋根のおうち）。プレイヤーと同じ言語で、12 文字以内。建てないときは空の文字列。",
+    "- title: 作るものの短い名前（例: お城、赤い屋根のおうち）。プレイヤーと同じ言語で、12 文字以内。作らないときは空の文字列。",
     "- collect_kind と collect_count: 集めてくるブロックの種類と数。集めないときは \"none\" と 0。",
     "  集められるのは dirt（土）、stone（石）、wood（木の幹）、leaves（葉）。数は 1 から 40 まで。",
-    "- build: 建てるものを、部品の並びで表します。建てないときは空の並び。",
+    "- model: 作るものを、立体の部品の並びで表します。作らないときは空の並び。",
     "",
-    "建てる場所:",
-    "- 横 x は 0 から 23、奥行き z は 0 から 23、高さ y は 0 から 19 の整数。y = 0 が地面のすぐ上の段です。",
-    "- 地面は建てる前に平らにならされます。プレイヤーは z の小さい側から建物を見るので、正面（入口）は z の小さい側に向けます。",
+    "座標と大きさ:",
+    "- 単位はメートル。小数を使えます。x は横、z は奥行き、y は高さで、y = 0 が地面です。",
+    "- 作るものは x が 0 から 24、z が 0 から 24 の範囲に収めます。高さは 60 まで。",
+    "- プレイヤーは z の小さい側に立って見ているので、正面（入口）は z の小さい側に向けます。",
+    "- プレイヤーの背の高さは 1.7。入口は幅 1.2・高さ 2.2 くらい、天井の高さは 2.8〜3.2、壁の厚さは 0.2〜0.3 が目安です。",
     "",
-    "部品の決まり:",
-    "- 部品は shape（形）、kind（ブロックの種類）、2 つの角 (x1, y1, z1)・(x2, y2, z2) で表し、その 2 つの角が作る箱の中に形を作ります（両端を含む）。",
-    "- 部品は並べた順に置かれ、後の部品が前の部品を上書きします。",
-    "- kind が \"air\" の部品は、その形の範囲を空けます。部屋の中、入口、窓の穴、アーチは air でくり抜きます。",
+    "部品:",
+    "- 部品は shape（形）、color（色）、位置 x・y・z、大きさ w・h・d、turn（回転）で表します。",
+    "- x・z は部品の底面の中心、y は底面の高さです。w は横幅（x の向き）、h は高さ、d は奥行き（z の向き）。",
+    "- turn は真上から見た回転で、単位は度。0 なら回しません。斜めの壁や、向きを変えた屋根に使います。",
+    "- color は \"#rrggbb\" の形（例: \"#c0392b\"）。どんな色でも使えます。",
+    "- 部品は中身の詰まった立体で、通り抜けられません。くり抜くことはできないので、部屋は壁・床・屋根を別々の薄い部品で囲んで作り、",
+    "  入口は、壁を左右に分けて間を空け、その上に小さな壁（まぐさ）を渡して作ります。",
     "",
     "shape（形）:",
-    "- box: 箱を全部埋める。",
-    "- walls: 箱の四方の壁だけ（床と天井なし、中は空のまま）。部屋や城壁に。",
-    "- cylinder: 縦の円柱（中まで埋まる）。 tube: 縦の円筒（壁だけ）。丸い塔に。",
-    "- pyramid: 1 段上がるごとに四方から 1 マスずつ縮む。四角い屋根や尖塔に。",
-    "- gable_x: 棟が x の向きに走る三角屋根（1 段ごとに z の両側から 1 マス縮む）。 gable_z: 棟が z の向きの三角屋根。",
-    "- cone: 上に向かって細くなる円すい。丸い塔のとんがり屋根に。",
-    "- dome: 半球の丸屋根。",
-    "- checker: 1 マスおきに置く市松模様。高さ 1 の walls の上に重ねて城壁のでこぼこ（狭間）にしたり、柵や模様にしたりします。",
+    "- box: 直方体。壁、床、柱、梁、窓枠、段など。",
+    "- cylinder: 縦の円柱（w と d が直径）。塔、柱、煙突。",
+    "- cone: 円すい。塔のとんがり屋根、木。",
+    "- pyramid: 四角すい。四角い塔の屋根、尖塔。",
+    "- roof: 三角屋根（棟が x の向きに走る三角柱）。棟を z の向きにしたいときは turn を 90 にします。",
+    "- dome: 半球の丸屋根。 sphere: 球（w・h・d が直径）。植え込み、飾り玉、明かり。",
+    "- wedge: z の大きい側へ向かって高くなる斜面。階段の代わりのスロープ、片流れの屋根、控え壁。",
     "",
-    "kind（ブロックの種類）:",
-    "- 自然: dirt（土。上の面は草）、stone（灰色の石）、wood（茶色の幹）、leaves（緑の葉）、snow（雪の白）、sandstone（砂色の石）。",
-    "- 建材: planks（明るい板）、dark_wood（こげ茶の木）、brick（赤茶のれんが）、dark_stone（濃い灰色の石）、gray（明るい灰色）、white（白い壁）、cream（クリーム色の壁）、black（黒）。",
-    "- 屋根や飾り: red（赤）、roof_blue（紺）、blue（青）、teal（青緑）、green（緑）、purple（紫）、lavender（薄紫）、pink（ピンク）、rose（濃いピンク）、orange（オレンジ）、yellow（黄）、mint（ミント）、gold（金）。",
-    "- glass（水色。窓）、lantern（明かりの色。ランプや窓の灯り）、air（空ける）。",
+    "見ごたえのあるものにするために:",
+    "- 範囲を広く使い、頼まれたものにふさわしい大きさにします（家なら幅 8〜12、城や神殿なら範囲いっぱい、塔なら高さ 20 以上）。",
+    "- 大きさと高さの違うかたまりを組み合わせます（母屋、張り出し、塔、玄関ポーチ、煙突、出窓、バルコニー）。",
+    "- 色は、土台・壁・柱や梁・窓枠・屋根・飾りで変え、全体で 5〜8 色にまとめます。",
+    "- 細い部品で細部を作ります: 窓は、ガラス（薄い水色の box）を壁から 0.05 だけ外に出して置き、まわりに枠を付けます。",
+    "  軒は屋根を壁より 0.4〜0.6 張り出させます。手すり、柱、梁、ひさし、戸口の段、街灯、旗、植え込みを足します。",
+    "- 同じ面にぴったり重なる部品は、ちらついて見えます。重ねるときは 0.03〜0.05 ずらします。",
+    "- 部品は 200 個まで使えます。凝ったものなら 80〜200 個を目安にします。",
+    "- 部品は書いた順に、少しずつ組み上がります。土台から上へ、大きいものから細部への順に書きます。",
     "",
-    "見ごたえのある建物にするために:",
-    "- 範囲を広く使い、頼まれたものにふさわしい大きさにします（家なら横 9〜13、城や塔や神殿なら範囲いっぱい）。",
-    "- 1 つの箱で済ませず、母屋・張り出し・塔・玄関・煙突など、大きさと高さの違うかたまりを組み合わせます。",
-    "- 壁は 1 色にせず、土台・柱・壁・窓枠・軒・屋根で種類を変えます（例: 土台は stone、角の柱は dark_wood、壁は cream、屋根は red）。",
-    "- 窓は並べて付け、glass と枠を使います。入口には段、ひさし、両脇の柱や明かりを付けます。",
-    "- 屋根は建物より 1 マス張り出させ、gable や pyramid、cone、dome を使い分けます。棟や先端に飾りを付けます。",
-    "- 城なら、四隅に丸い塔（tube と cone）、城壁の上に checker のでこぼこ、門、中央に高い主塔、旗（細い柱と色のブロック）。",
-    "- 中は air でくり抜いて入れるようにし、床を張ります。プレイヤーは高さ 2 マス弱なので、入口は幅 1〜2・高さ 2 以上、部屋の高さは 3 以上。",
-    "- まわりに、花壇（色のブロック）、生け垣（leaves）、小道（sandstone や gray）、街灯（柱と lantern）などを添えます。",
-    "- 部品は 150 個まで使えます。凝った建物なら 60〜150 個を目安にします。",
-    "",
-    "集めることと建てることを同時に頼まれたら、両方を入れてかまいません。",
+    "集めることと作ることを同時に頼まれたら、両方を入れてかまいません。",
     "どちらでもないお願い（あいさつ、質問など）には、say だけで答えます。",
   ]
   lines.join("\n")
@@ -135,18 +137,17 @@ fn quoted(names: List<String>) -> String {
 
 // 返事の形（JSON スキーマ）
 fn schema() -> String {
-  let kinds = quoted(kind_names())
-  let shapes = quoted(shape_names())
-  let number = "\{\"type\":\"integer\"}"
+  let shapes = quoted(models.shape_names())
+  let number = "\{\"type\":\"number\"}"
   let parts = [
     "\{\"type\":\"object\",\"properties\":\{\"say\":\{\"type\":\"string\"},\"title\":\{\"type\":\"string\"}",
     "\"collect_kind\":\{\"type\":\"string\",\"enum\":[\"none\",\"dirt\",\"stone\",\"wood\",\"leaves\"]}",
-    "\"collect_count\":{number}",
-    "\"build\":\{\"type\":\"array\",\"items\":\{\"type\":\"object\",\"properties\":\{\"shape\":\{\"type\":\"string\",\"enum\":[{shapes}]}",
-    "\"kind\":\{\"type\":\"string\",\"enum\":[{kinds}]}",
-    "\"x1\":{number},\"y1\":{number},\"z1\":{number},\"x2\":{number},\"y2\":{number},\"z2\":{number}}",
-    "\"required\":[\"shape\",\"kind\",\"x1\",\"y1\",\"z1\",\"x2\",\"y2\",\"z2\"],\"additionalProperties\":false}}}",
-    "\"required\":[\"say\",\"title\",\"collect_kind\",\"collect_count\",\"build\"],\"additionalProperties\":false}",
+    "\"collect_count\":\{\"type\":\"integer\"}",
+    "\"model\":\{\"type\":\"array\",\"items\":\{\"type\":\"object\",\"properties\":\{\"shape\":\{\"type\":\"string\",\"enum\":[{shapes}]}",
+    "\"color\":\{\"type\":\"string\"}",
+    "\"x\":{number},\"y\":{number},\"z\":{number},\"w\":{number},\"h\":{number},\"d\":{number},\"turn\":{number}}",
+    "\"required\":[\"shape\",\"color\",\"x\",\"y\",\"z\",\"w\",\"h\",\"d\",\"turn\"],\"additionalProperties\":false}}}",
+    "\"required\":[\"say\",\"title\",\"collect_kind\",\"collect_count\",\"model\"],\"additionalProperties\":false}",
   ]
   parts.join(",")
 }
@@ -165,6 +166,21 @@ fn plan_from(reply: String) -> Result<Plan, String> {
       }
     }
   }
+  // 立体の部品。置き場所と大きさは、決めた範囲に収める
+  let mut parts: List<Float> = []
+  for item in json.items(json.get(v, "model")) {
+    if parts.len() < 9 * 240 {
+      parts = parts.push(models.shape_of(json.text_of(json.get(item, "shape"))).to_float())
+      parts = parts.push(models.color_of(json.text_of(json.get(item, "color"))).to_float())
+      parts = parts.push(json.float_of(json.get(item, "x")).max(-2.0).min(26.0))
+      parts = parts.push(json.float_of(json.get(item, "y")).max(0.0).min(60.0))
+      parts = parts.push(json.float_of(json.get(item, "z")).max(-2.0).min(26.0))
+      parts = parts.push(json.float_of(json.get(item, "w")).max(0.02).min(28.0))
+      parts = parts.push(json.float_of(json.get(item, "h")).max(0.02).min(60.0))
+      parts = parts.push(json.float_of(json.get(item, "d")).max(0.02).min(28.0))
+      parts = parts.push(json.float_of(json.get(item, "turn")))
+    }
+  }
   let collect_kind = kind_of(json.text_of(json.get(v, "collect_kind")))
   let count = json.int_of(json.get(v, "collect_count")).max(0).min(40)
   Ok(Plan {
@@ -173,6 +189,7 @@ fn plan_from(reply: String) -> Result<Plan, String> {
     collect_kind: collect_kind,
     collect_count: if collect_kind >= 1 && collect_kind <= 4 { count } else { 0 },
     boxes: boxes,
+    parts: parts,
   })
 }
 
@@ -235,8 +252,76 @@ fn canned_castle() -> String {
   "\{\"say\":\"りっぱなお城、建てるね！\",\"title\":\"お城\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[{joined}]}"
 }
 
+fn model_text(
+  shape: String,
+  color: String,
+  x: Float,
+  y: Float,
+  z: Float,
+  w: Float,
+  h: Float,
+  d: Float,
+  turn: Float,
+) -> String {
+  "\{\"shape\":\"{shape}\",\"color\":\"{color}\",\"x\":{x},\"y\":{y},\"z\":{z},\"w\":{w},\"h\":{h},\"d\":{d},\"turn\":{turn}}"
+}
+
+// 決まった返事の小屋（立体の部品で作る）: 三角屋根の母屋、丸い塔、煙突、戸口の段、街灯、植え込み
+fn canned_cottage() -> String {
+  let stone = "#8a8a90"
+  let wall = "#f3e6c8"
+  let beam = "#5a4030"
+  let glass = "#96cdeb"
+  let parts = [
+    // 土台と床
+    model_text("box", stone, 6.0, 0.0, 5.0, 8.6, 0.3, 6.6, 0.0),
+    model_text("box", "#c49c62", 6.0, 0.3, 5.0, 8.0, 0.1, 6.0, 0.0),
+    // 壁（正面は入口の分を空ける）
+    model_text("box", wall, 6.0, 0.4, 7.9, 8.0, 2.8, 0.2, 0.0),
+    model_text("box", wall, 2.1, 0.4, 5.0, 0.2, 2.8, 6.0, 0.0),
+    model_text("box", wall, 9.9, 0.4, 5.0, 0.2, 2.8, 6.0, 0.0),
+    model_text("box", wall, 3.7, 0.4, 2.1, 3.4, 2.8, 0.2, 0.0),
+    model_text("box", wall, 8.3, 0.4, 2.1, 3.4, 2.8, 0.2, 0.0),
+    model_text("box", wall, 6.0, 2.6, 2.1, 1.2, 0.6, 0.2, 0.0),
+    // 角の柱と、戸口の枠
+    model_text("box", beam, 2.1, 0.3, 2.1, 0.3, 2.9, 0.3, 0.0),
+    model_text("box", beam, 9.9, 0.3, 2.1, 0.3, 2.9, 0.3, 0.0),
+    model_text("box", beam, 2.1, 0.3, 7.9, 0.3, 2.9, 0.3, 0.0),
+    model_text("box", beam, 9.9, 0.3, 7.9, 0.3, 2.9, 0.3, 0.0),
+    model_text("box", beam, 5.33, 0.4, 2.05, 0.14, 2.3, 0.3, 0.0),
+    model_text("box", beam, 6.67, 0.4, 2.05, 0.14, 2.3, 0.3, 0.0),
+    model_text("box", beam, 6.0, 2.6, 2.05, 1.48, 0.14, 0.3, 0.0),
+    // 窓（ガラスと枠）
+    model_text("box", glass, 3.7, 1.3, 2.06, 1.2, 1.0, 0.2, 0.0),
+    model_text("box", beam, 3.7, 1.2, 2.04, 1.4, 0.1, 0.3, 0.0),
+    model_text("box", beam, 3.7, 2.3, 2.04, 1.4, 0.1, 0.3, 0.0),
+    model_text("box", glass, 8.3, 1.3, 2.06, 1.2, 1.0, 0.2, 0.0),
+    model_text("box", beam, 8.3, 1.2, 2.04, 1.4, 0.1, 0.3, 0.0),
+    model_text("box", beam, 8.3, 2.3, 2.04, 1.4, 0.1, 0.3, 0.0),
+    // 屋根と煙突
+    model_text("roof", "#c0392b", 6.0, 3.2, 5.0, 9.2, 2.6, 7.2, 0.0),
+    model_text("box", "#7a5548", 8.4, 3.6, 6.2, 0.7, 2.6, 0.7, 0.0),
+    model_text("box", stone, 8.4, 6.2, 6.2, 0.9, 0.15, 0.9, 0.0),
+    // 丸い塔と、とんがり屋根、てっぺんの玉
+    model_text("cylinder", "#d9d2c4", 11.3, 0.0, 7.0, 2.6, 5.6, 2.6, 0.0),
+    model_text("cylinder", stone, 11.3, 5.6, 7.0, 3.0, 0.25, 3.0, 0.0),
+    model_text("cone", "#3a5496", 11.3, 5.85, 7.0, 3.4, 3.0, 3.4, 0.0),
+    model_text("sphere", "#f0c43c", 11.3, 8.75, 7.0, 0.4, 0.4, 0.4, 0.0),
+    // 戸口の段、街灯、植え込み、斜めに置いたベンチ
+    model_text("wedge", stone, 6.0, 0.0, 1.5, 1.6, 0.4, 1.0, 0.0),
+    model_text("cylinder", "#4a3a2a", 3.0, 0.0, 0.8, 0.14, 2.3, 0.14, 0.0),
+    model_text("sphere", "#ffe8a0", 3.0, 2.25, 0.8, 0.5, 0.5, 0.5, 0.0),
+    model_text("sphere", "#3c8c38", 9.4, 0.0, 1.2, 1.5, 1.1, 1.5, 0.0),
+    model_text("dome", "#4a9c44", 1.2, 0.0, 3.4, 1.4, 0.8, 1.4, 0.0),
+    model_text("box", "#8a6238", 10.6, 0.35, 2.2, 1.6, 0.1, 0.5, 30.0),
+  ]
+  let joined = parts.join(",")
+  "\{\"say\":\"小屋を組み立てるね！\",\"title\":\"小屋\",\"collect_kind\":\"none\",\"collect_count\":0,\"model\":[{joined}]}"
+}
+
 // API キーがないときの、決まった返事
 fn canned(request: String) -> String {
+  if request.contains("小屋") || request.contains("cottage") { return canned_cottage() }
   if request.contains("城") || request.contains("castle") { return canned_castle() }
   if request.contains("家") || request.contains("うち") || request.contains("house") {
     let boxes = [
@@ -264,7 +349,7 @@ fn canned(request: String) -> String {
   if request.contains("木") || request.contains("wood") {
     return "\{\"say\":\"木を集めてくるね！\",\"title\":\"\",\"collect_kind\":\"wood\",\"collect_count\":12,\"build\":[]}"
   }
-  "\{\"say\":\"API キーがないから、木集めと、おうち・お城作りだけ手伝えるよ\",\"title\":\"\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
+  "\{\"say\":\"API キーがないから、木集めと、小屋・おうち・お城作りだけ手伝えるよ\",\"title\":\"\",\"collect_kind\":\"none\",\"collect_count\":0,\"build\":[]}"
 }
 
 // ---- してもらうことを、ブロック 1 つずつの作業に直す ----
@@ -459,7 +544,8 @@ fn build_jobs(world: List<Int>, boxes: List<Int>, ox: Int, oz: Int) -> List<Int>
 
 // プレイヤーの前のあたりで、横 w × 奥行き d の建物を建てるのにいちばん平らな場所を探す。
 // 角の x × 128 + z を返す
-fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
+// taken は、もう建物がある場所（4 個で 1 つ: 角の x, z, 横, 奥行き）。そこには重ねない
+fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int, taken: List<Int>) -> Int {
   let ahead = 5.0 + w.max(d).to_float() / 2.0
   let cx = blocks_gpu.whole(p.x + blocks_gpu.sine(p.turn) * ahead) - w / 2
   let cz = blocks_gpu.whole(p.z + blocks_gpu.cosine(p.turn) * ahead) - d / 2
@@ -486,6 +572,13 @@ fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
       let mut low = 100
       let mut high = -1
       let mut usable = !(px >= ox - 1 && px <= ox + w && pz >= oz - 1 && pz <= oz + d)
+      let mut t = 0
+      while t + 4 <= taken.len() {
+        if ox < taken[t] + taken[t + 2] + 2 && ox + w + 2 > taken[t] && oz < taken[t + 1] + taken[t + 3] + 2 && oz + d + 2 > taken[t + 1] {
+          usable = false
+        }
+        t = t + 4
+      }
       for z in 0..d {
         for x in 0..w {
           let h = heights[(dz + z) * 51 + dx + x]
@@ -506,15 +599,80 @@ fn site_for(world: List<Int>, p: blocks_gpu.Player, w: Int, d: Int) -> Int {
   best
 }
 
+// 角が (ox, oz)、横 w × 奥行き d の場所の地面の高さの、真ん中の値
+fn site_base(world: List<Int>, ox: Int, oz: Int, w: Int, d: Int) -> Int {
+  let mut grounds: List<Int> = []
+  for z in oz..oz + d {
+    for x in ox..ox + w {
+      grounds = grounds.push(ground_at(world, x.max(0).min(127), z.max(0).min(127)))
+    }
+  }
+  grounds.sort()[grounds.len() / 2]
+}
+
+// その場所とまわり 1 マスの地面を高さ base にならし、生えている木をどける作業
+fn level_jobs(world: List<Int>, ox: Int, oz: Int, w: Int, d: Int, base: Int) -> List<Int> {
+  let mut jobs: List<Int> = []
+  for z in oz - 1..oz + d + 1 {
+    for x in ox - 1..ox + w + 1 {
+      if x >= 1 && x < 127 && z >= 1 && z < 127 {
+        let ground = ground_at(world, x, z)
+        for y in ground..base {
+          jobs = jobs.push(1).push(x).push(y).push(z).push(1)
+        }
+        for y in base..ground {
+          jobs = jobs.push(0).push(x).push(y).push(z).push(0)
+        }
+        for y in base.max(ground)..32 {
+          let kind = world[(y * 128 + z) * 128 + x]
+          if kind == 3 || kind == 4 {
+            jobs = jobs.push(0).push(x).push(y).push(z).push(0)
+          }
+        }
+      }
+    }
+  }
+  jobs
+}
+
+// 足元が (x, y, z) の人（幅 0.6、高さ 1.7）が、箱の並び（6 個で 1 つ: x0, y0, z0, x1, y1, z1）のどれかに重なるか
+fn solid_hit(solids: List<Float>, x: Float, y: Float, z: Float) -> Bool {
+  let mut i = 0
+  while i + 6 <= solids.len() {
+    if x + 0.3 > solids[i] && x - 0.3 < solids[i + 3] && y + 1.7 > solids[i + 1] && y < solids[i + 4] && z + 0.3 > solids[i + 2] && z - 0.3 < solids[i + 5] {
+      return true
+    }
+    i = i + 6
+  }
+  false
+}
+
+// ブロックにも、建物（立体の部品）にも重ならないか調べる
+fn hit(world: List<Int>, solids: List<Float>, x: Float, y: Float, z: Float) -> Bool {
+  blocks_gpu.blocked(world, x, y, z) || solid_hit(solids, x, y, z)
+}
+
+fn done_text(title: String, cost: Float, total: Float) -> String {
+  if cost > 0.0 { return "ユイ: できたよ！ {title}を建てるのに {claude.yen_text(cost)} 円くらいかかったよ（これまでの合計 {claude.yen_text(total)} 円くらい）" }
+  "ユイ: できたよ！"
+}
+
 // してもらうことを、作業の並びにする
-fn jobs_for(world: List<Int>, plan: Plan, p: blocks_gpu.Player, fx: Float, fz: Float) -> List<Int> {
+fn jobs_for(
+  world: List<Int>,
+  plan: Plan,
+  p: blocks_gpu.Player,
+  fx: Float,
+  fz: Float,
+  taken: List<Int>,
+) -> List<Int> {
   let mut jobs: List<Int> = []
   if plan.collect_count > 0 {
     jobs = collect_jobs(world, blocks_gpu.whole(fx), blocks_gpu.whole(fz), plan.collect_kind, plan.collect_count)
   }
   if !plan.boxes.is_empty() {
     let size = footprint(plan.boxes)
-    let site = site_for(world, p, (size / 32).min(24), (size % 32).min(24))
+    let site = site_for(world, p, (size / 32).min(24), (size % 32).min(24), taken)
     jobs = jobs.concat(build_jobs(world, plan.boxes, site / 128, site % 128))
   }
   jobs
@@ -665,9 +823,31 @@ fn main() uses io, net {
   let sky = rgb(130, 185, 240)
   gpu_fog(sky, 50, 120)
 
+  // 建物（立体の部品で作ったもの）: 絵の番号、当たり判定の箱、取り消すときに箱を何個目まで戻すか、使っている場所
+  let mut solids: List<Float> = []
+  let mut model_meshes: List<Int> = []
+  let mut model_solids: List<Int> = []
+  let mut taken: List<Int> = []
+  // 組み上げている途中の建物: 部品の並び、何個目まで置いたか、置く場所、ここまでの三角形と絵
+  let mut building = false
+  let mut pending: List<Float> = []
+  let mut shown = 0
+  let mut bx = 0.0
+  let mut by = 0.0
+  let mut bz = 0.0
+  let mut cur_points: List<Float> = []
+  let mut cur_colors: List<Int> = []
+  let mut cur_mesh = 0
+  // 動作確認のとき、できあがったものを見る場所（view_back が 0 なら、ふつうの視点）
+  let mut view_x = 0.0
+  let mut view_y = 0.0
+  let mut view_z = 0.0
+  let mut view_back = 0.0
+  let mut view_size = 0.0
+
   // 真ん中の地面の上から始める
   let mut start = 31.0
-  while start > 1.0 && !blocks_gpu.blocked(world, 64.5, start - 1.0, 64.5) {
+  while start > 1.0 && !hit(world, solids, 64.5, start - 1.0, 64.5) {
     start = start - 1.0
   }
   let mut p = blocks_gpu.Player { x: 64.5, y: start + 0.5, z: 64.5, fall: 0.0, turn: 0.6, tilt: -0.2 }
@@ -681,7 +861,7 @@ fn main() uses io, net {
   // 集めたブロックの数（種類ごと）
   let mut bag = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   // 会話
-  let mut log = [if key.is_empty() { "ユイ: やっほー！ Enter でお願いを書いてね（API キーがないので、木集めと、おうち・お城作りだけ）" } else { "ユイ: やっほー！ Enter でお願いを書いてね" }]
+  let mut log = [if key.is_empty() { "ユイ: やっほー！ Enter でお願いを書いてね（API キーがないので、木集めと、小屋・おうち・お城作りだけ）" } else { "ユイ: やっほー！ Enter でお願いを書いてね" }]
   let mut typing = false
   let mut escape_held = false
   let mut draft = ""
@@ -733,13 +913,31 @@ fn main() uses io, net {
     }
 
     // ---- お願いを送る ----
+    // 届いた「してもらうこと」と、その料金（円）
+    let mut plans: List<Plan> = []
+    let mut cost = 0.0
     if !send.is_empty() {
       log = log.push("あなた: {send}")
       let wanted = if send.starts_with("/") { claude.model_named(send.slice(1, send.len())) } else { "" }
-      if send.starts_with("/") {
+      if send == "/undo" {
+        // いちばん新しい建物を取り消す
+        if building {
+          log = log.push("（建てている途中は取り消せないよ）")
+        } else if model_meshes.is_empty() {
+          log = log.push("（取り消せる建物がないよ）")
+        } else {
+          let last = model_meshes.len() - 1
+          gpu_free(model_meshes[last])
+          solids = solids.slice(0, model_solids[last])
+          model_meshes = model_meshes.slice(0, last)
+          model_solids = model_solids.slice(0, last)
+          taken = taken.slice(0, last * 4)
+          log = log.push("（いちばん新しい建物を取り消したよ）")
+        }
+      } else if send.starts_with("/") {
         // モデルの切り替え
         if wanted.is_empty() {
-          log = log.push("（/opus、/sonnet、/haiku のどれかを送ってね。いまは {model}）")
+          log = log.push("（/opus、/sonnet、/haiku、/undo のどれかを送ってね。いまは {model}）")
         } else {
           model = wanted
           log = log.push("（ユイの頭脳を {model} に切り替えたよ）")
@@ -749,9 +947,8 @@ fn main() uses io, net {
       } else if key.is_empty() {
         // 決まった返事を、API の返事と同じ道筋で処理する
         match plan_from(canned(send)) {
-          Ok(plan) => {
-            log = log.push("ユイ: {plan.say}")
-            jobs = jobs.concat(jobs_for(world, plan, p, fx, fz))
+          Ok(found) => {
+            plans = plans.push(found)
           }
           Err(why) => {
             log = log.push("（うまくいかなかった: {why}）")
@@ -767,11 +964,10 @@ fn main() uses io, net {
       }
     }
 
-    // ---- 返事が届いたら、作業に直す ----
+    // ---- 返事が届いたか ----
     if request != 0 && http_done(request) {
       let result = http_result(request)
-      // この 1 回にかかった料金（円）
-      let cost = match result {
+      cost = match result {
         Ok(raw) => claude.cost_yen(raw)
         Err(_) => 0.0
       }
@@ -779,17 +975,8 @@ fn main() uses io, net {
       match claude.answer(result) {
         Ok(reply) => {
           match plan_from(reply) {
-            Ok(plan) => {
-              let added = jobs_for(world, plan, p, fx, fz)
-              if added.is_empty() || plan.title.is_empty() {
-                // 建てないとき（おしゃべりや木集め）は、その場で料金を添える
-                log = log.push("ユイ: {plan.say}（{claude.yen_text(cost)} 円くらい）")
-              } else {
-                log = log.push("ユイ: {plan.say}")
-                built_title = plan.title
-                built_cost = cost
-              }
-              jobs = jobs.concat(added)
+            Ok(found) => {
+              plans = plans.push(found)
             }
             Err(why) => {
               log = log.push("（返事を読めなかった: {why}）")
@@ -801,6 +988,47 @@ fn main() uses io, net {
         }
       }
       request = 0
+    }
+
+    // ---- してもらうことを、作業に直す ----
+    for plan in plans {
+      let mut added = jobs_for(world, plan, p, fx, fz, taken)
+      let mut starts = !added.is_empty() && !plan.title.is_empty()
+      if plan.parts.len() >= 9 && building {
+        log = log.push("ユイ: いま建てているところだから、終わってからもう一度頼んでね")
+      } else if plan.parts.len() >= 9 {
+        // 立体の部品で建てる: 場所を決め、地面をならしてから、部品を 1 つずつ組み上げる
+        let area = models.extent(plan.parts)
+        let w = ((area[2] - area[0]).ceil().to_int() + 1).max(1).min(26)
+        let d = ((area[3] - area[1]).ceil().to_int() + 1).max(1).min(26)
+        let site = site_for(world, p, w, d, taken)
+        let base = site_base(world, site / 128, site % 128, w, d)
+        added = added.concat(level_jobs(world, site / 128, site % 128, w, d, base))
+        pending = plan.parts
+        shown = 0
+        bx = (site / 128).to_float() + 0.5 - area[0]
+        by = base.to_float()
+        bz = (site % 128).to_float() + 0.5 - area[1]
+        taken = taken.push(site / 128).push(site % 128).push(w).push(d)
+        model_solids = model_solids.push(solids.len())
+        view_x = (site / 128).to_float() + w.to_float() / 2.0
+        view_y = base.to_float()
+        view_z = (site % 128).to_float() + d.to_float() / 2.0
+        view_size = w.max(d).to_float()
+        building = true
+        starts = true
+      }
+      if starts {
+        log = log.push("ユイ: {plan.say}")
+        built_title = plan.title
+        built_cost = cost
+      } else if cost > 0.0 {
+        // 建てないとき（おしゃべりや木集め）は、その場で料金を添える
+        log = log.push("ユイ: {plan.say}（{claude.yen_text(cost)} 円くらい）")
+      } else {
+        log = log.push("ユイ: {plan.say}")
+      }
+      jobs = jobs.concat(added)
     }
 
     // ---- 向きを変える・歩く（お願いを書いている間は動かない）----
@@ -840,21 +1068,28 @@ fn main() uses io, net {
       mx = mx - ct
       mz = mz + st
     }
+    // 低い段差（床や戸口の段）は、そのまま上がれる
     let nx = p.x + mx * 0.09
-    if !blocks_gpu.blocked(world, nx, p.y, p.z) {
+    if !hit(world, solids, nx, p.y, p.z) {
       p.x = nx
+    } else if mx != 0.0 && !hit(world, solids, nx, p.y + 0.55, p.z) {
+      p.x = nx
+      p.y = p.y + 0.55
     }
     let nz = p.z + mz * 0.09
-    if !blocks_gpu.blocked(world, p.x, p.y, nz) {
+    if !hit(world, solids, p.x, p.y, nz) {
       p.z = nz
+    } else if mz != 0.0 && !hit(world, solids, p.x, p.y + 0.55, nz) {
+      p.z = nz
+      p.y = p.y + 0.55
     }
-    let standing = blocks_gpu.blocked(world, p.x, p.y - 0.05, p.z)
+    let standing = hit(world, solids, p.x, p.y - 0.05, p.z)
     if standing && free && key_down("space") {
       p.fall = 0.21
     }
     p.fall = (p.fall - 0.012).max(-0.5)
     let ny = p.y + p.fall
-    if blocks_gpu.blocked(world, p.x, ny, p.z) {
+    if hit(world, solids, p.x, ny, p.z) {
       p.fall = 0.0
     } else {
       p.y = ny
@@ -899,7 +1134,7 @@ fn main() uses io, net {
       let place = target + back
       if place >= 0 && place < 524288 && world[place] == 0 {
         world[place] = selected
-        if blocks_gpu.blocked(world, p.x, p.y, p.z) {
+        if hit(world, solids, p.x, p.y, p.z) {
           world[place] = 0
         } else {
           meshes = blocks_gpu.rebuild(world, meshes, place % 128, place / 128 % 128)
@@ -909,12 +1144,32 @@ fn main() uses io, net {
     }
 
     // ---- ユイが動く ----
-    // 作業があればその場所へ、なければプレイヤーのそばへ
+    // ブロックの作業があればその場所へ、部品を組み上げているならその部品の所へ、なければプレイヤーのそばへ
     let working = job < jobs.len()
-    let goal_x = if working { jobs[job + 1].to_float() + 0.5 } else { p.x + st * 2.4 + ct * 1.3 }
-    let goal_y = if working { jobs[job + 2].to_float() + 1.8 } else { p.y + 1.0 + blocks_gpu.sine(frame.to_float() * 0.08) * 0.12 }
-    let goal_z = if working { jobs[job + 3].to_float() + 0.5 } else { p.z + ct * 2.4 - st * 1.3 }
-    let pace = if working { 0.6 } else { 0.12 }
+    let revealing = building && !working && shown * 9 < pending.len()
+    let at = shown * 9
+    let goal_x = if working {
+      jobs[job + 1].to_float() + 0.5
+    } else if revealing {
+      bx + pending[at + 2]
+    } else {
+      p.x + st * 2.4 + ct * 1.3
+    }
+    let goal_y = if working {
+      jobs[job + 2].to_float() + 1.8
+    } else if revealing {
+      by + pending[at + 3] + pending[at + 6] + 0.8
+    } else {
+      p.y + 1.0 + blocks_gpu.sine(frame.to_float() * 0.08) * 0.12
+    }
+    let goal_z = if working {
+      jobs[job + 3].to_float() + 0.5
+    } else if revealing {
+      bz + pending[at + 4]
+    } else {
+      p.z + ct * 2.4 - st * 1.3
+    }
+    let pace = if working || revealing { 0.6 } else { 0.12 }
     fx = fx + (goal_x - fx).max(-pace).min(pace)
     fy = fy + (goal_y - fy).max(-pace).min(pace)
     fz = fz + (goal_z - fz).max(-pace).min(pace)
@@ -939,7 +1194,7 @@ fn main() uses io, net {
           } else if jobs[job] == 1 && now != jobs[job + 4] {
             world[cell] = jobs[job + 4]
             // プレイヤーに重なる場所には置かない
-            if blocks_gpu.blocked(world, p.x, p.y, p.z) {
+            if hit(world, solids, p.x, p.y, p.z) {
               world[cell] = now
             } else {
               placed = placed + 1
@@ -960,28 +1215,68 @@ fn main() uses io, net {
       if job >= jobs.len() {
         jobs = []
         job = 0
-        if built_cost > 0.0 {
-          log = log.push("ユイ: できたよ！ {built_title}を建てるのに {claude.yen_text(built_cost)} 円くらいかかったよ（これまでの合計 {claude.yen_text(total_cost)} 円くらい）")
+        // 立体の建物は、このあと部品を組み上げてから「できたよ」と言う
+        if !building {
+          log = log.push(done_text(built_title, built_cost, total_cost))
           built_cost = 0.0
-        } else {
-          log = log.push("ユイ: できたよ！")
+          if placed > 0 {
+            view_x = (sum_x / placed).to_float() + 0.5
+            view_y = low_y.to_float()
+            view_z = (sum_z / placed).to_float() + 0.5
+            view_back = if placed > 800 { 30.0 } else { 13.0 }
+          }
         }
+      }
+    }
+
+    // ---- 部品を 1 つずつ組み上げる ----
+    if revealing && near && frame % 2 == 0 {
+      // 部品が多いほど、1 回に置く数を増やす
+      let mut count = 1 + (pending.len() / 9 - shown) / 60
+      while count > 0 && shown * 9 < pending.len() {
+        let part = pending.slice(shown * 9, shown * 9 + 9)
+        let points = models.placed(part, bx, by, bz)
+        cur_points = cur_points.concat(points)
+        cur_colors = cur_colors.concat(models.shades(points, part[1].to_int(), bx + part[2], by + part[3] + part[6] / 2.0, bz + part[4]))
+        // 当たり判定の箱。プレイヤーがちょうどそこにいるなら、閉じ込めないように箱は付けない
+        let cage = models.bounds(points)
+        if !solid_hit(cage, p.x, p.y, p.z) {
+          solids = solids.concat(cage)
+        }
+        shown = shown + 1
+        count = count - 1
+      }
+      if cur_mesh != 0 { gpu_free(cur_mesh) }
+      cur_mesh = gpu_mesh(cur_points, cur_colors)
+      if shown * 9 >= pending.len() {
+        model_meshes = model_meshes.push(cur_mesh)
+        cur_mesh = 0
+        cur_points = []
+        cur_colors = []
+        view_back = view_size * 0.9 + 5.0
+        pending = []
+        building = false
+        log = log.push(done_text(built_title, built_cost, total_cost))
+        built_cost = 0.0
       }
     }
 
     // ---- 描く ----
     gpu_clear(sky)
-    if limit > 0 && placed > 0 && !working {
+    if limit > 0 && view_back > 0.0 && !working && !building {
       // 動作確認のとき: 建て終わったら、建てたものを少し離れた高い所から見る
-      let mid_x = (sum_x / placed).to_float() + 0.5
-      let mid_z = (sum_z / placed).to_float() + 0.5
-      let back = if placed > 800 { 30.0 } else { 13.0 }
-      gpu_camera(mid_x - st * back, low_y.to_float() + back * 0.45, mid_z - ct * back, p.turn * 57.29577951308232, -14.0)
+      gpu_camera(view_x - st * view_back, view_y + view_back * 0.4, view_z - ct * view_back, p.turn * 57.29577951308232, -16.0)
     } else {
       gpu_camera(p.x, p.y + 1.6, p.z, p.turn * 57.29577951308232, p.tilt * 57.29577951308232)
     }
     for mesh in meshes {
       gpu_draw(mesh, 0.0, 0.0, 0.0)
+    }
+    for mesh in model_meshes {
+      gpu_draw(mesh, 0.0, 0.0, 0.0)
+    }
+    if cur_mesh != 0 {
+      gpu_draw(cur_mesh, 0.0, 0.0, 0.0)
     }
     gpu_draw(friend_mesh, fx, fy, fz)
     if reach && wait == 0 {
@@ -1007,12 +1302,18 @@ fn main() uses io, net {
       gpu_rect(16, 14, 30 + have.len() * 22, 40, rgb(20, 24, 40))
       gpu_text(26, 20, 24, rgb(255, 240, 180), "ユイの持ち物: {have}")
     }
-    draw_log(log, height)
+    // 動作確認でできあがりを見ているときは、会話を出さない（建物が隠れるので）
+    if !(limit > 0 && view_back > 0.0 && !working && !building) {
+      draw_log(log, height)
+    }
     if request != 0 {
       gpu_text(26, height - 140, 24, rgb(255, 240, 180), "ユイ: 考え中…")
     } else if working {
       let left = (jobs.len() - job) / 5
-      gpu_text(26, height - 140, 24, rgb(255, 240, 180), "ユイ: 作業中（あと {left}）")
+      gpu_text(26, height - 140, 24, rgb(255, 240, 180), "ユイ: 地面をならしたり、ブロックを動かしたり（あと {left}）")
+    } else if building {
+      let left = pending.len() / 9 - shown
+      gpu_text(26, height - 140, 24, rgb(255, 240, 180), "ユイ: 組み立て中（あと {left} 個）")
     }
     if typing {
       gpu_rect(16, height - 112, width - 32, 40, rgb(255, 255, 255))
@@ -1043,5 +1344,5 @@ fn main() uses io, net {
     }
   }
   window_close()
-  print("frames: {frame}, placed: {placed}, broken: {broken}, wood: {bag[3]}, log: {log.len()}")
+  print("frames: {frame}, placed: {placed}, broken: {broken}, wood: {bag[3]}, log: {log.len()}, models: {model_meshes.len()}, solids: {solids.len() / 6}")
 }

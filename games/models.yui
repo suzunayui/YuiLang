@@ -1,0 +1,281 @@
+// 自由な形の部品を組んで、3D モデル（三角形の集まり）を作る。
+//
+// 部品 1 つは 9 個の小数で表す:
+//   形, 色, x, y, z, w, h, d, turn
+//   形    shape_names の番号
+//   色    rgb(...) の値
+//   x, z  底面の中心の位置。 y は底面の高さ
+//   w     横幅（x の向き）、 h 高さ、 d 奥行き（z の向き）
+//   turn  上から見た回転（度）
+//
+//   let points = models.placed(part, ox, oy, oz)        その部品の三角形（世界の座標。三角形 1 つにつき小数 9 個）
+//   let colors = models.shades(points, color, cx, cy, cz) 面の向きで明るさを変えた色（三角形 1 つにつき 1 個）
+//   let box = models.bounds(points)                      その部品を囲む箱（当たり判定用）: x0, y0, z0, x1, y1, z1
+
+import blocks_gpu
+
+fn shape_names() -> List<String> {
+  ["box", "cylinder", "cone", "pyramid", "roof", "dome", "sphere", "wedge"]
+}
+
+fn shape_of(name: String) -> Int {
+  let names = shape_names()
+  for i in 0..names.len() {
+    if names[i] == name { return i }
+  }
+  0
+}
+
+fn hex_digit(code: Int) -> Int {
+  if code >= '0' && code <= '9' { return code - '0' }
+  if code >= 'a' && code <= 'f' { return code - 'a' + 10 }
+  if code >= 'A' && code <= 'F' { return code - 'A' + 10 }
+  -1
+}
+
+// "#rrggbb" の形の色。読めなければ灰色
+fn color_of(text: String) -> Int {
+  let codes = text.codes()
+  if codes.len() != 7 || codes[0] != '#' { return rgb(160, 160, 160) }
+  let mut value = 0
+  for i in 1..7 {
+    let digit = hex_digit(codes[i])
+    if digit < 0 { return rgb(160, 160, 160) }
+    value = value * 16 + digit
+  }
+  value
+}
+
+// 三角形 1 つ（点 3 つ）を足す
+fn tri(
+  points: List<Float>,
+  ax: Float,
+  ay: Float,
+  az: Float,
+  bx: Float,
+  by: Float,
+  bz: Float,
+  cx: Float,
+  cy: Float,
+  cz: Float,
+) -> List<Float> {
+  let mut out = points
+  out = out.push(ax).push(ay).push(az)
+  out = out.push(bx).push(by).push(bz)
+  out = out.push(cx).push(cy).push(cz)
+  out
+}
+
+// 輪（だ円）の上の点。step 番目 / 12 等分
+fn ring_x(step: Int, radius: Float) -> Float {
+  blocks_gpu.cosine(step.to_float() * 0.5235987755982988) * radius
+}
+
+fn ring_z(step: Int, radius: Float) -> Float {
+  blocks_gpu.sine(step.to_float() * 0.5235987755982988) * radius
+}
+
+// 部品の中での三角形。底面の中心が原点で、x は -w/2〜w/2、y は 0〜h、z は -d/2〜d/2
+fn local(shape: Int, w: Float, h: Float, d: Float) -> List<Float> {
+  let rx = w / 2.0
+  let rz = d / 2.0
+  let mut out: List<Float> = []
+  if shape == 1 {
+    // 円柱: 側面と上のふた
+    for i in 0..12 {
+      let x0 = ring_x(i, rx)
+      let z0 = ring_z(i, rz)
+      let x1 = ring_x(i + 1, rx)
+      let z1 = ring_z(i + 1, rz)
+      out = tri(out, x0, 0.0, z0, x1, 0.0, z1, x1, h, z1)
+      out = tri(out, x0, 0.0, z0, x1, h, z1, x0, h, z0)
+      out = tri(out, 0.0, h, 0.0, x0, h, z0, x1, h, z1)
+    }
+    return out
+  }
+  if shape == 2 {
+    // 円すい
+    for i in 0..12 {
+      out = tri(out, ring_x(i, rx), 0.0, ring_z(i, rz), ring_x(i + 1, rx), 0.0, ring_z(i + 1, rz), 0.0, h, 0.0)
+    }
+    return out
+  }
+  if shape == 3 {
+    // 四角すい
+    out = tri(out, -rx, 0.0, -rz, rx, 0.0, -rz, 0.0, h, 0.0)
+    out = tri(out, rx, 0.0, -rz, rx, 0.0, rz, 0.0, h, 0.0)
+    out = tri(out, rx, 0.0, rz, -rx, 0.0, rz, 0.0, h, 0.0)
+    out = tri(out, -rx, 0.0, rz, -rx, 0.0, -rz, 0.0, h, 0.0)
+    return out
+  }
+  if shape == 4 {
+    // 三角屋根: 棟が x の向きに走る。斜面 2 つと、両端の三角
+    out = tri(out, -rx, 0.0, -rz, rx, 0.0, -rz, rx, h, 0.0)
+    out = tri(out, -rx, 0.0, -rz, rx, h, 0.0, -rx, h, 0.0)
+    out = tri(out, -rx, 0.0, rz, rx, 0.0, rz, rx, h, 0.0)
+    out = tri(out, -rx, 0.0, rz, rx, h, 0.0, -rx, h, 0.0)
+    out = tri(out, -rx, 0.0, -rz, -rx, 0.0, rz, -rx, h, 0.0)
+    out = tri(out, rx, 0.0, -rz, rx, 0.0, rz, rx, h, 0.0)
+    return out
+  }
+  if shape == 5 || shape == 6 {
+    // 丸屋根（半球）と球: 輪を積み重ねる。球は下半分もある
+    let first = if shape == 6 { -3 } else { 0 }
+    let middle = if shape == 6 { h / 2.0 } else { 0.0 }
+    let ry = if shape == 6 { h / 2.0 } else { h }
+    for j in first..3 {
+      let a0 = j.to_float() * 0.5235987755982988
+      let a1 = (j + 1).to_float() * 0.5235987755982988
+      let y0 = middle + blocks_gpu.sine(a0) * ry
+      let y1 = middle + blocks_gpu.sine(a1) * ry
+      let s0 = blocks_gpu.cosine(a0)
+      let s1 = blocks_gpu.cosine(a1)
+      for i in 0..12 {
+        out = tri(out, ring_x(i, rx * s0), y0, ring_z(i, rz * s0), ring_x(i + 1, rx * s0), y0, ring_z(i + 1, rz * s0), ring_x(i + 1, rx * s1), y1, ring_z(i + 1, rz * s1))
+        out = tri(out, ring_x(i, rx * s0), y0, ring_z(i, rz * s0), ring_x(i + 1, rx * s1), y1, ring_z(i + 1, rz * s1), ring_x(i, rx * s1), y1, ring_z(i, rz * s1))
+      }
+    }
+    return out
+  }
+  if shape == 7 {
+    // くさび: z の大きい側へ向かって高くなる斜面。階段や片流れの屋根に
+    out = tri(out, -rx, 0.0, -rz, rx, 0.0, -rz, rx, h, rz)
+    out = tri(out, -rx, 0.0, -rz, rx, h, rz, -rx, h, rz)
+    out = tri(out, -rx, 0.0, rz, rx, 0.0, rz, rx, h, rz)
+    out = tri(out, -rx, 0.0, rz, rx, h, rz, -rx, h, rz)
+    out = tri(out, -rx, 0.0, -rz, -rx, 0.0, rz, -rx, h, rz)
+    out = tri(out, rx, 0.0, -rz, rx, 0.0, rz, rx, h, rz)
+    return out
+  }
+  // 箱
+  for face in 0..6 {
+    out = out.concat(blocks_gpu.face_points(-rx, 0.0, -rz, rx, h, rz, face))
+  }
+  out
+}
+
+// 部品を回して (ox, oy, oz) からの位置に置いたときの三角形（世界の座標）
+fn placed(part: List<Float>, ox: Float, oy: Float, oz: Float) -> List<Float> {
+  let turn = part[8] * 0.017453292519943295
+  // 回さないときは、計算の誤差が入らないようにそのまま置く
+  let c = if turn == 0.0 { 1.0 } else { blocks_gpu.cosine(turn) }
+  let s = if turn == 0.0 { 0.0 } else { blocks_gpu.sine(turn) }
+  let px = ox + part[2]
+  let py = oy + part[3]
+  let pz = oz + part[4]
+  let shape = local(part[0].to_int(), part[5], part[6], part[7])
+  let mut out: List<Float> = []
+  let mut i = 0
+  while i + 3 <= shape.len() {
+    let x = shape[i]
+    let z = shape[i + 2]
+    out = out.push(px + x * c + z * s).push(py + shape[i + 1]).push(pz - x * s + z * c)
+    i = i + 3
+  }
+  out
+}
+
+// 三角形ごとの色。面が外（中心 (cx, cy, cz) の反対側）を向いているとして、日の当たり方で明るさを決める
+fn shades(points: List<Float>, color: Int, cx: Float, cy: Float, cz: Float) -> List<Int> {
+  let r = (color / 65536 % 256).to_float()
+  let g = (color / 256 % 256).to_float()
+  let b = (color % 256).to_float()
+  let mut out: List<Int> = []
+  let mut i = 0
+  while i + 9 <= points.len() {
+    let ux = points[i + 3] - points[i]
+    let uy = points[i + 4] - points[i + 1]
+    let uz = points[i + 5] - points[i + 2]
+    let vx = points[i + 6] - points[i]
+    let vy = points[i + 7] - points[i + 1]
+    let vz = points[i + 8] - points[i + 2]
+    // 面に垂直な向き
+    let mut nx = uy * vz - uz * vy
+    let mut ny = uz * vx - ux * vz
+    let mut nz = ux * vy - uy * vx
+    let length = (nx * nx + ny * ny + nz * nz).sqrt()
+    let mut light = 0.7
+    if length > 0.0000001 {
+      // 外向きにそろえる
+      let mx = (points[i] + points[i + 3] + points[i + 6]) / 3.0 - cx
+      let my = (points[i + 1] + points[i + 4] + points[i + 7]) / 3.0 - cy
+      let mz = (points[i + 2] + points[i + 5] + points[i + 8]) / 3.0 - cz
+      if nx * mx + ny * my + nz * mz < 0.0 {
+        nx = -nx
+        ny = -ny
+        nz = -nz
+      }
+      // 日は斜め上から。日の当たらない面も真っ暗にはしない
+      let sun = ((nx * 0.35 + ny * 0.8 + nz * -0.48) / length).max(0.0)
+      light = 0.5 + 0.5 * sun + 0.06 * (nx / length).abs()
+    }
+    out = out.push(rgb((r * light).to_int(), (g * light).to_int(), (b * light).to_int()))
+    i = i + 9
+  }
+  out
+}
+
+// 三角形の集まりを囲む箱: x0, y0, z0, x1, y1, z1
+fn bounds(points: List<Float>) -> List<Float> {
+  let mut low = [1000000.0, 1000000.0, 1000000.0]
+  let mut high = [-1000000.0, -1000000.0, -1000000.0]
+  let mut i = 0
+  while i < points.len() {
+    let axis = i % 3
+    low[axis] = low[axis].min(points[i])
+    high[axis] = high[axis].max(points[i])
+    i = i + 1
+  }
+  low.concat(high)
+}
+
+// 部品の並び（9 個で 1 つ）が、横と奥行きに使っている範囲: x の最小, z の最小, x の最大, z の最大
+fn extent(parts: List<Float>) -> List<Float> {
+  let mut out = [1000000.0, 1000000.0, -1000000.0, -1000000.0]
+  let mut i = 0
+  while i + 9 <= parts.len() {
+    // 回っていても収まるように、幅と奥行きの大きいほうを半径にする
+    let reach = parts[i + 5].max(parts[i + 7]) / 2.0
+    out[0] = out[0].min(parts[i + 2] - reach)
+    out[1] = out[1].min(parts[i + 4] - reach)
+    out[2] = out[2].max(parts[i + 2] + reach)
+    out[3] = out[3].max(parts[i + 4] + reach)
+    i = i + 9
+  }
+  out
+}
+
+test "色を読む" {
+  assert color_of("#ff8000") == rgb(255, 128, 0)
+  assert color_of("#FFFFFF") == rgb(255, 255, 255)
+  assert color_of("red") == rgb(160, 160, 160)
+  assert color_of("#12345") == rgb(160, 160, 160)
+}
+
+test "箱は 12 個の三角形になり、囲む箱は寸法どおり" {
+  let part = [0.0, 0.0, 5.0, 1.0, 7.0, 2.0, 3.0, 4.0, 0.0]
+  let points = placed(part, 10.0, 20.0, 30.0)
+  assert points.len() == 12 * 9
+  assert bounds(points) == [14.0, 21.0, 35.0, 16.0, 24.0, 39.0]
+  assert shades(points, rgb(200, 100, 50), 15.0, 22.5, 37.0).len() == 12
+  assert extent(part) == [3.0, 5.0, 7.0, 9.0]
+}
+
+test "上を向いた面は明るく、下を向いた面は暗い" {
+  // 高さ 0 の位置にある水平な三角形を、下にある中心と上にある中心から見る
+  let flat = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+  let up = shades(flat, rgb(200, 200, 200), 0.3, -1.0, 0.3)[0]
+  let down = shades(flat, rgb(200, 200, 200), 0.3, 1.0, 0.3)[0]
+  assert up % 256 > down % 256
+  assert down % 256 == 100
+}
+
+test "形ごとの三角形の数" {
+  assert local(1, 2.0, 2.0, 2.0).len() == 36 * 9
+  assert local(2, 2.0, 2.0, 2.0).len() == 12 * 9
+  assert local(3, 2.0, 2.0, 2.0).len() == 4 * 9
+  assert local(4, 2.0, 2.0, 2.0).len() == 6 * 9
+  assert local(5, 2.0, 2.0, 2.0).len() == 72 * 9
+  assert local(6, 2.0, 2.0, 2.0).len() == 144 * 9
+  assert local(7, 2.0, 2.0, 2.0).len() == 6 * 9
+}
