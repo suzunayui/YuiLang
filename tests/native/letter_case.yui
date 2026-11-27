@@ -1,0 +1,31 @@
+// 大文字・小文字の変換。ASCII 以外の文字も、yui run と同じ結果になる
+
+fn show(text: String) uses io {
+  print("[{text}] upper [{text.to_upper()}] lower [{text.to_lower()}]")
+}
+
+fn main() uses io {
+  // 日本語が混ざっていても、英字だけが変わる
+  show("YuiLang で作る Game")
+  show("ユイ: やっほー！ Enter でお願い")
+  show("ｆｕｌｌ　ＷＩＤＴＨ　ａｂｃ")
+  // 英語以外の文字
+  show("Straße in München")
+  show("ÀÉÎÕÜ àéîõü Ÿ ÿ")
+  show("Привет, Мир")
+  show("Ελληνικά ΑΒΓ")
+  show("İstanbul ısı")
+  // 1 文字が 2〜3 文字になるもの
+  show("ß ﬁ ﬃ ŉ ǰ ΐ")
+  // 語の終わりのシグマだけが ς になる
+  show("ΟΔΥΣΣΕΥΣ")
+  show("Σ")
+  show("ΑΣ ΣΑ ΑΣΑ Σ. ΑΣ.")
+  show("ΑΣ'Σ Α'Σ ΑΣ1")
+  // 変わらないもの
+  show("")
+  show("123 !? 😀 漢字")
+  // 変えたものを、もう一度変える
+  let text = "Ǆ ǅ ǆ"
+  print("{text.to_upper().to_lower()} {text.to_lower().to_upper()} {text.to_upper().len()}")
+}

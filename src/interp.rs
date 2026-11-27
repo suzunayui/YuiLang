@@ -1639,7 +1639,12 @@ impl<'a> Interp<'a> {
             }
             (Value::List(items), "sort", []) => {
                 let mut items = items.to_vec();
-                items.sort_by(|a, b| order(a, b).unwrap_or(Ordering::Equal));
+                // Floats in the order of `f64::total_cmp`, so that the result is
+                // settled whatever the list holds: -0.0 before 0.0, NaN last.
+                items.sort_by(|a, b| match (a, b) {
+                    (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+                    _ => order(a, b).unwrap_or(Ordering::Equal),
+                });
                 Ok(Value::list(items))
             }
             (Value::List(items), "join", [Value::Str(sep)]) => {

@@ -127,8 +127,17 @@ fn list_contains_str(a: Int, value: Int) -> Int {
 }
 
 // x が y より前なら 1。strings が 1 なら文字列として比べる
+// 並べ替えで x が y より前か。strings: 0 = 整数、1 = 文字列、2 = 小数
 fn before(x: Int, y: Int, strings: Int) -> Int {
-  if strings == 1 { if str_cmp(x, y) < 0 { 1 } else { 0 } } else if x < y { 1 } else { 0 }
+  if strings == 1 { return if str_cmp(x, y) < 0 { 1 } else { 0 } }
+  if strings == 2 { return if float_key(x) < float_key(y) { 1 } else { 0 } }
+  if x < y { 1 } else { 0 }
+}
+
+// 小数の 64 ビットの並びを、整数として比べると小数の大小と同じ順になる数に直す。
+// 負の数は、並びが大きいほど値が小さいので、符号以外のビットを反転する（-0.0 は 0.0 の前、NaN は端に来る）
+fn float_key(bits: Int) -> Int {
+  if bits < 0 { __xor(bits, 9223372036854775807) } else { bits }
 }
 
 // ヒープソートの部品: start の要素を、end より前の範囲で正しい位置まで沈める
@@ -563,6 +572,115 @@ fn str_is_ascii(s: Int) -> Int {
   1
 }
 
+// 大文字・小文字の表（native.rs の case_table が作る）の中身:
+//   4 バイトの数が 4 つ: 1 文字に変わる文字の数、2〜3 文字に変わる文字の数、大小のある文字の範囲の数、飛ばす文字の範囲の数
+//   1 文字に変わる文字（8 バイトずつ: 文字, 変わった先）
+//   2〜3 文字に変わる文字（16 バイトずつ: 文字, 変わった先を 3 つまで。ない所は 0）
+//   範囲（8 バイトずつ: 最初, 最後）
+
+// 文字コードの昇順に並んだ表（1 件 size バイト、先頭 4 バイトが文字コード）から code を探す。なければ 0
+fn case_entry(first: Int, count: Int, size: Int, code: Int) -> Int {
+  let mut low = 0
+  let mut high = count
+  while low < high {
+    let middle = (low + high) / 2
+    let found = __load32(first + middle * size)
+    if found == code { return first + middle * size }
+    if found < code {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  0
+}
+
+// code が、範囲の並びのどれかに入っているか
+fn case_in(first: Int, count: Int, code: Int) -> Int {
+  let mut low = 0
+  let mut high = count
+  while low < high {
+    let middle = (low + high) / 2
+    if code < __load32(first + middle * 8) {
+      high = middle
+    } else if code > __load32(first + middle * 8 + 4) {
+      low = middle + 1
+    } else {
+      return 1
+    }
+  }
+  0
+}
+
+// s の at バイト目から、前（forward = 0）か後ろ（forward = 1）へ、飛ばす文字を飛ばしながら見ていき、
+// 最初に出会った文字が大小のある文字なら 1
+fn case_neighbor(s: Int, at: Int, table: Int, forward: Int) -> Int {
+  let count = __load(s + 8)
+  let cased = table + 16 + __load32(table) * 8 + __load32(table + 4) * 16
+  let skipped = cased + __load32(table + 8) * 8
+  let mut i = at
+  let mut looking = 1
+  while looking == 1 {
+    if forward == 1 {
+      if i >= count { return 0 }
+    } else {
+      if i <= 0 { return 0 }
+      // 1 つ前の文字の先頭へ（続きのバイトは 128〜191）
+      i = i - 1
+      while i > 0 && __load8(s + 24 + i) >= 128 && __load8(s + 24 + i) <= 191 {
+        i = i - 1
+      }
+    }
+    let code = utf8_code(s + 24 + i)
+    if case_in(skipped, __load32(table + 12), code) == 0 { return case_in(cased, __load32(table + 8), code) }
+    if forward == 1 {
+      i = i + utf8_width(__load8(s + 24 + i))
+    }
+  }
+  0
+}
+
+// 大文字（lower = 0）か小文字（lower = 1）にした新しい文字列。どの文字が何に変わるかは table による
+fn str_case(s: Int, table: Int, lower: Int) -> Int {
+  // ASCII だけなら、表を引かずに済ませる
+  if str_is_ascii(s) == 1 { return str_shift_case(s, if lower == 1 { 65 } else { 97 }) }
+  let count = __load(s + 8)
+  let singles = table + 16
+  let multis = singles + __load32(table) * 8
+  let mut out = str_new(count)
+  let mut i = 0
+  while i < count {
+    let code = utf8_code(s + 24 + i)
+    let width = utf8_width(__load8(s + 24 + i))
+    if lower == 1 && code == 931 {
+      // 大文字のシグマ（Σ）は、語の終わり（前に大小のある文字があり、後ろにはない）なら ς、そうでなければ σ
+      if case_neighbor(s, i, table, 0) == 1 && case_neighbor(s, i + width, table, 1) == 0 {
+        out = str_push_code(out, 962)
+      } else {
+        out = str_push_code(out, 963)
+      }
+    } else {
+      let one = case_entry(singles, __load32(table), 8, code)
+      if one != 0 {
+        out = str_push_code(out, __load32(one + 4))
+      } else {
+        let many = case_entry(multis, __load32(table + 4), 16, code)
+        if many == 0 {
+          out = str_push_code(out, code)
+        } else {
+          out = str_push_code(out, __load32(many + 4))
+          out = str_push_code(out, __load32(many + 8))
+          if __load32(many + 12) != 0 {
+            out = str_push_code(out, __load32(many + 12))
+          }
+        }
+      }
+    }
+    i = i + width
+  }
+  out
+}
+
 // first から 26 文字（大文字なら 65、小文字なら 97）を、もう一方の大小に変えた新しい文字列
 fn str_shift_case(s: Int, first: Int) -> Int {
   let count = __load(s + 8)
@@ -886,6 +1004,226 @@ fn str_trim(s: Int) -> Int {
 
 // 前後の空白を除いた部分が整数の表記なら 1 を返し、その値を result の番地に書く。
 // 符号は先頭に 1 つだけ、あとは数字が 1 つ以上。Int に収まらなければ 0
+// s の at バイト目からの 3 文字が、大文字小文字を区別せずに word（小文字 3 文字の文字コード）と同じか
+fn word3(s: Int, at: Int, a: Int, b: Int, c: Int) -> Int {
+  let x = __load8(s + 24 + at)
+  let y = __load8(s + 25 + at)
+  let z = __load8(s + 26 + at)
+  if (x == a || x == a - 32) && (y == b || y == b - 32) && (z == c || z == c - 32) { 1 } else { 0 }
+}
+
+// 文字列を小数として読む（前後の空白は無視）。読めたら result に 64 ビットの並びを入れて 1 を、読めなければ 0 を返す。
+// 読める形は yui run（Rust の読み方）と同じ: 符号、数字、小数点、e か E に続く指数、inf / infinity / nan。
+// 結果は、書かれた数にいちばん近い小数（ちょうど真ん中なら、仮数が偶数のほう）
+fn str_parse_float(s: Int, result: Int) -> Int {
+  let start = str_trim_start(s)
+  let end = str_trim_end(s, start)
+  let mut i = start
+  let mut sign = 0
+  if i < end {
+    let first = __load8(s + 24 + i)
+    if first == 45 {
+      sign = __shl(1, 63)
+      i = i + 1
+    } else if first == 43 {
+      i = i + 1
+    }
+  }
+  if i >= end { return 0 }
+  // 9218868437227405312 = 無限大、9221120237041090560 = 数でないもの（NaN）
+  if end - i == 3 && word3(s, i, 105, 110, 102) == 1 {
+    __store(result, sign + 9218868437227405312)
+    return 1
+  }
+  if end - i == 8 && word3(s, i, 105, 110, 102) == 1 && word3(s, i + 3, 105, 110, 105) == 1 && word3(s, i + 5, 105, 116, 121) == 1 {
+    __store(result, sign + 9218868437227405312)
+    return 1
+  }
+  if end - i == 3 && word3(s, i, 110, 97, 110) == 1 {
+    __store(result, sign + 9221120237041090560)
+    return 1
+  }
+
+  // 数字を読む。値 = num × 10 の scale10 乗。small は、15 桁までの間の num そのもの
+  let work = __alloc(1920)
+  let num = work
+  let den = work + 640
+  let tmp = work + 1280
+  big_set(num, 0)
+  let mut small = 0
+  let mut digits = 0
+  let mut seen = 0
+  let mut point = 0
+  let mut scale10 = 0
+  let mut sticky = 0
+  let mut reading = 1
+  while reading == 1 && i < end {
+    let c = __load8(s + 24 + i)
+    if c >= 48 && c <= 57 {
+      seen = 1
+      if digits == 0 && c == 48 {
+        // 先頭の 0 は桁に数えない
+        if point == 1 {
+          scale10 = scale10 - 1
+        }
+      } else if digits < 767 {
+        big_mul(num, 10)
+        big_set(tmp, c - 48)
+        big_add(num, tmp)
+        if digits < 15 {
+          small = small * 10 + c - 48
+        }
+        digits = digits + 1
+        if point == 1 {
+          scale10 = scale10 - 1
+        }
+      } else {
+        // 767 桁より先は、0 でない桁があったかどうかだけ覚えておく
+        // （2 つの小数のちょうど真ん中の数は、多くても 767 桁なので、それより先の桁は丸め方を変えない）
+        if c != 48 {
+          sticky = 1
+        }
+        if point == 0 {
+          scale10 = scale10 + 1
+        }
+      }
+      i = i + 1
+    } else if c == 46 && point == 0 {
+      point = 1
+      i = i + 1
+    } else {
+      reading = 0
+    }
+  }
+  let mut ok = seen
+  // 指数
+  if ok == 1 && i < end && (__load8(s + 24 + i) == 101 || __load8(s + 24 + i) == 69) {
+    i = i + 1
+    let mut down = 0
+    if i < end && __load8(s + 24 + i) == 45 {
+      down = 1
+      i = i + 1
+    } else if i < end && __load8(s + 24 + i) == 43 {
+      i = i + 1
+    }
+    let mut power = 0
+    let mut any = 0
+    while i < end && __load8(s + 24 + i) >= 48 && __load8(s + 24 + i) <= 57 {
+      any = 1
+      if power < 100000 {
+        power = power * 10 + __load8(s + 24 + i) - 48
+      }
+      i = i + 1
+    }
+    if any == 0 {
+      ok = 0
+    }
+    if down == 1 {
+      scale10 = scale10 - power
+    } else {
+      scale10 = scale10 + power
+    }
+  }
+  if ok == 0 || i < end {
+    __free(work)
+    return 0
+  }
+  if digits == 0 || digits + scale10 < 0 - 326 {
+    // 0、または表せないほど小さい数
+    __free(work)
+    __store(result, sign)
+    return 1
+  }
+  if digits + scale10 > 310 {
+    __free(work)
+    __store(result, sign + 9218868437227405312)
+    return 1
+  }
+
+  // 近道: 15 桁までの数と、10 の 22 乗までは小数で正確に表せるので、1 回の掛け算か割り算で正しく丸まる
+  if digits <= 15 && sticky == 0 && scale10 >= 0 - 22 && scale10 <= 22 {
+    __free(work)
+    let ten = __i2f(10)
+    let mut power10 = __i2f(1)
+    let mut left = if scale10 < 0 { 0 - scale10 } else { scale10 }
+    while left > 0 {
+      power10 = __fmul(power10, ten)
+      left = left - 1
+    }
+    let value = if scale10 < 0 { __fdiv(__i2f(small), power10) } else { __fmul(__i2f(small), power10) }
+    __store(result, sign + value)
+    return 1
+  }
+
+  // 正確な道: 値を num / den という分数にして、2 進の桁を 1 つずつ取り出す
+  if sticky == 1 {
+    big_mul(num, 10)
+    big_set(tmp, 1)
+    big_add(num, tmp)
+    scale10 = scale10 - 1
+  }
+  // 10 の累乗は 5 の累乗 × 2 の累乗なので、分数には 5 の累乗だけを掛け、2 の累乗は指数 e2 に回す
+  // （数が大きくなりすぎないようにするため。767 桁の数と 5 の 1,094 乗が、どちらも 2,560 ビットに収まる）
+  let mut e2 = scale10
+  big_set(den, 1)
+  while scale10 > 0 {
+    big_mul(num, 5)
+    scale10 = scale10 - 1
+  }
+  while scale10 < 0 {
+    big_mul(den, 5)
+    scale10 = scale10 + 1
+  }
+  // 1 <= num / den < 2 になるように 2 の累乗を掛ける。値 = (num / den) × 2 の e2 乗
+  let mut fitting = 1
+  while fitting == 1 {
+    big_copy(tmp, den)
+    big_mul(tmp, 2)
+    if big_cmp(num, tmp) >= 0 {
+      big_copy(den, tmp)
+      e2 = e2 + 1
+    } else {
+      fitting = 0
+    }
+  }
+  while big_cmp(num, den) < 0 {
+    big_mul(num, 2)
+    e2 = e2 - 1
+  }
+  // 取り出す桁の数。ふつうは 53。とても小さい数（指数が下の限界より小さい）は、その分だけ少ない
+  let mut bits = 53
+  if e2 < 0 - 1022 {
+    bits = 53 - (0 - 1022 - e2)
+  }
+  let mut value = 0
+  if e2 <= 1023 && bits >= 0 {
+    let mut mantissa = 0
+    let mut k = 0
+    while k < bits {
+      if big_cmp(num, den) >= 0 {
+        mantissa = mantissa * 2 + 1
+        big_sub(num, den)
+      } else {
+        mantissa = mantissa * 2
+      }
+      big_mul(num, 2)
+      k = k + 1
+    }
+    // 残りが半分より大きければ切り上げ。ちょうど半分なら、仮数が偶数になるほうへ
+    let order = big_cmp(num, den)
+    if order > 0 || order == 0 && __and(mantissa, 1) == 1 {
+      mantissa = mantissa + 1
+    }
+    // 切り上げで桁があふれても、指数の側に自然に繰り上がる（いちばん上なら無限大になる）
+    value = if e2 >= 0 - 1022 { (e2 + 1022) * 4503599627370496 + mantissa } else { mantissa }
+  } else if e2 > 1023 {
+    value = 9218868437227405312
+  }
+  __free(work)
+  __store(result, sign + value)
+  1
+}
+
 fn str_parse_int(s: Int, result: Int) -> Int {
   let start = str_trim_start(s)
   let end = str_trim_end(s, start)

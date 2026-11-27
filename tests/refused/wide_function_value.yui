@@ -1,0 +1,10 @@
+// `yui build --native` がまだ対応していない機能（引数が 4 個以上の関数を値として使う）を使う。
+// 断られることを確かめるためのファイル
+fn add4(a: Int, b: Int, c: Int, d: Int) -> Int {
+  a + b + c + d
+}
+
+fn main() uses io {
+  let f = add4
+  print("{f(1, 2, 3, 4)}")
+}

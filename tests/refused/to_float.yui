@@ -1,6 +1,0 @@
-// `yui build --native` がまだ対応していない機能（文字列から小数への変換）を使う。
-// 断られることを確かめるためのファイル
-fn main() uses io {
-  let text = "3.5"
-  print("{text.to_float()}")
-}

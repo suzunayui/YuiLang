@@ -358,7 +358,7 @@ fn native_executables_match_yui_run() {
     let refused = out_dir.join("refused.exe");
     let result = Command::new(yui)
         .args(["build", "--native"])
-        .arg(root().join("tests/refused/to_float.yui"))
+        .arg(root().join("tests/refused/wide_function_value.yui"))
         .arg("-o")
         .arg(&refused)
         .output()
@@ -370,7 +370,7 @@ fn native_executables_match_yui_run() {
     // Without `--native`, such a program is still built: with the interpreter inside.
     let result = Command::new(yui)
         .arg("build")
-        .arg(root().join("tests/refused/to_float.yui"))
+        .arg(root().join("tests/refused/wide_function_value.yui"))
         .arg("-o")
         .arg(&refused)
         .output()
@@ -378,7 +378,7 @@ fn native_executables_match_yui_run() {
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert!(String::from_utf8_lossy(&result.stderr).contains("note: bundling the interpreter"));
     let ran = Command::new(&refused).output().unwrap();
-    assert_eq!(String::from_utf8_lossy(&ran.stdout), "Some(3.5)\n");
+    assert_eq!(String::from_utf8_lossy(&ran.stdout), "10\n");
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 /// Standard input, command-line arguments and files: the native executable

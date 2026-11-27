@@ -346,6 +346,65 @@ const POOL_MAX: usize = 64;
 /// How much it takes from the system at a time.
 const POOL_CHUNK: u32 = 1 << 16;
 
+/// The table `str_case` of the runtime goes by, for `to_lower` or `to_upper`:
+/// what each character turns into, taken from the Rust library so that the
+/// result is the interpreter's.
+///
+/// Four counts of 4 bytes each, then that many entries of each kind:
+/// - characters that turn into one other: the character, what it becomes (8 bytes);
+/// - characters that turn into two or three: the character and those (16 bytes, 0 where there is none);
+/// - for `to_lower` only, what decides how a capital sigma at the end of a
+///   word is written: ranges of characters that have a case, and ranges of
+///   those that are passed over when looking for one (first and last, 8 bytes).
+fn case_table(lower: bool) -> &'static [u8] {
+    static TABLES: [std::sync::OnceLock<Vec<u8>>; 2] = [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    TABLES[lower as usize].get_or_init(|| {
+        let (mut singles, mut multis): (Vec<[u32; 2]>, Vec<[u32; 4]>) = (Vec::new(), Vec::new());
+        let (mut cased, mut skipped): (Vec<[u32; 2]>, Vec<[u32; 2]>) = (Vec::new(), Vec::new());
+        // Adds `code` to a list of ranges in rising order.
+        let extend = |ranges: &mut Vec<[u32; 2]>, code: u32| match ranges.last_mut() {
+            Some(last) if last[1] + 1 == code => last[1] = code,
+            _ => ranges.push([code, code]),
+        };
+        let mut probe = String::new();
+        for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+            let mut mapped = [0u32; 3];
+            let mut count = 0;
+            let changed: Box<dyn Iterator<Item = char>> = if lower { Box::new(c.to_lowercase()) } else { Box::new(c.to_uppercase()) };
+            for (to, from) in mapped.iter_mut().zip(changed) {
+                *to = from as u32;
+                count += 1;
+            }
+            if count == 1 && mapped[0] != c as u32 {
+                singles.push([c as u32, mapped[0]]);
+            } else if count > 1 {
+                multis.push([c as u32, mapped[0], mapped[1], mapped[2]]);
+            }
+            if lower {
+                // The library does not say which characters have a case or are
+                // passed over, but how it writes a sigma after them tells:
+                // after "a" and one that is passed over, or after one with a
+                // case, the sigma ends a word.
+                let ends_word = |probe: &str| probe.to_lowercase().ends_with('\u{3C2}');
+                probe.clear();
+                probe.extend(['a', c, '\u{3A3}']);
+                if ends_word(&probe) {
+                    probe.clear();
+                    probe.extend([c, '\u{3A3}']);
+                    extend(if ends_word(&probe) { &mut cased } else { &mut skipped }, c as u32);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for count in [singles.len(), multis.len(), cased.len(), skipped.len()] {
+            out.extend((count as u32).to_le_bytes());
+        }
+        let words = singles.iter().flatten().chain(multis.iter().flatten()).chain(cased.iter().flatten()).chain(skipped.iter().flatten());
+        out.extend(words.flat_map(|word| word.to_le_bytes()));
+        out
+    })
+}
+
 /// Why a program cannot be compiled natively yet.
 pub struct Unsupported {
     pub what: String,
@@ -534,6 +593,8 @@ struct Native<'a> {
     /// finished, and whether the program needs it.
     rt_http_callback: usize,
     uses_http_callback: bool,
+    /// Where the tables for `to_upper` and `to_lower` are, once a program uses them.
+    case_labels: [Option<usize>; 2],
     /// Whether those two are needed.
     uses_errors: bool,
     /// Closures to compile, and for each function used as a value, the code
@@ -662,6 +723,7 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         os_labels,
         rt_http_callback,
         uses_http_callback: false,
+        case_labels: [None, None],
         uses_errors: false,
         closures: Vec::new(),
         thunks: HashMap::new(),
@@ -4723,6 +4785,29 @@ impl Native<'_> {
                 self.release(temp, spilled);
                 Ok(Ty::Int)
             }
+            ("__fmul" | "__fdiv", [left, right]) => {
+                // Floats, given and returned as their bits.
+                self.eval(left, dst)?;
+                let (a, b, _, temp, spilled) = self.operands(dst, right)?;
+                self.load_opnd(RAX, a);
+                self.load_opnd(RCX, b);
+                self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]); // movq xmm0, rax
+                self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x6E, 0xC9]); // movq xmm1, rcx
+                self.a.buf.extend_from_slice(&[0xF2, 0x0F, if name == "__fmul" { 0x59 } else { 0x5E }, 0xC1]); // mulsd / divsd xmm0, xmm1
+                self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]); // movq rax, xmm0
+                self.a.mov_rr(dst, RAX);
+                self.release(temp, spilled);
+                Ok(Ty::Int)
+            }
+            ("__i2f", [value]) => {
+                // The bits of the float nearest to an integer.
+                self.eval(value, dst)?;
+                self.a.mov_rr(RAX, dst);
+                self.a.buf.extend_from_slice(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]); // cvtsi2sd xmm0, rax
+                self.a.buf.extend_from_slice(&[0x66, 0x48, 0x0F, 0x7E, 0xC0]); // movq rax, xmm0
+                self.a.mov_rr(dst, RAX);
+                Ok(Ty::Int)
+            }
             ("__load8", [address]) => {
                 self.eval(address, dst)?;
                 self.a.mov_rr(RAX, dst);
@@ -5017,22 +5102,23 @@ impl Native<'_> {
             (ty @ Ty::Map(_), ..) => self.map_method(e, recv, ty, name, name_span, args, dst),
             (ty @ Ty::Enum(_), ..) => self.enum_method(recv, ty, name, name_span, args, dst),
             (Ty::Str, "to_lower" | "to_upper", []) => {
-                // Only the letters a-z and A-Z are converted here; text with
-                // anything else beyond ASCII is refused, not converted wrongly.
-                let d = Diagnostic::new(
-                    "E0902",
-                    format!("`{name}` on text outside ASCII is not supported by `--native` yet"),
-                    e.span,
-                );
-                let stub = self.fail_stub(d);
+                // By the tables of Unicode, the same ones the interpreter uses;
+                // they go into the executable. (Text of nothing but ASCII
+                // takes a short way in the routine.)
+                let lower = name == "to_lower";
+                let table = match self.case_labels[lower as usize] {
+                    Some(label) => label,
+                    None => {
+                        let label = self.constant(case_table(lower));
+                        self.case_labels[lower as usize] = Some(label);
+                        label
+                    }
+                };
                 let (slot, owned, _) = self.park(recv, dst)?;
                 self.a.load(RCX, slot);
-                self.call_rt("str_is_ascii");
-                self.a.alu_rr(0x85, RAX, RAX);
-                self.a.jcc(CC_Z, stub);
-                self.a.load(RCX, slot);
-                self.a.mov_imm64(RDX, if name == "to_lower" { 65 } else { 97 });
-                self.call_rt("str_shift_case");
+                self.lea_label(RDX, table);
+                self.a.mov_imm64(R8, lower as i64);
+                self.call_rt("str_case");
                 if owned {
                     self.a.load(RCX, slot);
                     self.a.store(slot, RAX);
@@ -5077,7 +5163,7 @@ impl Native<'_> {
                 self.a.mov_rr(dst, RAX);
                 Ok(Ty::Str)
             }
-            (Ty::Str, "to_int", []) => {
+            (Ty::Str, "to_int" | "to_float", []) => {
                 // The routine says whether the text is a number, and stores the number.
                 let result = self.expr_ty(e)?;
                 let (slot, owned, _) = self.park(recv, dst)?;
@@ -5085,7 +5171,7 @@ impl Native<'_> {
                 let (none, done) = (self.a.label(), self.a.label());
                 self.a.load(RCX, slot);
                 self.a.lea(RDX, value);
-                self.call_rt("str_parse_int");
+                self.call_rt(if name == "to_int" { "str_parse_int" } else { "str_parse_float" });
                 self.a.alu_rr(0x85, RAX, RAX);
                 self.a.jcc(CC_Z, none);
                 self.fill_block(self.size_of(result), &[(value, 16)], dst);
@@ -6295,6 +6381,7 @@ impl Native<'_> {
                     ("reverse", 0, _) => ("list_reversed", None, true, left.2),
                     ("sort", 0, Ty::Int) => ("list_sorted", Some(0), true, left.2),
                     ("sort", 0, Ty::Str) => ("list_sorted", Some(1), true, left.2),
+                    ("sort", 0, Ty::Float) => ("list_sorted", Some(2), true, left.2),
                     ("join", 1, Ty::Str) => ("list_join", None, false, Ty::Str),
                     ("contains", 1, Ty::Int | Ty::Bool) => ("list_contains", None, false, Ty::Bool),
                     ("contains", 1, Ty::Str) => ("list_contains_str", None, false, Ty::Bool),
