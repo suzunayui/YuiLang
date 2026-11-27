@@ -116,7 +116,22 @@ fn scan_string(chars: List<String>, codes: List<Int>, open: Int) -> Scan {
           depth = depth - 1
           if depth == 0 { break }
         } else if d == '"' {
-          return failed("E0005", j)
+          // 式の中の文字列: 終わりまで飛ばす（中の波かっこや引用符を数えないように）
+          let inner = if is_raw_start(codes, j) {
+            scan_raw(chars, codes, j)
+          } else {
+            scan_string(chars, codes, j)
+          }
+          if !inner.ok { return inner }
+          j = inner.next
+          continue
+        } else if d == '\'' {
+          // 式の中の文字リテラル（'}' や '"' など）
+          let end = scan_char(codes, j)
+          if end >= 0 {
+            j = end
+            continue
+          }
         }
         j = j + 1
       }
@@ -137,6 +152,46 @@ fn scan_string(chars: List<String>, codes: List<Int>, open: Int) -> Scan {
     parts = "{parts}\tL:{escape(cur)}"
   }
   Scan { next: i, text: parts, ok: true }
+}
+
+// at から `"""` が始まっているか
+fn is_raw_start(codes: List<Int>, at: Int) -> Bool {
+  at + 2 < codes.len() && codes[at] == '"' && codes[at + 1] == '"' && codes[at + 2] == '"'
+}
+
+// open にある `"""` から始まる、そのまま書ける文字列を読む。
+// 中身に特別な文字はない。配置のための決まりは 2 つ:
+// 開く `"""` の直後の改行は中身に入らない。閉じる `"""` が単独の行にあれば、
+// その前の空白が各行の頭から取り除かれ、直前の改行も中身に入らない
+fn scan_raw(chars: List<String>, codes: List<Int>, open: Int) -> Scan {
+  let n = codes.len()
+  let start = open + 3
+  let mut end = start
+  while end < n && !is_raw_start(codes, end) {
+    end = end + 1
+  }
+  if end >= n { return failed("E0002", n) }
+  let raw = text(chars, start, end).replace("\r\n", "\n")
+  let next = end + 3
+  if !raw.starts_with("\n") { return Scan { next: next, text: "str\tL:{escape(raw)}", ok: true } }
+  let body = raw.slice(1, raw.len())
+  let lines = body.split("\n")
+  let indent = lines[lines.len() - 1]
+  let plain = lines.len() < 2 || indent.codes().any(|c| c != ' ' && c != '\t')
+  if plain { return Scan { next: next, text: "str\tL:{escape(body)}", ok: true } }
+  let mut kept: List<String> = []
+  for i in 0..lines.len() - 1 {
+    let line = lines[i]
+    if line.starts_with(indent) {
+      kept = kept.push(line.slice(indent.len(), line.len()))
+    } else if line.trim().is_empty() {
+      // 空の行は字下げがなくてもよい
+      kept = kept.push("")
+    } else {
+      return failed("E0007", next)
+    }
+  }
+  Scan { next: next, text: "str\tL:{escape(kept.join("\n"))}", ok: true }
 }
 
 // open にある `'` から始まる文字リテラルを読み、その直後の位置を返す。正しくなければ -1
@@ -220,7 +275,11 @@ fn lex(src: String) -> List<String> {
       out = out.push("{mark}int {text(chars, start, end)}")
       i = end
     } else if c == '"' {
-      let scan = scan_string(chars, codes, i)
+      let scan = if is_raw_start(codes, i) {
+        scan_raw(chars, codes, i)
+      } else {
+        scan_string(chars, codes, i)
+      }
       if !scan.ok { return out.push("error {scan.text}") }
       out = out.push("{mark}{scan.text}")
       i = scan.next
@@ -259,6 +318,22 @@ test "strings" {
   assert lex("\"\"") == ["+str\tL:", " eof"]
   assert lex("\"a\{b\}c\"") == ["+str\tL:a\tC:b\tL:c", " eof"]
   assert lex("\"\\n\"") == ["+str\tL:\\n", " eof"]
+}
+
+test "strings inside interpolation" {
+  assert lex("\"a\{f(\"x\")\}b\"") == ["+str\tL:a\tC:f(\"x\")\tL:b", " eof"]
+  assert lex("\"\{m.get(\"\}\")\}\"") == ["+str\tC:m.get(\"\}\")", " eof"]
+  assert lex("\"\{c == '\}'\}\"") == ["+str\tC:c == '\}'", " eof"]
+  assert lex("\"\{\"abc\}\"") == ["error E0002"]
+}
+
+test "raw strings" {
+  assert lex("\"\"\"a \"b\" \{c\} \\n\"\"\"") == ["+str\tL:a \"b\" \{c\} \\\\n", " eof"]
+  assert lex("\"\"\"\"\"\"") == ["+str\tL:", " eof"]
+  assert lex("x = \"\"\"\n  one\n\n    two\n  \"\"\" y") == ["+ident x", " sym =", " str\tL:one\\n\\n  two", " ident y", " eof"]
+  assert lex("\"\"\"\n  one\n two\n  \"\"\"") == ["error E0007"]
+  assert lex("\"\"\"\none\ntwo\"\"\"") == ["+str\tL:one\\ntwo", " eof"]
+  assert lex("\"\"\"abc") == ["error E0002"]
 }
 
 test "character literals" {

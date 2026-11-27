@@ -1,0 +1,45 @@
+// そのまま書ける文字列（""" で囲む）と、標準の部品（std.math、std.json）
+
+import std.json
+import std.math
+
+fn main() uses io {
+  // 1 行: 引用符も波かっこも逆斜線も、書いたとおりの文字になる
+  let one = """{"name": "ユイ", "path": "C:\dir\n", "x": {1}}"""
+  print(one)
+  print("{one.len()}")
+
+  // 複数行: 閉じる """ の前の空白が、各行の頭から取り除かれる
+  let many = """
+    {
+      "kind": "box",
+      "tags": ["a", "b"]
+    }
+    """
+  print(many)
+  print("{many.len()} {many.split("\n").len()}")
+
+  // 空の行は字下げがなくてもよい。閉じる """ を同じ行に書くと、最後の改行も文字になる
+  let gaps = """
+    first
+
+    third"""
+  print("[{gaps}]")
+  let empty = """"""
+  print("{empty.is_empty()} {empty.len()}")
+
+  // JSON として読める
+  match json.parse(many) {
+    Ok(v) => print("{json.text_of(json.get(v, "kind"))} {json.items(json.get(v, "tags")).len()} {json.write(v)}")
+    Err(why) => print(why)
+  }
+  match json.parse(one) {
+    Ok(v) => print("?")
+    Err(why) => print(why)
+  }
+
+  // 数学
+  print("{math.sin(0.5)} {math.cos(0.5)} {math.atan2(1.0, -1.0)} {math.exp(1.0)} {math.ln(10.0)} {math.pow(2.0, 10)}")
+  let turn = math.radians(30.0)
+  print("{math.sin(turn)} {math.degrees(turn)} {math.pi()}")
+}

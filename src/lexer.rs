@@ -246,6 +246,10 @@ pub fn lex_full(src: &str, base: usize) -> Result<(Vec<Token>, Vec<Span>), Diagn
             }
             let text = &src[start..i];
             keyword(text).unwrap_or_else(|| Tok::Ident(text.to_string()))
+        } else if src[i..].starts_with("\"\"\"") {
+            let (text, next) = lex_raw_string(src, i, base)?;
+            i = next;
+            Tok::Str(vec![StrPart::Lit(text)])
         } else if c == b'"' {
             let (parts, next) = lex_string(src, i, base)?;
             i = next;
@@ -415,6 +419,73 @@ fn lex_prefix(src: &str, end: usize) -> Vec<Token> {
     }
 }
 
+/// The index just past the character literal that starts at `open`, if there
+/// is a well-formed one there.
+fn char_literal_end(src: &str, open: usize) -> Option<usize> {
+    let mut rest = src[open + 1..].chars();
+    let close = match rest.next()? {
+        '\\' => {
+            if !matches!(rest.next()?, 'n' | 't' | 'r' | '\\' | '\'' | '"') {
+                return None;
+            }
+            open + 3
+        }
+        '\'' | '\n' => return None,
+        c => open + 1 + c.len_utf8(),
+    };
+    (src.as_bytes().get(close) == Some(&b'\'')).then_some(close + 1)
+}
+
+/// Lex a raw string starting at its opening `"""`. Returns its text and the
+/// index just past the closing `"""`.
+///
+/// Nothing between the two is special: no escapes, no `{...}`, and quotes
+/// and line breaks are part of the text. So that the text can be laid out
+/// with the code around it:
+/// - a line break right after the opening `"""` is not part of the text;
+/// - if the closing `"""` stands on a line of its own, the spaces before it
+///   are taken off the start of every line, and the line break before it is
+///   not part of the text.
+fn lex_raw_string(src: &str, open: usize, base: usize) -> Result<(String, usize), Diagnostic> {
+    let start = open + 3;
+    let Some(length) = src[start..].find("\"\"\"") else {
+        return Err(Diagnostic::new("E0002", "unterminated raw string", Span::new(base + open, base + start))
+            .hint("a raw string starts and ends with `\"\"\"`"));
+    };
+    let end = start + length;
+    // Files saved on Windows end their lines with "\r\n"; the text has "\n".
+    let text = src[start..end].replace("\r\n", "\n");
+    let Some(body) = text.strip_prefix('\n') else {
+        return Ok((text, end + 3));
+    };
+    let Some((lines, indent)) = body.rsplit_once('\n') else {
+        return Ok((body.to_string(), end + 3));
+    };
+    if !indent.chars().all(|c| c == ' ' || c == '\t') {
+        return Ok((body.to_string(), end + 3));
+    }
+    let mut out = String::new();
+    for (i, line) in lines.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match line.strip_prefix(indent) {
+            Some(rest) => out.push_str(rest),
+            // A blank line need not carry the indentation.
+            None if line.trim().is_empty() => {}
+            None => {
+                return Err(Diagnostic::new(
+                    "E0007",
+                    "a line of this raw string is indented less than its closing `\"\"\"`",
+                    Span::new(base + open, base + end + 3),
+                )
+                .hint("indent every line at least as far as the closing `\"\"\"`, which marks where the text starts"))
+            }
+        }
+    }
+    Ok((out, end + 3))
+}
+
 /// Lex a string literal starting at the opening quote. Returns its parts and
 /// the index just past the closing quote.
 fn lex_string(src: &str, open: usize, base: usize) -> Result<(Vec<StrPart>, usize), Diagnostic> {
@@ -474,13 +545,22 @@ fn lex_string(src: &str, open: usize, base: usize) -> Result<(Vec<StrPart>, usiz
                                 break;
                             }
                         }
+                        // A string inside the code: skip to its end, so that
+                        // braces and quotes in it are not taken for ours.
                         b'"' => {
-                            return Err(Diagnostic::new(
-                                "E0005",
-                                "string literals are not allowed inside `{...}` interpolation",
-                                Span::new(base + j, base + j + 1),
-                            )
-                            .hint("bind the value with `let` first, or write `\\{` for a literal brace"))
+                            j = if src[j..].starts_with("\"\"\"") {
+                                lex_raw_string(src, j, base)?.1
+                            } else {
+                                lex_string(src, j, base)?.1
+                            };
+                            continue;
+                        }
+                        // Likewise a character literal such as '}' or '"'.
+                        b'\'' => {
+                            if let Some(end) = char_literal_end(src, j) {
+                                j = end;
+                                continue;
+                            }
                         }
                         _ => {}
                     }

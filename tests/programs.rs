@@ -73,6 +73,8 @@ fn example_files() -> Vec<PathBuf> {
     let mut files = yui_files("examples");
     files.push(root().join("examples/modules/main.yui"));
     files.extend(yui_files("selfhost"));
+    // The modules that come with the language carry their own tests.
+    files.extend(yui_files("std"));
     files
 }
 
@@ -254,7 +256,7 @@ fn selfhosted_lexer_matches_the_rust_lexer() {
             .map_err(|(d, _)| d)
             .expect("the lexer loads");
         let mut files = Vec::new();
-        for dir in ["examples", "tests", "selfhost"] {
+        for dir in ["examples", "tests", "selfhost", "std", "games"] {
             all_yui_files(&root().join(dir), &mut files);
         }
         files.sort();
@@ -285,7 +287,7 @@ fn selfhosted_parser_matches_the_rust_parser() {
             .map_err(|(d, _)| d)
             .expect("the parser loads");
         let mut files = Vec::new();
-        for dir in ["examples", "tests", "selfhost"] {
+        for dir in ["examples", "tests", "selfhost", "std", "games"] {
             all_yui_files(&root().join(dir), &mut files);
         }
         files.sort();
@@ -322,7 +324,9 @@ fn native_executables_match_yui_run() {
         let name = path.file_name().unwrap();
         let exe = out_dir.join(path.file_stem().unwrap()).with_extension("exe");
         // Both run from the program's directory, so error messages name the file the same way.
-        let bundled = out_dir.join("bundled.exe");
+        // A file of its own per program: writing over the executable that
+        // has just run fails now and then, while the system still holds it.
+        let bundled = out_dir.join(format!("bundled_{}.exe", path.file_stem().unwrap().to_string_lossy()));
         let built = Command::new(yui).current_dir(&dir).args(["build", "--bundle"]).arg(name).arg("-o").arg(&bundled).output().unwrap();
         assert!(built.status.success(), "{}: {}", path.display(), String::from_utf8_lossy(&built.stderr));
         let expected = Command::new(&bundled).output().unwrap();
@@ -343,9 +347,9 @@ fn native_executables_match_yui_run() {
         assert_eq!(String::from_utf8_lossy(&actual.stdout), String::from_utf8_lossy(&expected.stdout), "{}", path.display());
         assert_eq!(String::from_utf8_lossy(&actual.stderr), String::from_utf8_lossy(&expected.stderr), "{}", path.display());
         assert_eq!(actual.status.code(), expected.status.code(), "{}", path.display());
-        // No interpreter inside: these programs are a few kilobytes, most of it
-        // the text of error messages.
-        assert!(std::fs::metadata(&exe).unwrap().len() < 64 * 1024, "{}", path.display());
+        // No interpreter inside (that would be over a megabyte): these programs
+        // are a few kilobytes, a few dozen where they use the standard modules.
+        assert!(std::fs::metadata(&exe).unwrap().len() < 256 * 1024, "{}", path.display());
         failures += (expected.status.code() != Some(0)) as usize;
     }
     assert!(failures >= 5, "only {failures} failing programs were compared");

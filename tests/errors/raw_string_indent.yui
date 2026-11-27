@@ -1,0 +1,7 @@
+// expect: E0007
+fn f() -> String {
+  """
+    one
+  two
+    """
+}

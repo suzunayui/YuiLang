@@ -12,7 +12,7 @@
 // key は API キー。環境変数 ANTHROPIC_API_KEY から env("ANTHROPIC_API_KEY") で読む。
 // schema は、返事の形を決める JSON スキーマ（JSON の文字列）。返事は必ずその形の JSON になる。
 
-import json
+import std.json
 
 // ふだん使うモデル
 fn model() -> String {

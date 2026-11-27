@@ -1,0 +1,232 @@
+// 数学の関数。`import std.math` で使う。
+//
+//   math.pi()                    円周率
+//   math.sin(x)  math.cos(x)  math.tan(x)      三角関数（x はラジアン）
+//   math.atan(x)  math.atan2(y, x)             逆正接。atan2 は点 (x, y) の向き（-π〜π）
+//   math.exp(x)  math.ln(x)                    e の x 乗、自然対数
+//   math.pow(x, n)                             x の n 乗（n は整数）
+//   math.radians(degrees)  math.degrees(radians)
+//
+// どれも YuiLang で書いてあり、`yui run` でも `yui build` でも、同じ入力には 1 ビットも違わない同じ結果を返す。
+// 精度は、ふつうの大きさの数（絶対値が 10 万くらいまで）で 15 桁ほど。
+
+fn pi() -> Float {
+  3.141592653589793
+}
+
+fn radians(degrees: Float) -> Float {
+  degrees * 0.017453292519943295
+}
+
+fn degrees(radians: Float) -> Float {
+  radians * 57.29577951308232
+}
+
+// -π/4〜π/4 の x の正弦。多項式で求める
+fn sin_small(x: Float) -> Float {
+  let z = x * x
+  let high = 0.0000027557313707070068 + z * (-0.000000025050760253406863 + z * 0.00000000015896909952115501)
+  let r = 0.008333333333322249 + z * (-0.0001984126982985795 + z * high)
+  x + x * z * (-0.16666666666666632 + z * r)
+}
+
+// -π/4〜π/4 の x の余弦
+fn cos_small(x: Float) -> Float {
+  let z = x * x
+  let high = -0.0000002755731417929674 + z * (0.000000002087570084197473 + z * -0.000000000011359647557788195)
+  let r = 0.0416666666666666 + z * (-0.001388888888887411 + z * (0.00002480158728947673 + z * high))
+  1.0 - z / 2.0 + z * z * r
+}
+
+// x から π/2 の何倍かを引いて -π/4〜π/4 にしたときの、引いた倍数（四捨五入した整数）
+fn quarter_turns(x: Float) -> Float {
+  (x * 0.6366197723675814).round()
+}
+
+// その残り。π/2 を上位と下位の 2 つの数に分けて引くことで、桁落ちを防ぐ
+fn quarter_rest(x: Float, turns: Float) -> Float {
+  x - turns * 1.5707963267341256 - turns * 0.00000000006077100506506192
+}
+
+fn sin(x: Float) -> Float {
+  let turns = quarter_turns(x)
+  let rest = quarter_rest(x, turns)
+  let quarter = (turns - (turns / 4.0).floor() * 4.0).to_int()
+  if quarter == 0 {
+    sin_small(rest)
+  } else if quarter == 1 {
+    cos_small(rest)
+  } else if quarter == 2 {
+    -sin_small(rest)
+  } else {
+    -cos_small(rest)
+  }
+}
+
+fn cos(x: Float) -> Float {
+  let turns = quarter_turns(x)
+  let rest = quarter_rest(x, turns)
+  let quarter = (turns - (turns / 4.0).floor() * 4.0).to_int()
+  if quarter == 0 {
+    cos_small(rest)
+  } else if quarter == 1 {
+    -sin_small(rest)
+  } else if quarter == 2 {
+    -cos_small(rest)
+  } else {
+    sin_small(rest)
+  }
+}
+
+// cos(x) が 0 になる所（π/2 の奇数倍）では、とても大きな数になる
+fn tan(x: Float) -> Float {
+  sin(x) / cos(x)
+}
+
+// 0〜0.268 の x の逆正接。級数で求める
+fn atan_small(x: Float) -> Float {
+  let z = x * x
+  let mut sum = 0.0
+  // 後ろの項から足していく（小さい項を先に足すほうが正確）
+  let mut n = 14
+  while n >= 0 {
+    sum = 1.0 / (2 * n + 1).to_float() - z * sum
+    n = n - 1
+  }
+  x * sum
+}
+
+fn atan(x: Float) -> Float {
+  if x < 0.0 { return -atan(-x) }
+  // 1 より大きければ逆数にし、さらに 30 度ぶん回して、小さな数にしてから求める
+  if x > 1.0 { return 1.5707963267948966 - atan(1.0 / x) }
+  if x > 0.2679491924311227 { return 0.5235987755982988 + atan_small((x * 1.7320508075688772 - 1.0) / (x + 1.7320508075688772)) }
+  atan_small(x)
+}
+
+// 原点から見た点 (x, y) の向き。-π〜π。x も y も 0 なら 0
+fn atan2(y: Float, x: Float) -> Float {
+  if x > 0.0 { return atan(y / x) }
+  if x < 0.0 { return if y >= 0.0 { atan(y / x) + pi() } else { atan(y / x) - pi() } }
+  if y > 0.0 { return 1.5707963267948966 }
+  if y < 0.0 { return -1.5707963267948966 }
+  0.0
+}
+
+// e の x 乗。x が 709 を超えると表せないので、とても大きな数（無限大）になる
+fn exp(x: Float) -> Float {
+  if x > 709.8 { return 1.0 / 0.0 }
+  if x < -745.2 { return 0.0 }
+  // x = k × ln 2 + r（|r| は ln 2 の半分以下）に分ける
+  let k = (x * 1.4426950408889634).round()
+  let r = x - k * 0.6931471803691238 - k * 0.00000000019082149292705877
+  let mut sum = 1.0
+  let mut n = 14
+  while n >= 1 {
+    sum = 1.0 + r / n.to_float() * sum
+    n = n - 1
+  }
+  // 2 の k 乗を掛ける
+  let mut result = sum
+  let mut left = k.abs().to_int()
+  while left > 0 {
+    result = if k > 0.0 { result * 2.0 } else { result / 2.0 }
+    left = left - 1
+  }
+  result
+}
+
+// 自然対数
+fn ln(x: Float) -> Float
+  requires x > 0.0
+{
+  // x = m × 2 の e 乗（m は 0.707〜1.414）に分ける
+  let mut m = x
+  let mut e = 0
+  while m >= 1.4142135623730951 {
+    m = m / 2.0
+    e = e + 1
+  }
+  while m < 0.7071067811865476 {
+    m = m * 2.0
+    e = e - 1
+  }
+  // ln m = 2 × (s + s³/3 + s⁵/5 + …)、s = (m - 1) / (m + 1)
+  let s = (m - 1.0) / (m + 1.0)
+  let z = s * s
+  let mut sum = 0.0
+  let mut n = 12
+  while n >= 0 {
+    sum = 1.0 / (2 * n + 1).to_float() + z * sum
+    n = n - 1
+  }
+  e.to_float() * 0.6931471805599453 + 2.0 * s * sum
+}
+
+// x の n 乗。n が負なら逆数
+fn pow(x: Float, n: Int) -> Float {
+  let mut base = x
+  let mut left = n.abs()
+  let mut result = 1.0
+  while left > 0 {
+    if left % 2 == 1 {
+      result = result * base
+    }
+    base = base * base
+    left = left / 2
+  }
+  if n < 0 { 1.0 / result } else { result }
+}
+
+fn near(a: Float, b: Float) -> Bool {
+  (a - b).abs() <= 0.000000000000002 * (1.0 + b.abs())
+}
+
+test "三角関数" {
+  assert sin(0.0) == 0.0
+  assert cos(0.0) == 1.0
+  assert near(sin(pi() / 6.0), 0.5)
+  assert near(cos(pi() / 3.0), 0.5)
+  assert near(sin(pi() / 2.0), 1.0)
+  assert near(sin(1.0), 0.8414709848078965)
+  assert near(cos(1.0), 0.5403023058681398)
+  assert near(sin(-2.5), -0.5984721441039564)
+  assert near(cos(10.0), -0.8390715290764524)
+  assert near(sin(100.0), -0.5063656411097588)
+  assert near(sin(12345.678), -0.7040813137533816)
+  assert near(tan(0.7), 0.8422883804630794)
+  assert sin(pi()).abs() < 0.000000000000001
+}
+
+test "逆正接" {
+  assert near(atan(1.0), pi() / 4.0)
+  assert near(atan(0.2), 0.19739555984988075)
+  assert near(atan(5.0), 1.373400766945016)
+  assert near(atan(-0.5), -0.4636476090008061)
+  assert near(atan2(1.0, 1.0), pi() / 4.0)
+  assert near(atan2(1.0, -1.0), 3.0 * pi() / 4.0)
+  assert near(atan2(-1.0, -1.0), -3.0 * pi() / 4.0)
+  assert atan2(0.0, 0.0) == 0.0
+  assert near(atan2(2.0, 0.0), pi() / 2.0)
+}
+
+test "指数と対数" {
+  assert exp(0.0) == 1.0
+  assert near(exp(1.0), 2.718281828459045)
+  assert near(exp(-3.5), 0.0301973834223185)
+  assert near(exp(20.0), 485165195.4097903)
+  assert near(ln(2.718281828459045), 1.0)
+  assert near(ln(10.0), 2.302585092994046)
+  assert near(ln(0.001), -6.907755278982137)
+  assert ln(1.0) == 0.0
+  assert near(exp(ln(123.456)), 123.456)
+}
+
+test "整数乗と角度" {
+  assert pow(2.0, 10) == 1024.0
+  assert pow(2.0, -2) == 0.25
+  assert pow(1.5, 0) == 1.0
+  assert near(pow(1.1, 7), 1.9487171)
+  assert near(radians(180.0), pi())
+  assert near(degrees(pi() / 2.0), 90.0)
+}

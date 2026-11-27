@@ -38,7 +38,26 @@ YuiLang は、AIが書き、AIが直すことを前提に設計した静的型�
 | Map | `Map { "a": 1, "b": 2 }`, `Map {}` |
 
 文字列の中の `{式}` は式の値に置き換わる（文字列補間）。文字列の連結は補間で行う。
-エスケープは `\n` `\t` `\r` `\\` `\"` `\{` `\}`。補間の中に文字列リテラルは書けない。
+エスケープは `\n` `\t` `\r` `\\` `\"` `\{` `\}`。補間の式の中にも文字列を書ける（`"{names.join(", ")}"`）。
+
+**そのまま書ける文字列**は `"""` で囲む。中には特別な文字がなく、エスケープも補間もない。
+引用符、波かっこ、逆斜線、改行が、書いたとおりの文字になる。JSON や長い文章を書くのに使う。
+
+```
+let one = """{"name": "ユイ", "path": "C:\dir"}"""
+
+let prompt = """
+  あなたは仲間の「ユイ」です。
+  返事は JSON で書きます。
+  """
+```
+
+コードに合わせて字下げできるように、決まりが 2 つある。
+
+- 開く `"""` の直後の改行は、中身に入らない。
+- 閉じる `"""` が単独の行にあれば、その前の空白が各行の頭から取り除かれ、直前の改行も中身に入らない
+  （上の `prompt` は 2 行で、どちらの行も字下げなし、最後に改行なし）。
+  閉じる `"""` より浅い行があるとコンパイルエラー（E0007）。空の行は字下げがなくてもよい。
 
 ## 3. 型
 
@@ -188,6 +207,14 @@ let p = shapes.Point { x: 1.0, y: 2.0 }
 - 他のモジュールの関数・型は必ず `モジュール名.名前` と書く。自分のモジュールの宣言は修飾なしで書く。
 - モジュールのすべての宣言は外から参照できる（公開・非公開の区別はない）。
 - 循環 import は可能。実行するファイル自身を import することはできない。
+- `std.` で始まるモジュールは、言語に付いてくる**標準の部品**で、ファイルを置かなくても使える（下の表）。
+
+| モジュール | 中身 |
+| --- | --- |
+| `std.math` | `math.pi()`、`math.sin(x)` `math.cos(x)` `math.tan(x)`（ラジアン）、`math.atan(x)` `math.atan2(y, x)`、`math.exp(x)` `math.ln(x)`（`x > 0` が必要）、`math.pow(x, n)`（`n` は Int）、`math.radians(度)` `math.degrees(ラジアン)`。精度は 15 桁ほど |
+| `std.json` | JSON を読む・書く。`json.parse(text) -> Result<json.Value, String>`、取り出しは `json.get(v, "名前")` `json.at(v, 番号)` `json.items(v)` と `json.text_of(v)` `json.int_of(v)` `json.float_of(v)` `json.flag_of(v)`（形が合わなければ空の値）、書き出しは `json.write(v)` `json.quote(text)` |
+
+標準の部品は YuiLang で書いてあり（[std](std) フォルダ）、`yui run` でも `yui build` でも同じ結果を返す。
 - `yui test` が実行するのは、指定したファイルの `test` だけ。import したモジュールの `test` は型チェックだけされる。
 
 ## 6. 文
@@ -383,7 +410,7 @@ fn main() uses io, net {
 }
 ```
 
-JSON の読み書きは、YuiLang で書いた部品 [games/json.yui](games/json.yui) にある（`import json`）。
+JSON の読み書きは、標準の部品 `std.json` にある（`import std.json`）。
 Claude（Anthropic の API）を呼ぶ部品は [games/claude.yui](games/claude.yui) にある。
 
 ### メソッド

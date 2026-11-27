@@ -781,11 +781,10 @@ fn str_append_float(s: Int, bits: Int) -> Int {
       if low == 0 {
         digit = digit + 1
       } else if high == 1 {
-        // どちらでもよいときは、近いほう。ちょうど真ん中なら偶数の桁にする
+        // どちらでもよいときは、近いほう。ちょうど真ん中なら上げる（yui run が使う Rust の表示と同じ決まり）
         big_copy(sum, r)
         big_mul(sum, 2)
-        let half = big_cmp(sum, scale)
-        if half > 0 || half == 0 && __and(digit, 1) == 1 {
+        if big_cmp(sum, scale) >= 0 {
           digit = digit + 1
         }
       }

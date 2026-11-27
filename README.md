@@ -145,6 +145,8 @@ error[E0305]: unused value of type `List<Int>`
 - クロージャと関数型（`|x| x + 1`、`fn(Int) -> Int`）
 - `Option` / `Result` と `?` 演算子（null と例外はない）
 - 副作用の宣言（`uses io`、`uses fs`、`uses net`）
+- そのまま書ける文字列（`"""..."""`。JSON や長い文章を、エスケープなしで書ける）
+- 標準の部品（`import std.math`、`import std.json`。YuiLang で書いてある）
 - 契約（`requires` / `ensures`）と言語組み込みの `test` / `assert`
 - モジュール（`import geometry.shapes` → `shapes.area(...)`）
 - `List` / `Map` / `String` の標準メソッド

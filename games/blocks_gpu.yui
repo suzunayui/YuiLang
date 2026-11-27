@@ -22,6 +22,8 @@
 // 三角形は 横 16 × 奥行き 16 マスの区画ごとにまとめる（8 × 8 = 64 区画）。
 // ブロックが変わったら、その区画だけ作り直す。
 
+import std.math
+
 struct Player {
   x: Float,
   y: Float,
@@ -31,22 +33,12 @@ struct Player {
   tilt: Float,
 }
 
-// 三角関数。角度を -π〜π に直してから、級数で求める
 fn sine(angle: Float) -> Float {
-  let pi = 3.141592653589793
-  let mut a = angle
-  while a > pi {
-    a = a - 2.0 * pi
-  }
-  while a < -pi {
-    a = a + 2.0 * pi
-  }
-  let s = a * a
-  a * (1.0 - s / 6.0 * (1.0 - s / 20.0 * (1.0 - s / 42.0 * (1.0 - s / 72.0 * (1.0 - s / 110.0 * (1.0 - s / 156.0 * (1.0 - s / 210.0)))))))
+  math.sin(angle)
 }
 
 fn cosine(angle: Float) -> Float {
-  sine(angle + 1.5707963267948966)
+  math.cos(angle)
 }
 
 fn whole(value: Float) -> Int {

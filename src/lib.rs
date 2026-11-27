@@ -77,6 +77,22 @@ pub fn load_units(units: &[SourceUnit]) -> Result<Loaded, LoadError> {
     })
 }
 
+/// The modules that come with the language, written in YuiLang and kept
+/// inside `yui` itself: `import std.math` and so on.
+const STANDARD: [(&str, &str); 2] = [("math", include_str!("../std/math.yui")), ("json", include_str!("../std/json.yui"))];
+
+/// The display name and the text of the standard module `name`.
+fn standard_module(name: &str, module: &str, span: Span) -> Result<(String, String), Diagnostic> {
+    match STANDARD.iter().find(|(known, _)| *known == name) {
+        Some((_, text)) => Ok((format!("std/{name}.yui"), text.to_string())),
+        None => {
+            let known: Vec<String> = STANDARD.iter().map(|(known, _)| format!("std.{known}")).collect();
+            Err(Diagnostic::new("E0208", format!("cannot find module `{module}`"), span)
+                .hint(format!("the standard modules are: {}", known.join(", "))))
+        }
+    }
+}
+
 /// Reads the file of a module below `root`. Returns its display name and text.
 fn read_module(root: &Path, entry: Option<&Path>, module: &str, span: Span) -> Result<(String, String), Diagnostic> {
     let relative: PathBuf = module.split('.').collect::<PathBuf>().with_extension("yui");
@@ -117,7 +133,11 @@ fn load(
         if !loaded.insert(module.clone()) {
             continue;
         }
-        let (display, text) = match read(&module, span) {
+        let found = match module.strip_prefix("std.") {
+            Some(name) => standard_module(name, &module, span),
+            None => read(&module, span),
+        };
+        let (display, text) = match found {
             Ok(found) => found,
             Err(d) => return Err((vec![d], sources)),
         };
