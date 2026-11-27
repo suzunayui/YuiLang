@@ -20,7 +20,9 @@
 //
 //   yui build games/blocks_ai.yui -o blocks_ai.exe
 //
-// 引数: コマ数（0 なら自分で遊ぶ）、横の点の数、縦の点の数、自動で送るお願い（動作確認用。API は呼ばない）
+// 引数: コマ数（0 なら自分で遊ぶ）、横の点の数、縦の点の数、始まってすぐに送るお願い。
+// コマ数が 1 以上のときは動作確認用で、API は呼ばず、決まった返事を使う。
+//   blocks_ai.exe 0 1280 720 お城建ててー     起動してすぐ、お城を頼む（API を使う）
 
 import blocks_gpu
 import claude
@@ -908,7 +910,8 @@ fn main() uses io, net {
     } else if typed.contains("\n") {
       typing = true
     }
-    if limit > 0 && frame == 20 {
+    // 引数でお願いが渡されていたら、始まってすぐに送る
+    if frame == 20 && !script.is_empty() {
       send = script
     }
 
