@@ -55,6 +55,13 @@ const CC_NP: u8 = 0xB;
 const TEMPS: [u8; 4] = [R8, R9, R10, R11];
 /// Registers for variables. Calls preserve them.
 const SAVED: [u8; 7] = [RBX, RSI, RDI, R12, R13, R14, R15];
+/// The xmm registers that keep their values across calls: for Float variables.
+const XMM_SAVED: [u8; 10] = [6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+/// The xmm registers a Float expression is computed in (the first free one
+/// is `fbase`). Calls overwrite them, like r8-r11. Everything else that
+/// handles floats uses xmm0-xmm2, so the two never meet.
+const FLOAT_FIRST: u8 = 3;
+const FLOAT_LAST: u8 = 5;
 /// The temp each argument is evaluated into, in an order that leaves the
 /// later ones free while the earlier ones are computed.
 const ARG_TEMPS: [u8; 4] = [R10, R11, R8, R9];
@@ -487,6 +494,9 @@ enum Body<'b> {
 enum Loc {
     Reg(u8),
     Stack(i32),
+    /// An xmm register: where the most used Float variables live, so that
+    /// arithmetic on them does not go through the general registers.
+    Xmm(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -640,6 +650,11 @@ struct Native<'a> {
     /// or method name.
     decl_loc: HashMap<(usize, u8), Loc>,
     free: Vec<u8>,
+    /// The first xmm register that holds no part of a Float expression
+    /// being computed (see `FLOAT_FIRST`).
+    fbase: u8,
+    /// Float constants already in the executable, by their bits.
+    float_constants: HashMap<u64, usize>,
     /// (label to leave the loop, label to start the next round, number of
     /// scopes outside the loop body, number of held values outside it)
     loops: Vec<(usize, usize, usize, usize)>,
@@ -752,6 +767,8 @@ pub fn build(program: &Program, sources: &SourceMap) -> Result<Vec<u8>, Unsuppor
         scopes: Vec::new(),
         decl_loc: HashMap::new(),
         free: Vec::new(),
+        fbase: FLOAT_FIRST,
+        float_constants: HashMap::new(),
         loops: Vec::new(),
         pending: Vec::new(),
         moving: None,
@@ -1160,6 +1177,7 @@ impl Native<'_> {
         match loc {
             Loc::Reg(r) => self.mov(dst, r),
             Loc::Stack(off) => self.a.load(dst, M(RSP, off)),
+            Loc::Xmm(x) => self.sse_rr(0x66, true, 0x7E, x, dst), // movq dst, xmm
         }
     }
 
@@ -1167,7 +1185,167 @@ impl Native<'_> {
         match loc {
             Loc::Reg(r) => self.mov(r, src),
             Loc::Stack(off) => self.a.store(M(RSP, off), src),
+            Loc::Xmm(x) => self.sse_rr(0x66, true, 0x6E, x, src), // movq xmm, src
         }
+    }
+
+    /// An instruction on an xmm register and another register (xmm or
+    /// general): `prefix [rex] 0F opcode /r`, with `reg` in the reg field.
+    fn sse_rr(&mut self, prefix: u8, wide: bool, opcode: u8, reg: u8, rm: u8) {
+        self.a.b(prefix);
+        let rex = 0x40 | (wide as u8) << 3 | (reg >> 3) << 2 | (rm >> 3);
+        if rex != 0x40 {
+            self.a.b(rex);
+        }
+        self.a.b(0x0F);
+        self.a.b(opcode);
+        self.a.b(0xC0 | (reg & 7) << 3 | (rm & 7));
+    }
+
+    /// The same with memory in place of the second register.
+    fn sse_rm(&mut self, prefix: u8, opcode: u8, reg: u8, m: M) {
+        self.a.b(prefix);
+        let rex = 0x40 | (reg >> 3) << 2 | (m.0 >> 3);
+        if rex != 0x40 {
+            self.a.b(rex);
+        }
+        self.a.b(0x0F);
+        self.a.b(opcode);
+        self.a.modrm_m(reg, m);
+    }
+
+    /// `xmm<to> = xmm<from>`.
+    fn fmov(&mut self, to: u8, from: u8) {
+        if to != from {
+            self.sse_rr(0x66, false, 0x28, to, from); // movapd
+        }
+    }
+
+    /// Evaluates `e`, a Float, into the xmm register `fbase`, without going
+    /// through the general registers where that can be avoided. `dst` is a
+    /// general register for the parts that are not floats.
+    ///
+    /// Nothing in `e` may call a function while a part of an enclosing
+    /// expression is held in an xmm register; `float_tree` sees to that.
+    fn feval(&mut self, e: &Expr, dst: u8) -> R<()> {
+        let x = self.fbase;
+        match &e.kind {
+            ExprKind::Float(f) if f.to_bits() == 0 => self.sse_rr(0x66, false, 0x57, x, x), // xorpd: 0.0
+            ExprKind::Float(f) => {
+                let at = self.float_constant(*f);
+                self.sse_label(0x10, x, at); // movsd xmm, [constant]
+            }
+            ExprKind::Ident(name) if self.float_var(name).is_some() => match self.float_var(name) {
+                Some(Loc::Xmm(from)) => self.fmov(x, from),
+                Some(Loc::Reg(r)) => self.sse_rr(0x66, true, 0x6E, x, r), // movq xmm, reg
+                Some(Loc::Stack(off)) => self.sse_rm(0xF2, 0x10, x, M(RSP, off)), // movsd xmm, [m]
+                None => {}
+            },
+            ExprKind::Binary(op @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div), l, r) if self.float_tree(l, r) => {
+                self.float_binary(*op, l, r, dst)?;
+            }
+            ExprKind::MethodCall { recv, name, args, .. }
+                if name == "sqrt" && args.is_empty() && matches!(self.recv_ty(recv), Ok(Ty::Float)) =>
+            {
+                self.feval(recv, dst)?;
+                self.sse_rr(0xF2, false, 0x51, x, x); // sqrtsd
+            }
+            ExprKind::MethodCall { recv, name, args, .. }
+                if name == "to_float" && args.is_empty() && matches!(self.recv_ty(recv), Ok(Ty::Int)) =>
+            {
+                self.eval(recv, dst)?;
+                self.sse_rr(0xF2, true, 0x2A, x, dst); // cvtsi2sd xmm, dst
+            }
+            _ => {
+                // Whatever else gives a Float: computed the general way.
+                self.eval(e, dst)?;
+                self.sse_rr(0x66, true, 0x6E, x, dst); // movq xmm, dst
+            }
+        }
+        Ok(())
+    }
+
+    /// The place in the executable where the bits of `value` are kept.
+    fn float_constant(&mut self, value: f64) -> usize {
+        if let Some(label) = self.float_constants.get(&value.to_bits()) {
+            return *label;
+        }
+        let label = self.constant(&value.to_bits().to_le_bytes());
+        self.float_constants.insert(value.to_bits(), label);
+        label
+    }
+
+    /// A scalar instruction (`F2 0F opcode`) on an xmm register and the
+    /// constant at `label`.
+    fn sse_label(&mut self, opcode: u8, reg: u8, label: usize) {
+        self.a.b(0xF2);
+        if reg >= 8 {
+            self.a.b(0x44);
+        }
+        self.a.b(0x0F);
+        self.a.b(opcode);
+        self.a.b((reg & 7) << 3 | 5);
+        self.a.rel32(label);
+    }
+
+    /// Where the variable `name` lives, if it is a Float.
+    fn float_var(&self, name: &str) -> Option<Loc> {
+        let local = self.scopes.iter().rev().find_map(|s| s.get(name))?;
+        (local.ty == Ty::Float).then_some(local.loc)
+    }
+
+    /// Whether `l op r` (one of `+ - * /`) is on Floats and can be computed
+    /// in the xmm registers from `fbase` on: there is a register for it, and
+    /// no call would overwrite a part that is held in one. (Only the left
+    /// operand of the outermost operation is computed while none is held.)
+    fn float_tree(&mut self, l: &Expr, r: &Expr) -> bool {
+        !self.in_runtime
+            && self.fbase <= FLOAT_LAST
+            && !self.has_call(r)
+            && (self.fbase == FLOAT_FIRST || !self.has_call(l))
+            && matches!(self.recv_ty(l), Ok(Ty::Float))
+    }
+
+    /// `xmm<fbase> = l op r` for Floats; see `float_tree`.
+    fn float_binary(&mut self, op: BinOp, l: &Expr, r: &Expr, dst: u8) -> R<()> {
+        let x = self.fbase;
+        let code = match op {
+            BinOp::Add => 0x58,
+            BinOp::Sub => 0x5C,
+            BinOp::Mul => 0x59,
+            _ => 0x5E,
+        };
+        self.feval(l, dst)?;
+        // A variable on the right is used from where it is.
+        let name = match &r.kind {
+            ExprKind::Ident(name) => self.float_var(name),
+            _ => None,
+        };
+        match (name, &r.kind) {
+            (Some(Loc::Xmm(from)), _) => self.sse_rr(0xF2, false, code, x, from),
+            (Some(Loc::Stack(off)), _) => self.sse_rm(0xF2, code, x, M(RSP, off)),
+            // A number written out is used from where it is kept, too.
+            (None, ExprKind::Float(f)) => {
+                let at = self.float_constant(*f);
+                self.sse_label(code, x, at);
+            }
+            _ => {
+                // The next register up, or xmm0 when there is none left. Either
+                // way nothing nested may use the registers up to `x`.
+                self.fbase = x + 1;
+                let right = if x < FLOAT_LAST {
+                    self.feval(r, dst)?;
+                    x + 1
+                } else {
+                    self.eval(r, dst)?;
+                    self.sse_rr(0x66, true, 0x6E, 0, dst); // movq xmm0, dst
+                    0
+                };
+                self.fbase = x;
+                self.sse_rr(0xF2, false, code, x, right);
+            }
+        }
+        Ok(())
     }
 
     fn load_opnd(&mut self, dst: u8, o: Opnd) {
@@ -1742,8 +1920,8 @@ impl Native<'_> {
     fn reg(&mut self, loc: Loc, scratch: u8) -> u8 {
         match loc {
             Loc::Reg(r) => r,
-            Loc::Stack(off) => {
-                self.a.load(scratch, M(RSP, off));
+            Loc::Stack(_) | Loc::Xmm(_) => {
+                self.load_loc(scratch, loc);
                 scratch
             }
         }
@@ -2423,6 +2601,7 @@ impl Native<'_> {
             match loc {
                 Loc::Reg(r) => self.a.alu_rr(0x01, RAX, *r),
                 Loc::Stack(off) => self.a.alu_m(0x03, RAX, M(RSP, *off)),
+                Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
             }
         }
         self.a.alu_imm(4, RAX, MEMO_ENTRIES as i32 - 1); // and
@@ -2486,22 +2665,32 @@ impl Native<'_> {
         order.sort_by_key(|i| std::cmp::Reverse(weight.get(&decls[*i].1).copied().unwrap_or(0)));
         self.decl_loc.clear();
         let mut used = Vec::new();
+        let mut used_xmm: Vec<u8> = Vec::new();
         let mut stack_slots = 0;
-        for (rank, i) in order.into_iter().enumerate() {
-            let loc = match SAVED.get(rank) {
-                Some(reg) => {
-                    used.push(*reg);
-                    Loc::Reg(*reg)
-                }
-                None => {
-                    stack_slots += 1;
-                    Loc::Stack(outgoing + 8 * (stack_slots - 1))
-                }
-            };
+        let types = self.types;
+        for i in order {
             let (id, _, kind) = &decls[i];
+            // The checker's name for the type of a variable declared at `id`.
+            // (In a generic function it may be a type parameter, which is not
+            // taken for a Float here even where it stands for one.)
+            let float = *kind == VAR && !self.in_runtime && types.var_types.get(id).is_some_and(|ty| ty == "Float");
+            let loc = if float && used_xmm.len() < XMM_SAVED.len() {
+                used_xmm.push(XMM_SAVED[used_xmm.len()]);
+                Loc::Xmm(XMM_SAVED[used_xmm.len() - 1])
+            } else if let Some(reg) = SAVED.get(used.len()) {
+                used.push(*reg);
+                Loc::Reg(*reg)
+            } else {
+                stack_slots += 1;
+                Loc::Stack(outgoing + 8 * (stack_slots - 1))
+            };
             self.decl_loc.insert((*id, *kind), loc);
         }
+        // What the xmm registers held is kept in the frame meanwhile.
+        let xmm_base = outgoing + 8 * stack_slots;
+        stack_slots += used_xmm.len() as i32;
         self.spill_base = outgoing + 8 * stack_slots;
+        self.fbase = FLOAT_FIRST;
         self.spill_depth = 0;
         self.spill_max = 0;
         self.free = TEMPS.to_vec();
@@ -2516,6 +2705,9 @@ impl Native<'_> {
         }
         self.a.alu_imm(5, RSP, 0);
         let frame_at = [self.a.buf.len() - 4, 0];
+        for (i, x) in used_xmm.iter().enumerate() {
+            self.sse_rm(0xF2, 0x11, *x, M(RSP, xmm_base + 8 * i as i32)); // movsd [frame], xmm
+        }
         let mut scope = HashMap::new();
         // In the code of a function value, the block takes the first place.
         let is_value = !captures.is_empty() || matches!(body, Body::Expr(_));
@@ -2586,6 +2778,7 @@ impl Native<'_> {
                 match loc {
                     Loc::Reg(r) => self.a.alu_rr(0x39, RAX, *r),
                     Loc::Stack(off) => self.a.alu_m(0x3B, RAX, M(RSP, *off)),
+                    Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
                 }
                 self.a.jcc(CC_NE, miss);
             }
@@ -2649,6 +2842,9 @@ impl Native<'_> {
             self.a.mov_rr(RAX, R8);
         }
         self.a.bind(quick_exit);
+        for (i, x) in used_xmm.iter().enumerate() {
+            self.sse_rm(0xF2, 0x10, *x, M(RSP, xmm_base + 8 * i as i32)); // movsd xmm, [frame]
+        }
         self.a.alu_imm(0, RSP, 0);
         let frame_at = [frame_at[0], self.a.buf.len() - 4];
         for reg in used.iter().rev() {
@@ -2702,6 +2898,7 @@ impl Native<'_> {
         // In a fixed order, so that the same program always gives the same executable.
         locs.sort_by_key(|local| match local.loc {
             Loc::Reg(r) => r as i32,
+            Loc::Xmm(x) => 50 + x as i32,
             Loc::Stack(off) => 100 + off,
         });
         let slot = keep.map(|reg| {
@@ -2957,6 +3154,20 @@ impl Native<'_> {
         if let (Loc::Reg(r), true) = (loc, direct) {
             return self.eval(value, r);
         }
+        if let Loc::Xmm(x) = loc {
+            // A Float variable: computed in the xmm registers, then moved over.
+            // (Not computed in place: the value may be made from the variable.)
+            let calls = self.has_call(value);
+            let outer = calls.then(|| self.fresh_temps(TEMPS[0]));
+            let t = if calls { TEMPS[0] } else { self.take_temp(value.span)? };
+            self.feval(value, t)?;
+            self.fmov(x, self.fbase);
+            match outer {
+                Some(outer) => self.free = outer,
+                None => self.free.push(t),
+            }
+            return Ok(Ty::Float);
+        }
         if self.has_call(value) {
             let outer = self.fresh_temps(TEMPS[0]);
             let ty = self.eval(value, TEMPS[0])?;
@@ -3032,6 +3243,7 @@ impl Native<'_> {
                             match counter {
                                 Loc::Reg(r) => self.a.alu_rr(0x29, RDX, r),
                                 Loc::Stack(off) => self.a.alu_m(0x2B, RDX, M(RSP, off)),
+                                Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
                             }
                             self.load_loc(RCX, local.loc);
                             self.call_rt("list_reserve");
@@ -3045,6 +3257,7 @@ impl Native<'_> {
                 match limit {
                     Loc::Reg(r) => self.a.alu_rr(0x39, RAX, r),
                     Loc::Stack(off) => self.a.alu_m(0x3B, RAX, M(RSP, off)),
+                    Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
                 }
                 self.a.jcc(CC_GE, exit);
                 self.scopes.push(HashMap::from([(var.clone(), Local { ty: Ty::Int, loc: counter, borrowed: false })]));
@@ -3060,6 +3273,7 @@ impl Native<'_> {
                 match counter {
                     Loc::Reg(r) => self.a.alu_imm(0, r, 1),
                     Loc::Stack(off) => self.a.inc_mem(M(RSP, off)),
+                    Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
                 }
                 self.a.jmp(top);
                 self.a.bind(exit);
@@ -3608,9 +3822,9 @@ impl Native<'_> {
         self.a.jcc(CC_GE, exit);
         match item {
             Loc::Reg(r) => self.element(0x8B, r, l, p),
-            Loc::Stack(off) => {
+            Loc::Stack(_) | Loc::Xmm(_) => {
                 self.element(0x8B, RDX, l, p);
-                self.a.store(M(RSP, off), RDX);
+                self.store_loc(item, RDX);
             }
         }
     }
@@ -3620,6 +3834,7 @@ impl Native<'_> {
         match pos {
             Loc::Reg(r) => self.a.alu_imm(0, r, 1),
             Loc::Stack(off) => self.a.inc_mem(M(RSP, off)),
+            Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
         }
     }
 
@@ -3627,6 +3842,7 @@ impl Native<'_> {
         match loc {
             Loc::Reg(r) => self.a.mov_imm64(r, value as i64),
             Loc::Stack(off) => self.a.store_imm(M(RSP, off), value),
+            Loc::Xmm(_) => unreachable!("an Int in an xmm register"),
         }
     }
 
@@ -3642,6 +3858,8 @@ impl Native<'_> {
                 Some(match local.loc {
                     Loc::Reg(r) => (Opnd::Reg(r), local.ty),
                     Loc::Stack(off) => (Opnd::Mem(M(RSP, off)), local.ty),
+                    // Not somewhere an instruction on general registers can use it.
+                    Loc::Xmm(_) => return None,
                 })
             }
             _ => None,
@@ -4108,6 +4326,12 @@ impl Native<'_> {
     }
 
     fn arithmetic(&mut self, op: BinOp, l: &Expr, r: &Expr, dst: u8, span: Span) -> R<Ty> {
+        if op != BinOp::Rem && self.float_tree(l, r) {
+            // Floats: the whole expression in the xmm registers.
+            self.float_binary(op, l, r, dst)?;
+            self.sse_rr(0x66, true, 0x7E, self.fbase, dst); // movq dst, xmm
+            return Ok(Ty::Float);
+        }
         // An Int variable or small literal on the left is used from where it
         // is, and the right side is computed straight into `dst` - unless
         // `dst` is where that variable lives.
@@ -4351,6 +4575,25 @@ impl Native<'_> {
                         self.a.jcc(condition(*op) ^ 1, no);
                         return Ok(());
                     }
+                }
+                if !self.in_runtime
+                    && self.fbase < FLOAT_LAST
+                    && !self.has_call(l)
+                    && !self.has_call(r)
+                    && matches!(self.recv_ty(l), Ok(Ty::Float))
+                {
+                    // Floats: both sides in the xmm registers.
+                    let t = self.take_temp(e.span)?;
+                    let x = self.fbase;
+                    self.feval(l, t)?;
+                    self.fbase = x + 1;
+                    self.feval(r, t)?;
+                    self.fbase = x;
+                    self.free.push(t);
+                    self.fmov(0, x);
+                    self.fmov(1, x + 1);
+                    self.float_compare(*op, no);
+                    return Ok(());
                 }
                 let (left, b, temp, spilled, owned, lt, rt) = match direct {
                     Some((reg, b, lt, rt)) => (Opnd::Reg(reg), b, None, false, None, lt, rt),
